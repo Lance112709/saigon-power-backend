@@ -148,6 +148,37 @@ def list_lead_customers(
         })
     return results
 
+# ── Dropped Deals ─────────────────────────────────────────────────────────────
+
+@router.get("/dropped-deals")
+def list_dropped_deals(
+    search: Optional[str] = Query(None),
+    supplier: Optional[str] = Query(None),
+    sales_agent: Optional[str] = Query(None),
+    limit: int = Query(100),
+    offset: int = Query(0),
+    user: UserContext = Depends(get_current_user),
+):
+    db = get_client()
+    q = db.table("lead_deals").select("*, leads(first_name, last_name, phone, address, city, state)").eq("status", "Inactive")
+    if supplier:
+        q = q.eq("supplier", supplier)
+    if sales_agent:
+        q = q.eq("sales_agent", sales_agent)
+    res = q.order("updated_at", desc=True).range(offset, offset + limit - 1).execute()
+    results = []
+    for d in res.data:
+        lead = d.pop("leads", None) or {}
+        name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip()
+        if search:
+            s = search.lower()
+            if not (s in name.lower() or s in (d.get("supplier") or "").lower()
+                    or s in (d.get("sales_agent") or "").lower()
+                    or s in (d.get("esiid") or "").lower()):
+                continue
+        results.append({**d, "lead_name": name, "lead_phone": lead.get("phone"), "lead_address": f"{lead.get('address','')} {lead.get('city','')} {lead.get('state','')}".strip()})
+    return results
+
 # ── Leads List + Create ────────────────────────────────────────────────────────
 
 @router.get("")
