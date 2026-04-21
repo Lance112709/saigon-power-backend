@@ -266,6 +266,7 @@ def create_lead(data: dict = Body(...)):
         "business_name":  str(data.get("business_name") or "").strip() or None,
         "phone2":         str(data.get("phone2") or "").strip() or None,
         "email2":         str(data.get("email2") or "").strip().lower() or None,
+        "referral_by":    str(data.get("referral_by") or "").strip() or None,
         "status":         "lead",
         "source":         str(data.get("source") or "manual").strip(),
     }
@@ -292,7 +293,7 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
 @router.patch("/{id}")
 def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
-    allowed = {"first_name", "last_name", "address", "city", "state", "zip", "phone", "email", "business_name", "phone2", "email2"}
+    allowed = {"first_name", "last_name", "address", "city", "state", "zip", "phone", "email", "business_name", "phone2", "email2", "referral_by"}
     payload = {k: str(v).strip() for k, v in data.items() if k in allowed and v is not None}
     if "phone" in payload and not _validate_phone(payload["phone"]):
         raise HTTPException(status_code=400, detail="Invalid phone number format")
