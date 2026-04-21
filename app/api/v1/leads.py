@@ -20,6 +20,16 @@ def _validate_phone(phone: str) -> bool:
 def _full_name(lead: dict) -> str:
     return f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip()
 
+def _next_sgp_id(db) -> str:
+    res = db.table("leads").select("sgp_customer_id").not_.is_("sgp_customer_id", "null").order("sgp_customer_id", desc=True).limit(1).execute()
+    num = 1
+    if res.data:
+        try:
+            num = int(res.data[0]["sgp_customer_id"].split("-")[1][4:]) + 1
+        except Exception:
+            pass
+    return f"SGP-2026{num:06d}"
+
 def _try_convert(db, lead_id: str) -> None:
     active = db.table("lead_deals").select("id").eq("lead_id", lead_id).eq("status", "Active").execute()
     if not active.data:
@@ -27,7 +37,12 @@ def _try_convert(db, lead_id: str) -> None:
     existing = db.table("lead_customers").select("id").eq("lead_id", lead_id).execute()
     if not existing.data:
         db.table("lead_customers").insert({"lead_id": lead_id}).execute()
-    db.table("leads").update({"status": "converted", "updated_at": _now()}).eq("id", lead_id).execute()
+    # Assign SGP customer ID if not already set
+    lead_row = db.table("leads").select("sgp_customer_id").eq("id", lead_id).execute()
+    if lead_row.data and not lead_row.data[0].get("sgp_customer_id"):
+        db.table("leads").update({"sgp_customer_id": _next_sgp_id(db), "status": "converted", "updated_at": _now()}).eq("id", lead_id).execute()
+    else:
+        db.table("leads").update({"status": "converted", "updated_at": _now()}).eq("id", lead_id).execute()
 
 def _shape_lead(lead: dict) -> dict:
     deals = lead.pop("lead_deals", []) or []
@@ -137,6 +152,7 @@ def list_lead_customers(
             "lead_id": c["lead_id"],
             "customer_since": c["created_at"],
             "full_name": name,
+            "sgp_customer_id": lead.get("sgp_customer_id"),
             "phone": lead.get("phone"),
             "email": lead.get("email"),
             "address": lead.get("address"),
@@ -147,6 +163,21 @@ def list_lead_customers(
             "active_deal_count": sum(1 for d in deals if d.get("status") == "Active"),
         })
     return results
+
+# ── Backfill SGP IDs ──────────────────────────────────────────────────────────
+
+@router.post("/backfill-sgp-ids")
+def backfill_sgp_ids(user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    converted = db.table("leads").select("id, sgp_customer_id").eq("status", "converted").order("created_at").execute().data or []
+    assigned = 0
+    for lead in converted:
+        if lead.get("sgp_customer_id"):
+            continue
+        new_id = _next_sgp_id(db)
+        db.table("leads").update({"sgp_customer_id": new_id}).eq("id", lead["id"]).execute()
+        assigned += 1
+    return {"assigned": assigned}
 
 # ── Dropped Deals ─────────────────────────────────────────────────────────────
 
