@@ -193,16 +193,19 @@ def create_lead(data: dict = Body(...)):
             raise HTTPException(status_code=409, detail="A lead with this name and address already exists")
 
     payload = {
-        "first_name": data["first_name"].strip(),
-        "last_name":  data["last_name"].strip(),
-        "address":    data["address"].strip(),
-        "city":       data["city"].strip(),
-        "state":      data["state"].strip().upper(),
-        "zip":        data["zip"].strip(),
-        "phone":      phone,
-        "email":      str(data.get("email") or "").strip().lower() or None,
-        "status":     "lead",
-        "source":     str(data.get("source") or "manual").strip(),
+        "first_name":     data["first_name"].strip(),
+        "last_name":      data["last_name"].strip(),
+        "address":        data["address"].strip(),
+        "city":           data["city"].strip(),
+        "state":          data["state"].strip().upper(),
+        "zip":            data["zip"].strip(),
+        "phone":          phone,
+        "email":          str(data.get("email") or "").strip().lower() or None,
+        "business_name":  str(data.get("business_name") or "").strip() or None,
+        "phone2":         str(data.get("phone2") or "").strip() or None,
+        "email2":         str(data.get("email2") or "").strip().lower() or None,
+        "status":         "lead",
+        "source":         str(data.get("source") or "manual").strip(),
     }
     res = db.table("leads").insert(payload).execute()
     new_lead = res.data[0]
@@ -227,7 +230,7 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
 @router.patch("/{id}")
 def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
-    allowed = {"first_name", "last_name", "address", "city", "state", "zip", "phone", "email"}
+    allowed = {"first_name", "last_name", "address", "city", "state", "zip", "phone", "email", "business_name", "phone2", "email2"}
     payload = {k: str(v).strip() for k, v in data.items() if k in allowed and v is not None}
     if "phone" in payload and not _validate_phone(payload["phone"]):
         raise HTTPException(status_code=400, detail="Invalid phone number format")
@@ -236,6 +239,17 @@ def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get
     payload["updated_at"] = _now()
     res = db.table("leads").update(payload).eq("id", id).execute()
     return res.data[0] if res.data else {}
+
+# ── Delete Lead ───────────────────────────────────────────────────────────────
+
+@router.delete("/{id}")
+def delete_lead(id: str, user: UserContext = Depends(require_admin)):
+    db = get_client()
+    db.table("lead_notes").delete().eq("lead_id", id).execute()
+    db.table("lead_deals").delete().eq("lead_id", id).execute()
+    db.table("lead_customers").delete().eq("lead_id", id).execute()
+    db.table("leads").delete().eq("id", id).execute()
+    return {"ok": True}
 
 # ── Deals for a Lead ──────────────────────────────────────────────────────────
 

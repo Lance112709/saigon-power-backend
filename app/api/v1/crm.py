@@ -193,6 +193,14 @@ def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends
     res = db.table("crm_customers").update(payload).eq("id", id).execute()
     return res.data[0] if res.data else {}
 
+@router.delete("/customers/{id}")
+def delete_crm_customer(id: str, user: UserContext = Depends(require_admin)):
+    db = get_client()
+    db.table("crm_customer_notes").delete().eq("customer_id", id).execute()
+    db.table("crm_deals").delete().eq("customer_id", id).execute()
+    db.table("crm_customers").delete().eq("id", id).execute()
+    return {"ok": True}
+
 # ── Deals ─────────────────────────────────────────────────────────────────────
 
 @router.post("/customers/{id}/deals")
