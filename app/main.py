@@ -12,8 +12,24 @@ def _run_reminders():
     except Exception:
         pass
 
+def _run_ai_daily():
+    try:
+        from app.services.ai_agent import generate_daily_report
+        generate_daily_report()
+    except Exception:
+        pass
+
+def _run_ai_monthly():
+    try:
+        from app.services.ai_agent import generate_monthly_report
+        generate_monthly_report()
+    except Exception:
+        pass
+
 scheduler = BackgroundScheduler(timezone="America/Chicago")
 scheduler.add_job(_run_reminders, "cron", hour=8, minute=0)
+scheduler.add_job(_run_ai_daily, "cron", hour=6, minute=0)
+scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
