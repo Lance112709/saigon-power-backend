@@ -135,7 +135,26 @@ def create_proposal(data: dict = Body(...), user: UserContext = Depends(get_curr
     res = db.table("proposals").insert(payload).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Failed to create proposal")
-    return res.data[0]
+    created = res.data[0]
+
+    if created.get("customer_phone"):
+        try:
+            from app.services.sms import send_automated
+            send_automated(
+                "proposal_sent",
+                created["customer_phone"],
+                {
+                    "first_name": (created["customer_name"] or "").split()[0],
+                    "plan_name":  created.get("plan_name") or "our energy plan",
+                    "rep_name":   created.get("rep_name") or "Your Saigon Power rep",
+                },
+                lead_id=created.get("lead_id"),
+                customer_id=created.get("customer_id"),
+            )
+        except Exception:
+            pass
+
+    return created
 
 # ── Single proposal ───────────────────────────────────────────────────────────
 

@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent
+from app.api.v1 import suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -20,3 +20,4 @@ router.include_router(tasks.router, prefix="/tasks", tags=["Tasks"])
 router.include_router(calllist.router, prefix="/call-list", tags=["Call List"])
 router.include_router(proposals.router, prefix="/proposals", tags=["Proposals"])
 router.include_router(ai_agent.router, prefix="/ai-agent", tags=["AI Agent"])
+router.include_router(sms_module.router, prefix="/sms", tags=["SMS"])
