@@ -1,13 +1,11 @@
-from pydantic_settings import BaseSettings
+import os
 
-class Settings(BaseSettings):
-    supabase_url: str
-    supabase_anon_key: str
-    supabase_service_key: str
-    anthropic_api_key: str = ""
-    frontend_url: str = "http://localhost:3000"
-
-    class Config:
-        env_file = ".env"
+class Settings:
+    supabase_url: str       = os.environ.get("SUPABASE_URL", "")
+    supabase_anon_key: str  = os.environ.get("SUPABASE_ANON_KEY", "")
+    supabase_service_key: str = os.environ.get("SUPABASE_SERVICE_KEY", "")
+    anthropic_api_key: str  = os.environ.get("ANTHROPIC_API_KEY", "")
+    frontend_url: str       = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+    jwt_secret: str         = os.environ.get("JWT_SECRET", "saigon-power-secret-key-change-in-production")
 
 settings = Settings()
