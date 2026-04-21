@@ -89,6 +89,11 @@ def create_deal_renewal_tasks(db, lead_id: str, deal_id: str, lead_name: str, en
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@router.post("/send-reminders")
+def trigger_reminders(user: UserContext = Depends(get_current_user)):
+    from app.services.email_reminders import send_task_reminders
+    return send_task_reminders()
+
 @router.get("/stats")
 def task_stats(user: UserContext = Depends(get_current_user)):
     db = get_client()

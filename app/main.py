@@ -1,9 +1,28 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.background import BackgroundScheduler
 from app.api.v1.router import router
 from app.config import settings
 
+def _run_reminders():
+    try:
+        from app.services.email_reminders import send_task_reminders
+        send_task_reminders()
+    except Exception:
+        pass
+
+scheduler = BackgroundScheduler(timezone="America/Chicago")
+scheduler.add_job(_run_reminders, "cron", hour=8, minute=0)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
 app = FastAPI(
+    lifespan=lifespan,
     title="Saigon Power Commission API",
     description="Commission tracking and reconciliation system for Saigon Power LLC",
     version="1.0.0"
