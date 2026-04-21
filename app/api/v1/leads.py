@@ -243,7 +243,7 @@ def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get
 # ── Delete Lead ───────────────────────────────────────────────────────────────
 
 @router.delete("/{id}")
-def delete_lead(id: str, user: UserContext = Depends(require_admin)):
+def delete_lead(id: str, user: UserContext = Depends(require_manager)):
     db = get_client()
     db.table("lead_notes").delete().eq("lead_id", id).execute()
     db.table("lead_deals").delete().eq("lead_id", id).execute()
