@@ -2,12 +2,50 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
+import re
 from app.auth.deps import require_admin, UserContext
 from app.db.client import get_client
 from app.services.ai_agent import (
     get_dashboard, run_full_scan, generate_daily_report,
     generate_monthly_report, _resolve_alert
 )
+
+
+def _norm_esiid(s: str) -> str:
+    """Normalize ESIID: handle scientific notation, strip non-digits and leading zeros."""
+    if not s:
+        return ""
+    s = str(s).strip()
+    try:
+        if "e" in s.lower():
+            s = str(int(float(s)))
+    except Exception:
+        pass
+    return re.sub(r"\D", "", s).lstrip("0")
+
+
+def _months_between(start_str: str, end_str: Optional[str], now: datetime) -> list:
+    """Return list of YYYY-MM strings from start to min(end, today)."""
+    try:
+        start = datetime(int(start_str[:4]), int(start_str[5:7]), 1, tzinfo=timezone.utc)
+    except Exception:
+        return []
+    if end_str:
+        try:
+            end = datetime(int(end_str[:4]), int(end_str[5:7]), 1, tzinfo=timezone.utc)
+        except Exception:
+            end = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    else:
+        end = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    # Cap at current month
+    cap = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    end = min(end, cap)
+    months = []
+    cur = start
+    while cur <= end:
+        months.append(cur.strftime("%Y-%m"))
+        cur = (cur + timedelta(days=32)).replace(day=1)
+    return months
 
 router = APIRouter()
 
@@ -263,4 +301,130 @@ def deals_by_agent(
         "agents": agents_sorted,
         "rows": rows,
         "agent_totals": agent_totals,
+    }
+
+
+@router.get("/reconciliation-gap")
+def reconciliation_gap(user: UserContext = Depends(require_admin)):
+    db = get_client()
+    now = datetime.now(timezone.utc)
+
+    # All signed deals (Active or Inactive) that have an ESIID and start date
+    deals = (
+        db.table("lead_deals")
+        .select("id, lead_id, supplier, esiid, start_date, end_date, status, rate, est_kwh, adder, sales_agent")
+        .in_("status", ["Active", "Inactive"])
+        .execute()
+        .data or []
+    )
+    valid = [d for d in deals if d.get("esiid") and d.get("start_date")]
+
+    if not valid:
+        return {
+            "summary": {
+                "deals_analyzed": 0, "total_payments_expected": 0,
+                "total_payments_received": 0, "total_payments_missing": 0,
+                "pct_received": 0, "est_missing_commission": 0,
+            },
+            "deals": [],
+        }
+
+    # Batch-fetch all actual commissions for these ESIIDs (both raw and normalized)
+    raw_esiids = list({d["esiid"] for d in valid})
+    # Also include normalized forms to cast a wider net
+    norm_esiids = list({_norm_esiid(e) for e in raw_esiids if _norm_esiid(e)})
+
+    actuals_raw  = db.table("actual_commissions").select("raw_esiid, billing_month, raw_amount").in_("raw_esiid", raw_esiids).execute().data or []
+    # Also try fetching by normalized esiid where raw may differ (scientific notation etc.)
+    actuals_norm = db.table("actual_commissions").select("raw_esiid, billing_month, raw_amount").execute().data or []
+
+    # Build paid map: norm_esiid → {billing_month: amount}
+    paid: dict = defaultdict(dict)
+    for a in actuals_norm:
+        norm = _norm_esiid(a.get("raw_esiid") or "")
+        if norm:
+            month = (a.get("billing_month") or "")[:7]
+            if month:
+                paid[norm][month] = float(a.get("raw_amount") or 0)
+    # Also index by raw esiid (no normalization) for exact matches
+    paid_raw: dict = defaultdict(dict)
+    for a in actuals_raw:
+        raw = str(a.get("raw_esiid") or "").strip()
+        month = (a.get("billing_month") or "")[:7]
+        if raw and month:
+            paid_raw[raw][month] = float(a.get("raw_amount") or 0)
+
+    # Batch-fetch lead names
+    lead_ids = list({d["lead_id"] for d in valid if d.get("lead_id")})
+    leads_data: dict = {}
+    if lead_ids:
+        leads_res = db.table("leads").select("id, first_name, last_name").in_("id", lead_ids).execute().data or []
+        leads_data = {l["id"]: l for l in leads_res}
+
+    results = []
+    for deal in valid:
+        esiid_raw  = str(deal["esiid"]).strip()
+        esiid_norm = _norm_esiid(esiid_raw)
+
+        expected_months = _months_between(deal["start_date"], deal.get("end_date"), now)
+        if not expected_months:
+            continue
+
+        # Merge paid months from both raw and normalized lookups
+        paid_months_map: dict = {}
+        paid_months_map.update(paid.get(esiid_norm, {}))
+        paid_months_map.update(paid_raw.get(esiid_raw, {}))
+
+        paid_list    = sorted(m for m in expected_months if m in paid_months_map)
+        missing_list = sorted(m for m in expected_months if m not in paid_months_map)
+
+        # Extra payments received outside the contract window
+        extra_list = sorted(m for m in paid_months_map if m not in expected_months)
+
+        commission_pm = float(deal.get("est_kwh") or 0) * float(deal.get("adder") or 0)
+
+        lead = leads_data.get(deal.get("lead_id") or "")
+        lead_name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip() if lead else "—"
+
+        results.append({
+            "deal_id":              deal["id"],
+            "lead_id":              deal.get("lead_id"),
+            "lead_name":            lead_name,
+            "supplier":             deal.get("supplier") or "—",
+            "sales_agent":          deal.get("sales_agent") or "Unassigned",
+            "esiid":                esiid_raw,
+            "status":               deal["status"],
+            "start_date":           deal["start_date"][:10],
+            "end_date":             (deal.get("end_date") or "")[:10] or None,
+            "contract_months":      len(expected_months),
+            "expected_months":      expected_months,
+            "paid_months":          paid_list,
+            "missing_months":       missing_list,
+            "extra_months":         extra_list,
+            "payments_expected":    len(expected_months),
+            "payments_received":    len(paid_list),
+            "payments_missing":     len(missing_list),
+            "est_monthly_comm":     round(commission_pm, 2),
+            "est_missing_comm":     round(len(missing_list) * commission_pm, 2),
+            "est_total_comm":       round(len(expected_months) * commission_pm, 2),
+            "pct_received":         round(len(paid_list) / len(expected_months) * 100, 1) if expected_months else 0,
+        })
+
+    results.sort(key=lambda x: (x["payments_missing"], -x["est_missing_comm"]), reverse=True)
+
+    total_expected  = sum(r["payments_expected"]  for r in results)
+    total_received  = sum(r["payments_received"]  for r in results)
+    total_missing   = sum(r["payments_missing"]   for r in results)
+    est_missing_com = sum(r["est_missing_comm"]   for r in results)
+
+    return {
+        "summary": {
+            "deals_analyzed":          len(results),
+            "total_payments_expected": total_expected,
+            "total_payments_received": total_received,
+            "total_payments_missing":  total_missing,
+            "pct_received":            round(total_received / total_expected * 100, 1) if total_expected else 0,
+            "est_missing_commission":  round(est_missing_com, 2),
+        },
+        "deals": results,
     }
