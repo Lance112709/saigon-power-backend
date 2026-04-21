@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import re
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
-from app.api.v1.tasks import create_lead_tasks, create_deal_renewal_tasks
+from app.api.v1.tasks import create_lead_tasks
 
 router = APIRouter()
 
@@ -274,16 +274,6 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
 
     if deal["status"] == "Active":
         _try_convert(db, id)
-
-    if deal.get("end_date"):
-        lead_row = db.table("leads").select("first_name, last_name").eq("id", id).limit(1).execute()
-        lead_name = ""
-        if lead_row.data:
-            lead_name = f"{lead_row.data[0].get('first_name','')} {lead_row.data[0].get('last_name','')}".strip()
-        try:
-            create_deal_renewal_tasks(db, id, deal["id"], lead_name, deal["end_date"])
-        except Exception:
-            pass
 
     return deal
 
