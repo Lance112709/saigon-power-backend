@@ -2,7 +2,7 @@ from fastapi import APIRouter, Query, Depends
 from typing import Optional
 from datetime import date, datetime, timezone, timedelta
 from app.db.client import get_client
-from app.auth.deps import require_manager, UserContext
+from app.auth.deps import require_manager, get_current_user, UserContext
 
 router = APIRouter()
 
@@ -50,7 +50,7 @@ def get_overview(billing_month: Optional[str] = Query(None), user: UserContext =
     }
 
 @router.get("/leads-stats")
-def get_leads_stats():
+def get_leads_stats(user: UserContext = Depends(get_current_user)):
     db = get_client()
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
@@ -101,7 +101,7 @@ def get_leads_stats():
     }
 
 @router.get("/commission-history")
-def get_commission_history():
+def get_commission_history(user: UserContext = Depends(get_current_user)):
     db = get_client()
     twelve_ago = (datetime.now(timezone.utc) - timedelta(days=365)).date().isoformat()
     res = db.table("lead_deals").select("start_date, est_kwh, adder").eq("status", "Active").gte("start_date", twelve_ago).execute()
@@ -115,7 +115,7 @@ def get_commission_history():
     return [{"month": m, "amount": round(monthly[m], 2)} for m in sorted_months]
 
 @router.get("/revenue-forecast")
-def get_revenue_forecast():
+def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
     db = get_client()
     today = date.today()
     cutoff = date(today.year + 2, today.month, 1)
@@ -207,7 +207,7 @@ def get_revenue_forecast():
     }
 
 @router.get("/supplier-breakdown")
-def supplier_breakdown(billing_month: Optional[str] = Query(None)):
+def supplier_breakdown(billing_month: Optional[str] = Query(None), user: UserContext = Depends(get_current_user)):
     db = get_client()
     month = billing_month or get_latest_month(db)
 

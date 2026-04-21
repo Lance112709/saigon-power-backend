@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException, Query, Body
+from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from app.db.client import get_client
+from app.auth.deps import get_current_user, UserContext
 
 router = APIRouter()
 
@@ -89,7 +90,7 @@ def create_deal_renewal_tasks(db, lead_id: str, deal_id: str, lead_name: str, en
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
-def task_stats():
+def task_stats(user: UserContext = Depends(get_current_user)):
     db = get_client()
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -114,9 +115,10 @@ def list_tasks(
     deal_id:      Optional[str] = Query(None),
     customer_id:  Optional[str] = Query(None),
     crm_deal_id:  Optional[str] = Query(None),
-    window:       Optional[str] = Query(None),  # overdue | today | upcoming | completed
+    window:       Optional[str] = Query(None),
     limit:  int = Query(200),
     offset: int = Query(0),
+    user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
     now         = datetime.now(timezone.utc)
@@ -161,7 +163,7 @@ def list_tasks(
     return results
 
 @router.post("")
-def create_task(data: dict = Body(...)):
+def create_task(data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     if not data.get("lead_id") and not data.get("deal_id") and not data.get("customer_id") and not data.get("crm_deal_id"):
         raise HTTPException(status_code=400, detail="Task must be linked to a lead, deal, or customer")
@@ -187,7 +189,7 @@ def create_task(data: dict = Body(...)):
     return res.data[0]
 
 @router.patch("/{task_id}")
-def update_task(task_id: str, data: dict = Body(...)):
+def update_task(task_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     allowed = {"title", "description", "due_date", "status", "priority", "assigned_to", "task_type"}
     payload = {k: v for k, v in data.items() if k in allowed}
@@ -201,7 +203,7 @@ def update_task(task_id: str, data: dict = Body(...)):
     return res.data[0]
 
 @router.delete("/{task_id}")
-def delete_task(task_id: str):
+def delete_task(task_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
     db.table("tasks").delete().eq("id", task_id).execute()
     return {"ok": True}

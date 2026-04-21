@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
+from app.auth.deps import get_current_user, require_admin, UserContext
 from pydantic import BaseModel
 from typing import Optional
 from app.db.client import get_client
@@ -18,19 +19,19 @@ class SupplierUpdate(BaseModel):
     notes: Optional[str] = None
 
 @router.get("")
-def list_suppliers():
+def list_suppliers(user: UserContext = Depends(get_current_user)):
     db = get_client()
     res = db.table("suppliers").select("*").order("name").execute()
     return res.data
 
 @router.post("")
-def create_supplier(body: SupplierCreate):
+def create_supplier(body: SupplierCreate, user: UserContext = Depends(require_admin)):
     db = get_client()
     res = db.table("suppliers").insert(body.model_dump()).execute()
     return res.data[0]
 
 @router.get("/{id}")
-def get_supplier(id: str):
+def get_supplier(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
     res = db.table("suppliers").select("*").eq("id", id).single().execute()
     if not res.data:
@@ -38,7 +39,7 @@ def get_supplier(id: str):
     return res.data
 
 @router.patch("/{id}")
-def update_supplier(id: str, body: SupplierUpdate):
+def update_supplier(id: str, body: SupplierUpdate, user: UserContext = Depends(require_admin)):
     db = get_client()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     res = db.table("suppliers").update(updates).eq("id", id).execute()

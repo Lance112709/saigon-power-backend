@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from app.auth.deps import get_current_user, require_admin, UserContext
 from pydantic import BaseModel
 from typing import Optional
 from app.db.client import get_client
@@ -27,7 +28,8 @@ class CustomerUpdate(BaseModel):
 @router.get("")
 def list_customers(
     search: Optional[str] = Query(None),
-    is_active: Optional[bool] = Query(None)
+    is_active: Optional[bool] = Query(None),
+    user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
     q = db.table("customers").select("*").order("business_name")
@@ -41,13 +43,13 @@ def list_customers(
     return data
 
 @router.post("")
-def create_customer(body: CustomerCreate):
+def create_customer(body: CustomerCreate, user: UserContext = Depends(require_admin)):
     db = get_client()
     res = db.table("customers").insert(body.model_dump()).execute()
     return res.data[0]
 
 @router.get("/{id}")
-def get_customer(id: str):
+def get_customer(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
     customer = db.table("customers").select("*").eq("id", id).single().execute()
     if not customer.data:
@@ -61,7 +63,7 @@ def get_customer(id: str):
     }
 
 @router.patch("/{id}")
-def update_customer(id: str, body: CustomerUpdate):
+def update_customer(id: str, body: CustomerUpdate, user: UserContext = Depends(require_admin)):
     db = get_client()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     res = db.table("customers").update(updates).eq("id", id).execute()

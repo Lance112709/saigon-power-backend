@@ -1,7 +1,8 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Depends
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from app.db.client import get_client
+from app.auth.deps import get_current_user, UserContext
 
 router = APIRouter()
 
@@ -187,9 +188,10 @@ def _score_crm_customer(customer: dict, deals: list, tasks: list) -> tuple[int, 
 
 @router.get("")
 def get_call_list(
-    type_filter:     Optional[str] = Query(None),   # leads | customers
-    priority_filter: Optional[str] = Query(None),   # high
+    type_filter:     Optional[str] = Query(None),
+    priority_filter: Optional[str] = Query(None),
     limit:           int           = Query(20),
+    user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
     now = _now()

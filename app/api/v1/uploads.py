@@ -109,7 +109,7 @@ def list_uploads(supplier_id: Optional[str] = None, user: UserContext = Depends(
     return q.execute().data
 
 @router.get("/{id}")
-def get_upload(id: str):
+def get_upload(id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
     res = db.table("upload_batches").select("*, suppliers(name, code)").eq("id", id).single().execute()
     if not res.data:
@@ -122,7 +122,8 @@ def confirm_upload(
     file_hash: str = Body(...),
     supplier_id: str = Body(...),
     billing_month: str = Body(...),
-    column_mapping: dict = Body(...)
+    column_mapping: dict = Body(...),
+    user: UserContext = Depends(require_admin),
 ):
     db = get_client()
     batch = db.table("upload_batches").select("*").eq("id", id).single().execute()
@@ -197,7 +198,7 @@ def confirm_upload(
     }
 
 @router.post("/{id}/reject")
-def reject_upload(id: str, reason: str = ""):
+def reject_upload(id: str, reason: str = "", user: UserContext = Depends(require_admin)):
     db = get_client()
     db.table("upload_batches").update({
         "status": "failed",
