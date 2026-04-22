@@ -148,10 +148,12 @@ def list_lead_customers(
         name = _full_name(lead)
         if search and search.lower() not in name.lower() and search.lower() not in (lead.get("phone") or "").lower():
             continue
+        start_dates = [d.get("start_date") for d in deals if d.get("start_date")]
+        contract_start = min(start_dates) if start_dates else None
         results.append({
             "id": c["id"],
             "lead_id": c["lead_id"],
-            "customer_since": c["created_at"],
+            "customer_since": contract_start or c["created_at"],
             "full_name": name,
             "sgp_customer_id": lead.get("sgp_customer_id"),
             "business_name": lead.get("business_name"),
