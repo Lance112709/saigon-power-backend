@@ -100,6 +100,36 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         "recent_leads": recent_leads,
     }
 
+@router.get("/expiring-deals")
+def get_expiring_deals(user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    today = datetime.now(timezone.utc).date()
+    thirty_out = (today + timedelta(days=30)).isoformat()
+    today_str = today.isoformat()
+
+    res = db.table("lead_deals").select(
+        "id, end_date, supplier, plan_name, contract_term, lead_id, leads(first_name, last_name, phone, sgp_customer_id)"
+    ).eq("status", "Active").lte("end_date", thirty_out).gte("end_date", today_str).order("end_date").execute()
+
+    results = []
+    for d in res.data:
+        lead = d.pop("leads", None) or {}
+        end = d.get("end_date")
+        days_left = (date.fromisoformat(end) - today).days if end else None
+        results.append({
+            "deal_id":        d["id"],
+            "lead_id":        d.get("lead_id"),
+            "sgp_customer_id": lead.get("sgp_customer_id"),
+            "full_name":      f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
+            "phone":          lead.get("phone"),
+            "supplier":       d.get("supplier"),
+            "plan_name":      d.get("plan_name"),
+            "contract_term":  d.get("contract_term"),
+            "end_date":       end,
+            "days_left":      days_left,
+        })
+    return results
+
 @router.get("/commission-history")
 def get_commission_history(user: UserContext = Depends(get_current_user)):
     db = get_client()
