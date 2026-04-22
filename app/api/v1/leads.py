@@ -153,6 +153,7 @@ def list_lead_customers(
             "customer_since": c["created_at"],
             "full_name": name,
             "sgp_customer_id": lead.get("sgp_customer_id"),
+            "business_name": lead.get("business_name"),
             "phone": lead.get("phone"),
             "email": lead.get("email"),
             "address": lead.get("address"),
