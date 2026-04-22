@@ -279,10 +279,6 @@ def create_lead(data: dict = Body(...)):
     new_lead = res.data[0]
     lead_name = f"{payload['first_name']} {payload['last_name']}"
     try:
-        create_lead_tasks(db, new_lead["id"], lead_name)
-    except Exception:
-        pass
-    try:
         from app.services.sms import send_automated
         send_automated(
             "new_lead",
