@@ -268,6 +268,7 @@ def create_lead(data: dict = Body(...)):
         "phone2":         str(data.get("phone2") or "").strip() or None,
         "email2":         str(data.get("email2") or "").strip().lower() or None,
         "referral_by":    str(data.get("referral_by") or "").strip() or None,
+        "sales_agent":    str(data.get("sales_agent") or "").strip() or None,
         "status":         "lead",
         "source":         str(data.get("source") or "manual").strip(),
     }
