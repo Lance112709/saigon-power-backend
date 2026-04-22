@@ -71,6 +71,7 @@ def _deal_payload(data: dict) -> dict:
         "supplier":            str(data.get("supplier") or "").strip() or None,
         "plan_name":           str(data.get("plan_name") or "").strip() or None,
         "product_type":        str(data.get("product_type") or "").strip() or None,
+        "rate_type":           str(data.get("rate_type") or "").strip() or None,
         "contract_term":       str(data.get("contract_term") or "").strip() or None,
         "rate":                _f("rate"),
         "adder":               _f("adder"),
@@ -387,7 +388,7 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
     db = get_client()
     allowed = {
         "flag_tos", "flag_toao", "flag_deposit", "flag_special_deal", "flag_promo_10",
-        "status", "supplier", "plan_name", "product_type", "contract_term",
+        "status", "supplier", "plan_name", "product_type", "rate_type", "contract_term",
         "rate", "adder", "est_kwh", "expected_close_date", "start_date", "end_date",
         "service_address", "service_city", "service_state", "service_zip", "esiid",
         "sales_agent", "deal_type", "service_order_type", "notes",
