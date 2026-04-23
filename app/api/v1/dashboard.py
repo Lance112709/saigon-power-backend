@@ -137,9 +137,12 @@ def get_expiring_deals(user: UserContext = Depends(get_current_user)):
 
     res = q.execute()
 
-    if user.is_sales_agent and not user.sales_agent_name:
-        return []
-    agent_name = user.sales_agent_name if user.is_sales_agent else None
+    agent_name = None
+    if user.is_sales_agent:
+        u = db.table("users").select("sales_agent_name").eq("id", user.user_id).limit(1).execute()
+        agent_name = (u.data[0].get("sales_agent_name") or "").strip() or None
+        if not agent_name:
+            return []
     results = []
     for d in res.data:
         lead = d.pop("leads", None) or {}
