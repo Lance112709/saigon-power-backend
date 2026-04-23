@@ -58,23 +58,46 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
     thirty_days_out = (now + timedelta(days=30)).date().isoformat()
     today_str = now.date().isoformat()
 
-    leads_today = db.table("leads").select("id", count="exact").gte("created_at", today_start).execute()
-    leads_week  = db.table("leads").select("id", count="exact").gte("created_at", week_start).execute()
+    # Sales agent scope
+    is_agent = user.is_sales_agent
+    agent_name = user.sales_agent_name if is_agent else None
 
-    active_deals = db.table("lead_deals").select("id, est_kwh, adder", count="exact").eq("status", "Active").execute()
-    expiring     = db.table("lead_deals").select("id", count="exact").eq("status", "Active").lte("end_date", thirty_days_out).gte("end_date", today_str).execute()
+    def leads_q():
+        q = db.table("leads").select("id", count="exact")
+        if agent_name:
+            q = q.eq("sales_agent", agent_name)
+        return q
 
-    leads_count     = db.table("leads").select("id", count="exact").eq("status", "lead").execute()
-    converted_count = db.table("leads").select("id", count="exact").eq("status", "converted").execute()
-    pipeline = {
-        "lead":      leads_count.count or 0,
-        "converted": converted_count.count or 0,
-    }
+    leads_today = leads_q().gte("created_at", today_start).execute()
+    leads_week  = leads_q().gte("created_at", week_start).execute()
 
+    # For deals, we need lead_ids scoped to this agent
+    if agent_name:
+        scoped_leads = db.table("leads").select("id").eq("sales_agent", agent_name).execute().data or []
+        scoped_ids = [l["id"] for l in scoped_leads]
+        if not scoped_ids:
+            return {
+                "leads_today": 0, "leads_this_week": 0, "active_deals": 0,
+                "expiring_soon": 0, "pipeline": {"lead": 0, "converted": 0},
+                "portfolio": {"active_contracts": 0, "total_kwh": 0, "commission_mo": 0, "at_risk": 0},
+                "recent_leads": [],
+            }
+        active_deals = db.table("lead_deals").select("id, est_kwh, adder", count="exact").eq("status", "Active").in_("lead_id", scoped_ids).execute()
+        expiring     = db.table("lead_deals").select("id", count="exact").eq("status", "Active").in_("lead_id", scoped_ids).lte("end_date", thirty_days_out).gte("end_date", today_str).execute()
+        leads_count     = db.table("leads").select("id", count="exact").eq("status", "lead").eq("sales_agent", agent_name).execute()
+        converted_count = db.table("leads").select("id", count="exact").eq("status", "converted").eq("sales_agent", agent_name).execute()
+        recent_raw = db.table("leads").select("*, lead_deals(id, status, product_type)").eq("sales_agent", agent_name).order("created_at", desc=True).limit(5).execute()
+    else:
+        active_deals = db.table("lead_deals").select("id, est_kwh, adder", count="exact").eq("status", "Active").execute()
+        expiring     = db.table("lead_deals").select("id", count="exact").eq("status", "Active").lte("end_date", thirty_days_out).gte("end_date", today_str).execute()
+        leads_count     = db.table("leads").select("id", count="exact").eq("status", "lead").execute()
+        converted_count = db.table("leads").select("id", count="exact").eq("status", "converted").execute()
+        recent_raw = db.table("leads").select("*, lead_deals(id, status, product_type)").order("created_at", desc=True).limit(5).execute()
+
+    pipeline = {"lead": leads_count.count or 0, "converted": converted_count.count or 0}
     total_kwh     = sum((r.get("est_kwh") or 0) for r in active_deals.data)
     commission_mo = sum((r.get("est_kwh") or 0) * (r.get("adder") or 0) for r in active_deals.data)
 
-    recent_raw = db.table("leads").select("*, lead_deals(id, status, product_type)").order("created_at", desc=True).limit(5).execute()
     recent_leads = []
     for l in recent_raw.data:
         deals = l.pop("lead_deals", []) or []
@@ -107,13 +130,19 @@ def get_expiring_deals(user: UserContext = Depends(get_current_user)):
     thirty_out = (today + timedelta(days=30)).isoformat()
     today_str = today.isoformat()
 
-    res = db.table("lead_deals").select(
-        "id, end_date, supplier, plan_name, contract_term, lead_id, leads(first_name, last_name, phone, sgp_customer_id)"
-    ).eq("status", "Active").lte("end_date", thirty_out).gte("end_date", today_str).order("end_date").execute()
+    q = db.table("lead_deals").select(
+        "id, end_date, supplier, plan_name, contract_term, lead_id, leads(first_name, last_name, phone, sgp_customer_id, sales_agent)"
+    ).eq("status", "Active").lte("end_date", thirty_out).gte("end_date", today_str).order("end_date")
 
+    res = q.execute()
+
+    agent_name = user.sales_agent_name if user.is_sales_agent else None
     results = []
     for d in res.data:
         lead = d.pop("leads", None) or {}
+        # Filter by sales agent
+        if agent_name and (lead.get("sales_agent") or "").lower() != agent_name.lower():
+            continue
         end = d.get("end_date")
         days_left = (date.fromisoformat(end) - today).days if end else None
         results.append({
