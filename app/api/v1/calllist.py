@@ -81,6 +81,9 @@ def get_call_list(
     for d in all_deals:
         deals_by_lead.setdefault(d["lead_id"], []).append(d)
 
+    # Sales agents only see their own customers — if no agent name mapped, return nothing
+    if user.is_sales_agent and not user.sales_agent_name:
+        return []
     agent_name = user.sales_agent_name if user.is_sales_agent else None
 
     for c in customers:

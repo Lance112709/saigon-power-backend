@@ -173,11 +173,13 @@ def list_lead_customers(
         .execute()
     )
     results = []
+    # Sales agents only see their own customers — if no agent name mapped, return nothing
+    if user.is_sales_agent and not user.sales_agent_name:
+        return []
     agent_name = user.sales_agent_name if user.is_sales_agent else None
     for c in res.data:
         lead = c.get("leads") or {}
         deals = lead.pop("lead_deals", []) or []
-        # Sales agents only see their own customers
         if agent_name:
             lead_agent = (lead.get("sales_agent") or "").strip().lower()
             deal_agents = [(d.get("sales_agent") or "").strip().lower() for d in deals]
@@ -238,8 +240,10 @@ def list_dropped_deals(
         q = q.eq("supplier", supplier)
     if sales_agent:
         q = q.eq("sales_agent", sales_agent)
-    # Sales agents only see their own deals
-    if user.is_sales_agent and user.sales_agent_name:
+    # Sales agents only see their own deals — if no agent name mapped, return nothing
+    if user.is_sales_agent:
+        if not user.sales_agent_name:
+            return []
         q = q.eq("sales_agent", user.sales_agent_name)
     res = q.order("updated_at", desc=True).range(offset, offset + limit - 1).execute()
     results = []
@@ -276,8 +280,10 @@ def list_leads(
         )
     if status:
         q = q.eq("status", status)
-    # Sales agents only see their own leads
-    if user.is_sales_agent and user.sales_agent_name:
+    # Sales agents only see their own leads — if no agent name mapped, return nothing
+    if user.is_sales_agent:
+        if not user.sales_agent_name:
+            return []
         q = q.eq("sales_agent", user.sales_agent_name)
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     return [_shape_lead(lead) for lead in res.data]
