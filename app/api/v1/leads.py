@@ -109,14 +109,45 @@ def create_agent(data: dict = Body(...), user: UserContext = Depends(require_man
     if not name:
         raise HTTPException(status_code=400, detail="'name' is required")
     agent_type = str(data.get("agent_type") or "").strip() or None
+    phone = str(data.get("phone") or "").strip() or None
+
+    # Auto-generate agent code: FirstName + last 4 digits of phone
+    first_name = name.split()[0].upper()
+    digits = "".join(c for c in (phone or "") if c.isdigit())
+    last4 = digits[-4:] if len(digits) >= 4 else digits.zfill(4)
+    agent_code = f"{first_name}{last4}" if last4 else first_name
+
     payload = {
         "name":       name,
         "agent_type": agent_type,
         "email":      str(data.get("email") or "").strip() or None,
-        "phone":      str(data.get("phone") or "").strip() or None,
+        "phone":      phone,
+        "agent_code": agent_code,
     }
     res = db.table("sales_agents").insert(payload).execute()
     return res.data[0]
+
+@router.patch("/agents/{agent_id}")
+def update_agent(agent_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
+    if user.role not in ("admin", "manager"):
+        raise HTTPException(status_code=403, detail="Admin or Manager only")
+    db = get_client()
+    allowed = {"name", "agent_type", "email", "phone"}
+    payload = {k: v for k, v in data.items() if k in allowed}
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields")
+    # If phone changed, regenerate agent_code
+    if "phone" in payload or "name" in payload:
+        existing = db.table("sales_agents").select("name, phone").eq("id", agent_id).limit(1).execute().data
+        current = existing[0] if existing else {}
+        name  = payload.get("name",  current.get("name",  ""))
+        phone = payload.get("phone", current.get("phone", ""))
+        first_name = (name or "").split()[0].upper() if name else ""
+        digits = "".join(c for c in (phone or "") if c.isdigit())
+        last4  = digits[-4:] if len(digits) >= 4 else digits.zfill(4)
+        payload["agent_code"] = f"{first_name}{last4}" if last4 else first_name
+    res = db.table("sales_agents").update(payload).eq("id", agent_id).execute()
+    return res.data[0] if res.data else {}
 
 @router.delete("/agents/{agent_id}")
 def delete_agent(agent_id: str, user: UserContext = Depends(require_manager)):
