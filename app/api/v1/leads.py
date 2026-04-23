@@ -401,6 +401,15 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
         raise HTTPException(status_code=400, detail="'status' is required")
 
     payload = {"lead_id": id, **_deal_payload(data)}
+
+    # For Residential deals, auto-fill adder from supplier's default_adder
+    if str(data.get("product_type") or "").strip().lower() == "residential" and not payload.get("adder"):
+        supplier_name = str(data.get("supplier") or "").strip()
+        if supplier_name:
+            sup = db.table("suppliers").select("default_adder").ilike("name", supplier_name).limit(1).execute()
+            if sup.data and sup.data[0].get("default_adder") is not None:
+                payload["adder"] = float(sup.data[0]["default_adder"])
+
     try:
         res = db.table("lead_deals").insert(payload).execute()
     except Exception as e:

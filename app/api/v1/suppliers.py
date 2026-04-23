@@ -17,6 +17,7 @@ class SupplierUpdate(BaseModel):
     contact_email: Optional[str] = None
     is_active: Optional[bool] = None
     notes: Optional[str] = None
+    default_adder: Optional[float] = None
 
 @router.get("")
 def list_suppliers(user: UserContext = Depends(get_current_user)):
@@ -41,6 +42,6 @@ def get_supplier(id: str, user: UserContext = Depends(get_current_user)):
 @router.patch("/{id}")
 def update_supplier(id: str, body: SupplierUpdate, user: UserContext = Depends(require_admin)):
     db = get_client()
-    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    updates = {k: v for k, v in body.model_dump().items() if v is not None or k == "default_adder"}
     res = db.table("suppliers").update(updates).eq("id", id).execute()
     return res.data[0]
