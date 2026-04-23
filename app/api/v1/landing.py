@@ -18,8 +18,8 @@ def update_landing_plan(
     data: dict,
     user: UserContext = Depends(get_current_user),
 ):
-    if user.role != "admin":
-        raise HTTPException(status_code=403, detail="Admin only")
+    if user.role not in ("admin", "manager"):
+        raise HTTPException(status_code=403, detail="Admin or Manager only")
 
     allowed = {"plan_name", "provider", "rate", "badge"}
     payload = {k: v for k, v in data.items() if k in allowed}
