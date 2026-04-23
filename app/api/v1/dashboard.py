@@ -59,9 +59,12 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
     today_str = now.date().isoformat()
 
     is_agent = user.is_sales_agent
-    agent_name = user.sales_agent_name if is_agent else None
+    # Always fetch fresh from DB — never trust stale token value
+    agent_name = None
+    if is_agent:
+        u = db.table("users").select("sales_agent_name").eq("id", user.user_id).limit(1).execute()
+        agent_name = (u.data[0].get("sales_agent_name") or "").strip() or None
 
-    # Sales agent with no name mapped → return zeros
     EMPTY_STATS = {
         "leads_today": 0, "leads_this_week": 0, "active_deals": 0,
         "expiring_soon": 0, "pipeline": {"lead": 0, "converted": 0},
