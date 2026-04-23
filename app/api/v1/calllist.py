@@ -45,14 +45,6 @@ def _score_customer(lead: dict, deals: list) -> tuple[int, list[str], str]:
                 score += 25
                 reasons.append(f"Renewal window opens soon ({days} days)")
                 action = "Start renewal conversation"
-            else:
-                score += 10
-                reasons.append("Active deal — routine check-in")
-                action = "Check in with customer"
-        else:
-            score += 10
-            reasons.append("Active deal — no end date set")
-            action = "Check in — verify contract end date"
 
         # Boost commercial accounts
         if str(deal.get("product_type") or "").lower() == "commercial":
@@ -89,10 +81,16 @@ def get_call_list(
     for d in all_deals:
         deals_by_lead.setdefault(d["lead_id"], []).append(d)
 
+    agent_name = user.sales_agent_name if user.is_sales_agent else None
+
     for c in customers:
         lead_id = c.get("lead_id")
         lead = c.get("leads") or {}
         deals = deals_by_lead.get(lead_id, [])
+
+        # Sales agents only see their own customers
+        if agent_name and (lead.get("sales_agent") or "").lower() != agent_name.lower():
+            continue
 
         score, reasons, action = _score_customer(lead, deals)
         if score == 0:

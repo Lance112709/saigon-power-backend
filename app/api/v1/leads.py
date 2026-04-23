@@ -173,9 +173,16 @@ def list_lead_customers(
         .execute()
     )
     results = []
+    agent_name = user.sales_agent_name if user.is_sales_agent else None
     for c in res.data:
         lead = c.get("leads") or {}
         deals = lead.pop("lead_deals", []) or []
+        # Sales agents only see their own customers
+        if agent_name:
+            lead_agent = (lead.get("sales_agent") or "").strip().lower()
+            deal_agents = [(d.get("sales_agent") or "").strip().lower() for d in deals]
+            if lead_agent != agent_name.lower() and not any(a == agent_name.lower() for a in deal_agents):
+                continue
         name = _full_name(lead)
         if search and search.lower() not in name.lower() and search.lower() not in (lead.get("phone") or "").lower():
             continue
@@ -231,6 +238,9 @@ def list_dropped_deals(
         q = q.eq("supplier", supplier)
     if sales_agent:
         q = q.eq("sales_agent", sales_agent)
+    # Sales agents only see their own deals
+    if user.is_sales_agent and user.sales_agent_name:
+        q = q.eq("sales_agent", user.sales_agent_name)
     res = q.order("updated_at", desc=True).range(offset, offset + limit - 1).execute()
     results = []
     for d in res.data:
@@ -266,6 +276,9 @@ def list_leads(
         )
     if status:
         q = q.eq("status", status)
+    # Sales agents only see their own leads
+    if user.is_sales_agent and user.sales_agent_name:
+        q = q.eq("sales_agent", user.sales_agent_name)
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     return [_shape_lead(lead) for lead in res.data]
 
@@ -329,6 +342,10 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
     lead = db.table("leads").select("*").eq("id", id).limit(1).execute()
     if not lead.data:
         raise HTTPException(status_code=404, detail="Lead not found")
+    # Sales agents can only view their own leads
+    if user.is_sales_agent and user.sales_agent_name:
+        if (lead.data[0].get("sales_agent") or "").lower() != user.sales_agent_name.lower():
+            raise HTTPException(status_code=403, detail="Access denied")
     deals = db.table("lead_deals").select("*").eq("lead_id", id).order("created_at", desc=True).execute()
     return {**lead.data[0], "full_name": _full_name(lead.data[0]), "deals": deals.data}
 
