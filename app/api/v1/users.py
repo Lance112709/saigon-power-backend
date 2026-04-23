@@ -87,7 +87,7 @@ def update_user(id: str, data: dict = Body(...), user: UserContext = Depends(req
     if id == user.user_id and data.get("role") and data["role"] != "admin":
         raise HTTPException(status_code=400, detail="Cannot remove admin role from yourself")
     db = get_client()
-    allowed = {"first_name", "last_name", "role", "status", "sales_agent_name"}
+    allowed = {"first_name", "last_name", "email", "role", "status", "sales_agent_name"}
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields")
