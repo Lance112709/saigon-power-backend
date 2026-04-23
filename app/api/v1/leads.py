@@ -96,6 +96,15 @@ def _deal_payload(data: dict) -> dict:
 
 # ── Sales Agents (declared BEFORE /{id}) ──────────────────────────────────────
 
+@router.get("/agents/lookup")
+def lookup_agent(code: str = Query(...)):
+    """Public — verify an agent_code and return the agent's name."""
+    db = get_client()
+    res = db.table("sales_agents").select("name, agent_type").ilike("agent_code", code.strip()).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Agent ID not found")
+    return {"name": res.data[0]["name"], "agent_type": res.data[0].get("agent_type")}
+
 @router.get("/agents")
 def list_agents(user: UserContext = Depends(get_current_user)):
     db = get_client()
