@@ -87,11 +87,27 @@ def list_proposals(
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
-    q = db.table("proposals").select("*")
+
+    # Sales agents only see proposals tied to their own leads
+    if user.is_sales_agent:
+        u = db.table("users").select("sales_agent_name").eq("id", user.user_id).limit(1).execute()
+        agent_name = (u.data[0].get("sales_agent_name") or "").strip() or None
+        if not agent_name:
+            return []
+        scoped = db.table("leads").select("id").eq("sales_agent", agent_name).execute()
+        scoped_ids = [r["id"] for r in (scoped.data or [])]
+        if not scoped_ids:
+            return []
+        if lead_id and lead_id not in scoped_ids:
+            return []
+        q = db.table("proposals").select("*").in_("lead_id", scoped_ids)
+    else:
+        q = db.table("proposals").select("*")
+        if lead_id:
+            q = q.eq("lead_id", lead_id)
+
     if status:
         q = q.eq("status", status)
-    if lead_id:
-        q = q.eq("lead_id", lead_id)
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     return res.data or []
 
@@ -164,7 +180,16 @@ def get_proposal(proposal_id: str, user: UserContext = Depends(get_current_user)
     res = db.table("proposals").select("*").eq("id", proposal_id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Proposal not found")
-    return res.data[0]
+    p = res.data[0]
+    if user.is_sales_agent and p.get("lead_id"):
+        u = db.table("users").select("sales_agent_name").eq("id", user.user_id).limit(1).execute()
+        agent_name = (u.data[0].get("sales_agent_name") or "").strip() or None
+        if not agent_name:
+            raise HTTPException(status_code=403, detail="Access denied")
+        lead = db.table("leads").select("sales_agent").eq("id", p["lead_id"]).limit(1).execute()
+        if not lead.data or (lead.data[0].get("sales_agent") or "").lower() != agent_name.lower():
+            raise HTTPException(status_code=403, detail="Access denied")
+    return p
 
 @router.patch("/{proposal_id}")
 def update_proposal(proposal_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
