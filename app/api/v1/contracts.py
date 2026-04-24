@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, Depends
+from fastapi import APIRouter, HTTPException, Query, Depends, UploadFile, File
 from app.auth.deps import get_current_user, require_admin, UserContext
 from pydantic import BaseModel
 from typing import Optional
@@ -24,6 +24,74 @@ class ContractUpdate(BaseModel):
     end_date: Optional[date] = None
     status: Optional[str] = None
     notes: Optional[str] = None
+
+class ContractTemplateUpdate(BaseModel):
+    html_content: str
+
+# ── Proposal contract template endpoints (defined before /{id} to avoid conflicts) ──
+
+@router.get("/template")
+def get_contract_template():
+    db = get_client()
+    res = db.table("contract_templates").select("*").order("id", desc=True).limit(1).execute()
+    if not res.data:
+        return {"id": None, "html_content": ""}
+    return res.data[0]
+
+@router.patch("/template")
+def update_contract_template(body: ContractTemplateUpdate, user: UserContext = Depends(get_current_user)):
+    if user.role not in ("admin", "manager"):
+        raise HTTPException(status_code=403, detail="Admin/Manager only")
+    db = get_client()
+    existing = db.table("contract_templates").select("id").order("id", desc=True).limit(1).execute()
+    if existing.data:
+        res = db.table("contract_templates").update({"html_content": body.html_content}).eq("id", existing.data[0]["id"]).execute()
+    else:
+        res = db.table("contract_templates").insert({"html_content": body.html_content}).execute()
+    return res.data[0]
+
+@router.post("/store/{token}")
+async def store_signed_contract(token: str, file: UploadFile = File(...)):
+    db = get_client()
+    proposal = db.table("proposals").select("id, status").eq("token", token).limit(1).execute()
+    if not proposal.data:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+
+    pdf_bytes = await file.read()
+    path = f"{token}.pdf"
+
+    try:
+        db.storage.from_("contracts").upload(path, pdf_bytes, {"content-type": "application/pdf", "upsert": "true"})
+    except Exception:
+        try:
+            db.storage.from_("contracts").remove([path])
+            db.storage.from_("contracts").upload(path, pdf_bytes, {"content-type": "application/pdf"})
+        except Exception as e2:
+            raise HTTPException(status_code=500, detail=f"Upload failed: {str(e2)}")
+
+    db.table("proposals").update({"signed_contract_url": path}).eq("token", token).execute()
+    return {"path": path}
+
+@router.get("/signed-url/{token}")
+def get_signed_url(token: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    proposal = db.table("proposals").select("signed_contract_url").eq("token", token).limit(1).execute()
+    if not proposal.data or not proposal.data[0].get("signed_contract_url"):
+        raise HTTPException(status_code=404, detail="No signed contract found")
+
+    path = proposal.data[0]["signed_contract_url"]
+    try:
+        result = db.storage.from_("contracts").create_signed_url(path, 3600)
+        # Handle different supabase-py response shapes
+        if hasattr(result, "data"):
+            url = (result.data or {}).get("signedUrl") or (result.data or {}).get("signedURL")
+        else:
+            url = result.get("signedUrl") or result.get("signedURL")
+        if not url:
+            raise ValueError("Empty signed URL")
+        return {"url": url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate signed URL: {str(e)}")
 
 @router.get("")
 def list_contracts(
