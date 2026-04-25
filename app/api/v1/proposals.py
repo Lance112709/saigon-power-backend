@@ -24,6 +24,35 @@ def view_proposal(token: str):
     elif p["status"] == "sent":
         db.table("proposals").update({"status": "viewed", "updated_at": _now()}).eq("token", token).execute()
         p["status"] = "viewed"
+
+    # Enrich with lead data (dob, ssn/anxh) and latest active deal (esiid, service address, start date)
+    if p.get("lead_id"):
+        try:
+            lead = db.table("leads").select("dob, anxh, email, phone").eq("id", p["lead_id"]).limit(1).execute()
+            if lead.data:
+                l = lead.data[0]
+                p.setdefault("dob", l.get("dob"))
+                p.setdefault("anxh", l.get("anxh"))
+                if not p.get("customer_email"):
+                    p["customer_email"] = l.get("email")
+                if not p.get("customer_phone"):
+                    p["customer_phone"] = l.get("phone")
+        except Exception:
+            pass
+        try:
+            deals = db.table("lead_deals").select("esiid, service_address, service_city, service_state, service_zip, start_date") \
+                .eq("lead_id", p["lead_id"]).order("created_at", desc=True).limit(1).execute()
+            if deals.data:
+                d = deals.data[0]
+                p.setdefault("esi_id", d.get("esiid"))
+                p.setdefault("service_address", ", ".join(filter(None, [
+                    d.get("service_address"), d.get("service_city"),
+                    d.get("service_state"), d.get("service_zip")
+                ])))
+                p.setdefault("start_date", d.get("start_date"))
+        except Exception:
+            pass
+
     return p
 
 @router.post("/accept/{token}")
