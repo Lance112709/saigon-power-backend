@@ -268,6 +268,52 @@ def list_dropped_deals(
         results.append({**d, "lead_name": name, "lead_phone": lead.get("phone"), "lead_address": f"{lead.get('address','')} {lead.get('city','')} {lead.get('state','')}".strip()})
     return results
 
+@router.get("/all-deals")
+def list_all_lead_deals(
+    search: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    supplier: Optional[str] = Query(None),
+    sales_agent: Optional[str] = Query(None),
+    product_type: Optional[str] = Query(None),
+    limit: int = Query(100),
+    offset: int = Query(0),
+    user: UserContext = Depends(get_current_user),
+):
+    db = get_client()
+    q = db.table("lead_deals").select("*, leads(id, first_name, last_name, phone, sgp_customer_id, status)")
+    if status:
+        q = q.eq("status", status)
+    if supplier:
+        q = q.ilike("supplier", f"%{supplier}%")
+    if sales_agent:
+        q = q.eq("sales_agent", sales_agent)
+    if product_type:
+        q = q.eq("product_type", product_type)
+    if user.is_sales_agent:
+        if not user.sales_agent_name:
+            return []
+        q = q.eq("sales_agent", user.sales_agent_name)
+    res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
+    results = []
+    for d in res.data:
+        lead = d.pop("leads", None) or {}
+        name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip()
+        if search:
+            s = search.lower()
+            if not (s in name.lower() or s in (d.get("supplier") or "").lower()
+                    or s in (d.get("sales_agent") or "").lower()
+                    or s in (d.get("esiid") or "").lower()):
+                continue
+        results.append({
+            **d,
+            "customer_name": name,
+            "customer_phone": lead.get("phone"),
+            "lead_id": lead.get("id"),
+            "sgp_customer_id": lead.get("sgp_customer_id"),
+            "lead_status": lead.get("status"),
+        })
+    return results
+
 # ── Leads List + Create ────────────────────────────────────────────────────────
 
 @router.get("")
