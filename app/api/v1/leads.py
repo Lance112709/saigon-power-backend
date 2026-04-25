@@ -276,6 +276,8 @@ def list_leads(
     status: Optional[str] = Query(None),
     limit: int = Query(50),
     offset: int = Query(0),
+    created_after: Optional[str] = Query(None),
+    count_only: bool = Query(False),
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
@@ -289,11 +291,15 @@ def list_leads(
         )
     if status:
         q = q.eq("status", status)
-    # Sales agents only see their own leads — if no agent name mapped, return nothing
+    if created_after:
+        q = q.gt("created_at", created_after)
     if user.is_sales_agent:
         if not user.sales_agent_name:
-            return []
+            return 0 if count_only else []
         q = q.eq("sales_agent", user.sales_agent_name)
+    if count_only:
+        res = q.execute()
+        return {"count": len(res.data)}
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     return [_shape_lead(lead) for lead in res.data]
 
