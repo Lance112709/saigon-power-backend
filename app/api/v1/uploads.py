@@ -244,3 +244,23 @@ def reject_upload(id: str, reason: str = "", user: UserContext = Depends(require
         "parse_errors": [{"reason": reason}]
     }).eq("id", id).execute()
     return {"status": "failed"}
+
+@router.patch("/{id}")
+def update_upload(id: str, data: dict = Body(...), user: UserContext = Depends(require_admin)):
+    db = get_client()
+    allowed = {"supplier_id", "original_filename"}
+    payload = {k: v for k, v in data.items() if k in allowed}
+    if not payload:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    res = db.table("upload_batches").update(payload).eq("id", id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    return res.data[0]
+
+@router.delete("/{id}")
+def delete_upload(id: str, user: UserContext = Depends(require_admin)):
+    db = get_client()
+    # Remove associated commission rows first
+    db.table("actual_commissions").delete().eq("upload_batch_id", id).execute()
+    db.table("upload_batches").delete().eq("id", id).execute()
+    return {"ok": True}
