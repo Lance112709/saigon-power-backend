@@ -123,6 +123,7 @@ def confirm_upload(
     supplier_id: str = Body(...),
     billing_month: str = Body(...),
     column_mapping: dict = Body(...),
+    amount_received: Optional[float] = Body(None),
     user: UserContext = Depends(require_admin),
 ):
     db = get_client()
@@ -220,20 +221,29 @@ def confirm_upload(
         for i in range(0, len(records), 100):
             db.table("actual_commissions").insert(records[i:i+100]).execute()
 
-    # Persist going_final list on the batch so it's retrievable later
+    total_affinity = round(sum(r["raw_amount"] for r in records), 2)
+    difference     = round(total_affinity - amount_received, 2) if amount_received is not None else None
+    amounts_match  = abs(difference) < 0.02 if difference is not None else None  # within 2 cents
+
     db.table("upload_batches").update({
-        "status":        "confirmed",
-        "confirmed_at":  datetime.utcnow().isoformat(),
-        "rows_imported": len(records),
-        "supplier_id":   supplier_id,
-        "going_final":   going_final if going_final else None,
+        "status":               "confirmed",
+        "confirmed_at":         datetime.utcnow().isoformat(),
+        "rows_imported":        len(records),
+        "supplier_id":          supplier_id,
+        "going_final":          going_final if going_final else None,
+        "amount_received":      amount_received,
+        "total_affinity_amount": total_affinity,
     }).eq("id", id).execute()
 
     return {
-        "status":        "confirmed",
-        "rows_imported": len(records),
-        "rows_skipped":  skipped,
-        "going_final":   going_final,
+        "status":               "confirmed",
+        "rows_imported":        len(records),
+        "rows_skipped":         skipped,
+        "going_final":          going_final,
+        "amount_received":      amount_received,
+        "total_affinity_amount": total_affinity,
+        "difference":           difference,
+        "amounts_match":        amounts_match,
     }
 
 @router.post("/{id}/reject")
