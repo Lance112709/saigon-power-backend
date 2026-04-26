@@ -153,8 +153,12 @@ def confirm_upload(
         raw_name   = str(_extract_value(row, name_col) or "")[:200]
         raw_status = str(_extract_value(row, status_col) or "").strip().lower() if status_col else ""
 
-        # Flag "going final" accounts before skipping
-        if "going final" in raw_status and raw_esiid:
+        # Flag accounts that are canceling — covers variations across all REPs
+        is_going_final = any(kw in raw_status for kw in [
+            "going final", "final", "cancelled", "canceled", "churned",
+            "terminating", "dropping", "drop", "cancel"
+        ])
+        if is_going_final and raw_esiid:
             # Try to find matching lead
             lead_match = None
             try:

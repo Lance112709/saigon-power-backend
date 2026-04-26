@@ -79,7 +79,8 @@ def _rule_based_mapping(headers: list) -> dict:
             mapping["rate"] = h
         elif "rate" in hl and "billed" not in hl:
             mapping["rate"] = h
-        elif any(k in hl for k in ["customer_status", "acct_status", "account_status", "status"]):
+        elif any(k in hl for k in ["customer_status", "acct_status", "account_status", "contract_status",
+                                    "service_status", "enrollment_status", "cust_status", "status"]):
             mapping["customer_status"] = h
 
     return {"mapping": mapping, "confidence": 0.7, "notes": "Rule-based mapping (no AI key set)"}
