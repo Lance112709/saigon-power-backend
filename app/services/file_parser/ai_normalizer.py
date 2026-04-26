@@ -10,6 +10,7 @@ identify which columns correspond to these fields:
 - amount: The commission or payment amount (dollars)
 - kwh: Electricity usage/consumption in kWh
 - rate: The commission rate (per kWh or percentage)
+- customer_status: The account/customer status (e.g. "Going Final", "Active", "Cancelled")
 
 Return a JSON object with this exact format:
 {
@@ -19,7 +20,8 @@ Return a JSON object with this exact format:
     "billing_month": "exact_column_name_or_null",
     "amount": "exact_column_name_or_null",
     "kwh": "exact_column_name_or_null",
-    "rate": "exact_column_name_or_null"
+    "rate": "exact_column_name_or_null",
+    "customer_status": "exact_column_name_or_null"
   },
   "confidence": 0.95,
   "notes": "any observations about the data format"
@@ -55,7 +57,8 @@ def _rule_based_mapping(headers: list) -> dict:
         "billing_month": None,
         "amount": None,
         "kwh": None,
-        "rate": None
+        "rate": None,
+        "customer_status": None,
     }
 
     for h in headers:
@@ -76,5 +79,7 @@ def _rule_based_mapping(headers: list) -> dict:
             mapping["rate"] = h
         elif "rate" in hl and "billed" not in hl:
             mapping["rate"] = h
+        elif any(k in hl for k in ["customer_status", "acct_status", "account_status", "status"]):
+            mapping["customer_status"] = h
 
     return {"mapping": mapping, "confidence": 0.7, "notes": "Rule-based mapping (no AI key set)"}

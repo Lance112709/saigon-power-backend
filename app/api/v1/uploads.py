@@ -135,18 +135,41 @@ def confirm_upload(
         raise HTTPException(status_code=400, detail="Parsed data not found. Please re-upload the file.")
 
     mapping = column_mapping.get("mapping", column_mapping)
-    esiid_col = mapping.get("esiid")
-    name_col = mapping.get("customer_name")
-    amount_col = mapping.get("amount")
-    kwh_col = mapping.get("kwh")
-    rate_col = mapping.get("rate")
-    date_col = mapping.get("billing_month")
+    esiid_col        = mapping.get("esiid")
+    name_col         = mapping.get("customer_name")
+    amount_col       = mapping.get("amount")
+    kwh_col          = mapping.get("kwh")
+    rate_col         = mapping.get("rate")
+    date_col         = mapping.get("billing_month")
+    status_col       = mapping.get("customer_status")
 
     records = []
     skipped = 0
+    going_final = []
+
     for row in rows:
-        raw_esiid = str(_extract_value(row, esiid_col) or "").strip()
+        raw_esiid  = str(_extract_value(row, esiid_col) or "").strip()
         raw_amount = _to_float(_extract_value(row, amount_col))
+        raw_name   = str(_extract_value(row, name_col) or "")[:200]
+        raw_status = str(_extract_value(row, status_col) or "").strip().lower() if status_col else ""
+
+        # Flag "going final" accounts before skipping
+        if "going final" in raw_status and raw_esiid:
+            # Try to find matching lead
+            lead_match = None
+            try:
+                ld = db.table("lead_deals").select("lead_id, leads(id, name, phone)") \
+                    .eq("esiid", raw_esiid).limit(1).execute()
+                if ld.data:
+                    lead_match = ld.data[0].get("leads")
+            except Exception:
+                pass
+            going_final.append({
+                "esiid":         raw_esiid,
+                "customer_name": raw_name,
+                "status":        str(_extract_value(row, status_col) or ""),
+                "lead":          lead_match,
+            })
 
         if not raw_esiid or raw_amount is None:
             skipped += 1
@@ -165,36 +188,38 @@ def confirm_upload(
         service_point_id = sp.data[0]["id"] if sp.data else None
 
         records.append({
-            "upload_batch_id": id,
-            "supplier_id": supplier_id,
+            "upload_batch_id":  id,
+            "supplier_id":      supplier_id,
             "service_point_id": service_point_id,
-            "billing_month": bm,
-            "raw_esiid": raw_esiid,
-            "raw_customer_name": str(_extract_value(row, name_col) or "")[:200],
-            "raw_amount": raw_amount,
-            "raw_kwh": _to_float(_extract_value(row, kwh_col)),
-            "raw_rate": _to_float(_extract_value(row, rate_col)),
-            "raw_row_data": row,
-            "resolved_esiid": raw_esiid,
-            "resolved_amount": raw_amount,
+            "billing_month":    bm,
+            "raw_esiid":        raw_esiid,
+            "raw_customer_name": raw_name,
+            "raw_amount":       raw_amount,
+            "raw_kwh":          _to_float(_extract_value(row, kwh_col)),
+            "raw_rate":         _to_float(_extract_value(row, rate_col)),
+            "raw_row_data":     row,
+            "resolved_esiid":   raw_esiid,
+            "resolved_amount":  raw_amount,
         })
 
     if records:
-        # Insert in chunks of 100
         for i in range(0, len(records), 100):
             db.table("actual_commissions").insert(records[i:i+100]).execute()
 
+    # Persist going_final list on the batch so it's retrievable later
     db.table("upload_batches").update({
-        "status": "confirmed",
-        "confirmed_at": datetime.utcnow().isoformat(),
+        "status":        "confirmed",
+        "confirmed_at":  datetime.utcnow().isoformat(),
         "rows_imported": len(records),
-        "supplier_id": supplier_id,
+        "supplier_id":   supplier_id,
+        "going_final":   going_final if going_final else None,
     }).eq("id", id).execute()
 
     return {
-        "status": "confirmed",
+        "status":        "confirmed",
         "rows_imported": len(records),
-        "rows_skipped": skipped
+        "rows_skipped":  skipped,
+        "going_final":   going_final,
     }
 
 @router.post("/{id}/reject")
