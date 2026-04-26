@@ -255,6 +255,51 @@ def reject_upload(id: str, reason: str = "", user: UserContext = Depends(require
     }).eq("id", id).execute()
     return {"status": "failed"}
 
+@router.get("/{id}/records")
+def get_upload_records(
+    id: str,
+    unmatched_only: bool = False,
+    limit: int = 200,
+    offset: int = 0,
+    user: UserContext = Depends(require_admin),
+):
+    db = get_client()
+    q = db.table("actual_commissions").select("*").eq("upload_batch_id", id)
+    if unmatched_only:
+        q = q.is_("service_point_id", "null")
+    res = q.order("raw_customer_name").range(offset, offset + limit - 1).execute()
+    return res.data or []
+
+@router.patch("/{batch_id}/records/{record_id}")
+def match_record(
+    batch_id: str,
+    record_id: str,
+    data: dict = Body(...),
+    user: UserContext = Depends(require_admin),
+):
+    """Manually link a commission record to a lead deal by ESI ID."""
+    db = get_client()
+    esiid = str(data.get("esiid") or "").strip()
+    if not esiid:
+        raise HTTPException(status_code=400, detail="esiid is required")
+
+    # Look up service point
+    sp = db.table("service_points").select("id").eq("esiid", esiid).execute()
+    service_point_id = sp.data[0]["id"] if sp.data else None
+
+    # Look up lead via lead_deals
+    lead_info = None
+    ld = db.table("lead_deals").select("lead_id, leads(id, name)").eq("esiid", esiid).limit(1).execute()
+    if ld.data:
+        lead_info = ld.data[0].get("leads")
+
+    db.table("actual_commissions").update({
+        "resolved_esiid":   esiid,
+        "service_point_id": service_point_id,
+    }).eq("id", record_id).execute()
+
+    return {"ok": True, "service_point_id": service_point_id, "lead": lead_info}
+
 @router.patch("/{id}")
 def update_upload(id: str, data: dict = Body(...), user: UserContext = Depends(require_admin)):
     db = get_client()
