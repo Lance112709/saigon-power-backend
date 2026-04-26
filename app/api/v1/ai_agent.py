@@ -428,3 +428,107 @@ def reconciliation_gap(user: UserContext = Depends(require_admin)):
         },
         "deals": results,
     }
+
+
+@router.get("/commission-tracker")
+def commission_tracker(months_back: int = Query(12), user: UserContext = Depends(require_admin)):
+    """
+    Returns monthly commission totals received per supplier + flags which
+    suppliers have not submitted a payment for each recent month.
+    """
+    db = get_client()
+    now = datetime.now(timezone.utc)
+
+    # Build list of last N months (YYYY-MM-01 strings)
+    month_list = []
+    for i in range(months_back - 1, -1, -1):
+        y = now.year - ((now.month - 1 - i + 12 * 100) // 12 - 100 if (now.month - 1 - i) < 0 else 0)
+        m = ((now.month - 1 - i) % 12) + 1
+        y = now.year + (now.month - 1 - i) // 12 - (1 if (now.month - 1 - i) < 0 else 0)
+        month_list.append(f"{y:04d}-{m:02d}-01")
+
+    # Easier: just subtract months properly
+    month_list = []
+    for i in range(months_back - 1, -1, -1):
+        total_months = now.month - 1 - i
+        y = now.year + total_months // 12
+        m = total_months % 12 + 1
+        if total_months < 0:
+            neg = abs(total_months)
+            y = now.year - (neg + 11) // 12
+            m = 12 - (neg - 1) % 12
+        month_list.append(f"{y:04d}-{m:02d}-01")
+
+    # Fetch all upload_batches (confirmed) with amount_received
+    batches = db.table("upload_batches") \
+        .select("id, supplier_id, billing_month_override:billing_month, amount_received, total_affinity_amount, confirmed_at, suppliers(name)") \
+        .eq("status", "confirmed") \
+        .execute().data or []
+
+    # Fetch actual_commissions aggregated by supplier + billing_month
+    actuals = db.table("actual_commissions") \
+        .select("supplier_id, billing_month, raw_amount") \
+        .execute().data or []
+
+    # Aggregate: total received per supplier per month
+    # Key: (supplier_id, billing_month YYYY-MM-01)
+    received: dict = defaultdict(float)
+    for row in actuals:
+        sid = row.get("supplier_id") or "unknown"
+        bm  = (row.get("billing_month") or "")[:7]  # YYYY-MM
+        if bm:
+            received[(sid, bm + "-01")] += float(row.get("raw_amount") or 0)
+
+    # Get all known suppliers that have sent any commission
+    supplier_ids = list({row.get("supplier_id") for row in actuals if row.get("supplier_id")})
+    suppliers_info: dict = {}
+    if supplier_ids:
+        s_rows = db.table("suppliers").select("id, name").in_("id", supplier_ids).execute().data or []
+        suppliers_info = {s["id"]: s["name"] for s in s_rows}
+
+    # Build per-month totals
+    monthly_totals = []
+    for bm in month_list:
+        label = datetime.strptime(bm, "%Y-%m-%d").strftime("%b '%y")
+        total = sum(v for (sid, m), v in received.items() if m == bm)
+        monthly_totals.append({"month": bm, "label": label, "total": round(total, 2)})
+
+    # Find missing: which suppliers had NO payment in each recent month
+    # Only flag months that are at least 30 days old
+    missing_by_month = []
+    for bm in month_list:
+        bm_dt = datetime.strptime(bm, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        age_days = (now - bm_dt).days
+        if age_days < 30:
+            continue
+        paid_suppliers = {sid for (sid, m) in received if m == bm and received[(sid, m)] > 0}
+        all_suppliers  = set(supplier_ids)
+        missing = []
+        for sid in all_suppliers:
+            if sid not in paid_suppliers:
+                missing.append({"supplier_id": sid, "supplier_name": suppliers_info.get(sid, sid)})
+        if missing:
+            missing_by_month.append({
+                "month": bm,
+                "label": datetime.strptime(bm, "%Y-%m-%d").strftime("%b %Y"),
+                "missing_suppliers": missing,
+            })
+
+    # Amount received vs affinity total per supplier (overall)
+    supplier_summary = []
+    for sid in supplier_ids:
+        name = suppliers_info.get(sid, sid)
+        total_recv = sum(v for (s, m), v in received.items() if s == sid)
+        supplier_summary.append({
+            "supplier_id":   sid,
+            "supplier_name": name,
+            "total_received": round(total_recv, 2),
+            "months_paid":   len({m for (s, m) in received if s == sid and received[(s, m)] > 0}),
+        })
+    supplier_summary.sort(key=lambda x: x["total_received"], reverse=True)
+
+    return {
+        "monthly_totals":   monthly_totals,
+        "missing_by_month": missing_by_month,
+        "supplier_summary": supplier_summary,
+    }
