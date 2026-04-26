@@ -93,7 +93,7 @@ def _rule_based_mapping(headers: list) -> dict:
                                     "service_status", "enrollment_status", "cust_status", "status"]):
             mapping["customer_status"] = h
 
-        elif any(k in hl for k in ["service_address", "premise_address", "address"]):
+        elif any(k in hl for k in ["service_address", "premise_address", "cust_premise", "service_addr", "address"]):
             mapping["service_address"] = h
 
         elif any(k in hl for k in ["affinity_rate", "broker_rate", "commission_rate", "mils", "mil"]):
