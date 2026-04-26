@@ -5,7 +5,9 @@ SYSTEM_PROMPT = """You are a data extraction assistant for an energy broker comm
 Given column headers and sample rows from a supplier commission statement,
 identify which columns correspond to these fields:
 - esiid: The Electric Service Identifier (long numeric ID, usually 17-22 digits)
-- customer_name: The customer or account name
+- customer_name: The customer or account name (full name in one column)
+- customer_first_name: Customer first name (if split into separate columns)
+- customer_last_name: Customer last name (if split into separate columns)
 - billing_month: The billing period or invoice date
 - amount: The commission or payment amount (dollars)
 - kwh: Electricity usage/consumption in kWh
@@ -21,7 +23,9 @@ Return a JSON object with this exact format:
     "amount": "exact_column_name_or_null",
     "kwh": "exact_column_name_or_null",
     "rate": "exact_column_name_or_null",
-    "customer_status": "exact_column_name_or_null"
+    "customer_status": "exact_column_name_or_null",
+    "customer_first_name": "exact_column_name_or_null",
+    "customer_last_name": "exact_column_name_or_null"
   },
   "confidence": 0.95,
   "notes": "any observations about the data format"
@@ -54,6 +58,8 @@ def _rule_based_mapping(headers: list) -> dict:
     mapping = {
         "esiid": None,
         "customer_name": None,
+        "customer_first_name": None,
+        "customer_last_name": None,
         "billing_month": None,
         "amount": None,
         "kwh": None,
@@ -65,7 +71,13 @@ def _rule_based_mapping(headers: list) -> dict:
         hl = h.lower().replace(" ", "_").replace("-", "_")
         if any(k in hl for k in ["esiid", "esi_id", "meter_id", "service_id", "premise_id", "premise"]):
             mapping["esiid"] = h
-        elif any(k in hl for k in ["customer_name", "customer", "account_name"]) and "id" not in hl and "number" not in hl:
+        elif any(k in hl for k in ["first_name", "firstname"]):
+            mapping["customer_first_name"] = h
+        elif any(k in hl for k in ["last_name", "lastname"]):
+            mapping["customer_last_name"] = h
+        elif any(k in hl for k in ["customer_name", "full_name", "account_name"]) and "id" not in hl and "number" not in hl:
+            mapping["customer_name"] = h
+        elif hl == "customer" and "id" not in hl:
             mapping["customer_name"] = h
         elif any(k in hl for k in ["invoice_from", "invoice_date", "billing_month", "period_start"]):
             mapping["billing_month"] = h

@@ -137,6 +137,8 @@ def confirm_upload(
     mapping = column_mapping.get("mapping", column_mapping)
     esiid_col        = mapping.get("esiid")
     name_col         = mapping.get("customer_name")
+    first_name_col   = mapping.get("customer_first_name")
+    last_name_col    = mapping.get("customer_last_name")
     amount_col       = mapping.get("amount")
     kwh_col          = mapping.get("kwh")
     rate_col         = mapping.get("rate")
@@ -150,7 +152,13 @@ def confirm_upload(
     for row in rows:
         raw_esiid  = str(_extract_value(row, esiid_col) or "").strip()
         raw_amount = _to_float(_extract_value(row, amount_col))
-        raw_name   = str(_extract_value(row, name_col) or "")[:200]
+        if name_col:
+            raw_name = str(_extract_value(row, name_col) or "").strip()
+        else:
+            first = str(_extract_value(row, first_name_col) or "").strip()
+            last  = str(_extract_value(row, last_name_col) or "").strip()
+            raw_name = " ".join(filter(None, [first, last]))
+        raw_name = raw_name[:200]
         raw_status = str(_extract_value(row, status_col) or "").strip().lower() if status_col else ""
 
         # Flag accounts that are canceling — covers variations across all REPs
