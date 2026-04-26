@@ -60,7 +60,7 @@ def _rule_based_mapping(headers: list) -> dict:
 
     for h in headers:
         hl = h.lower().replace(" ", "_").replace("-", "_")
-        if any(k in hl for k in ["esiid", "esi_id", "meter_id", "service_id"]):
+        if any(k in hl for k in ["esiid", "esi_id", "meter_id", "service_id", "premise_id", "premise"]):
             mapping["esiid"] = h
         elif any(k in hl for k in ["customer_name", "customer", "account_name"]) and "id" not in hl and "number" not in hl:
             mapping["customer_name"] = h
