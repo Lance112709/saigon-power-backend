@@ -4,28 +4,32 @@ from app.config import settings
 SYSTEM_PROMPT = """You are a data extraction assistant for an energy broker commission system.
 Given column headers and sample rows from a supplier commission statement,
 identify which columns correspond to these fields:
-- esiid: The Electric Service Identifier (long numeric ID, usually 17-22 digits)
-- customer_name: The customer or account name (full name in one column)
-- customer_first_name: Customer first name (if split into separate columns)
-- customer_last_name: Customer last name (if split into separate columns)
-- billing_month: The billing period or invoice date
-- amount: The commission or payment amount (dollars)
-- kwh: Electricity usage/consumption in kWh
-- rate: The commission rate (per kWh or percentage)
-- customer_status: The account/customer status (e.g. "Going Final", "Active", "Cancelled")
+- esiid: The Electric Service Identifier (long numeric ID, usually 17-22 digits). Also called Premise ID, Meter ID, Service ID.
+- customer_name: The customer full name in one column. If only split columns exist, leave null.
+- customer_first_name: Customer first name column (if name is split).
+- customer_last_name: Customer last name column (if name is split).
+- customer_status: Account/customer status (e.g. "Going Final", "Active", "Cancelled").
+- service_address: The service or premise address.
+- rate: The affinity/commission rate (per kWh or as a dollar amount).
+- amount: The affinity/commission payment amount (dollars).
+- kwh: Electricity usage/consumption in kWh. Also called Usage, Billed kWh.
+- bill_start_date: The billing period start date.
+- bill_end_date: The billing period end date.
 
 Return a JSON object with this exact format:
 {
   "mapping": {
     "esiid": "exact_column_name_or_null",
     "customer_name": "exact_column_name_or_null",
-    "billing_month": "exact_column_name_or_null",
+    "customer_first_name": "exact_column_name_or_null",
+    "customer_last_name": "exact_column_name_or_null",
+    "customer_status": "exact_column_name_or_null",
+    "service_address": "exact_column_name_or_null",
+    "rate": "exact_column_name_or_null",
     "amount": "exact_column_name_or_null",
     "kwh": "exact_column_name_or_null",
-    "rate": "exact_column_name_or_null",
-    "customer_status": "exact_column_name_or_null",
-    "customer_first_name": "exact_column_name_or_null",
-    "customer_last_name": "exact_column_name_or_null"
+    "bill_start_date": "exact_column_name_or_null",
+    "bill_end_date": "exact_column_name_or_null"
   },
   "confidence": 0.95,
   "notes": "any observations about the data format"
@@ -54,45 +58,60 @@ def normalize_columns(headers: list, sample_rows: list) -> dict:
         return _rule_based_mapping(headers)
 
 def _rule_based_mapping(headers: list) -> dict:
-    """Fallback: match by common column name patterns."""
     mapping = {
-        "esiid": None,
-        "customer_name": None,
+        "esiid":               None,
+        "customer_name":       None,
         "customer_first_name": None,
-        "customer_last_name": None,
-        "billing_month": None,
-        "amount": None,
-        "kwh": None,
-        "rate": None,
-        "customer_status": None,
+        "customer_last_name":  None,
+        "customer_status":     None,
+        "service_address":     None,
+        "rate":                None,
+        "amount":              None,
+        "kwh":                 None,
+        "bill_start_date":     None,
+        "bill_end_date":       None,
     }
 
     for h in headers:
         hl = h.lower().replace(" ", "_").replace("-", "_")
+
         if any(k in hl for k in ["esiid", "esi_id", "meter_id", "service_id", "premise_id", "premise"]):
             mapping["esiid"] = h
+
         elif any(k in hl for k in ["first_name", "firstname"]):
             mapping["customer_first_name"] = h
+
         elif any(k in hl for k in ["last_name", "lastname"]):
             mapping["customer_last_name"] = h
+
         elif any(k in hl for k in ["customer_name", "full_name", "account_name"]) and "id" not in hl and "number" not in hl:
             mapping["customer_name"] = h
-        elif hl == "customer" and "id" not in hl:
+        elif hl == "customer":
             mapping["customer_name"] = h
-        elif any(k in hl for k in ["invoice_from", "invoice_date", "billing_month", "period_start"]):
-            mapping["billing_month"] = h
-        elif any(k in hl for k in ["invoice", "billing", "period", "month"]) and "stop" not in hl and "end" not in hl:
-            mapping["billing_month"] = h
-        elif any(k in hl for k in ["commission", "residual", "amount", "payment", "paid"]):
-            mapping["amount"] = h
-        elif any(k in hl for k in ["kwh", "consumption", "usage", "billed_kwh"]):
-            mapping["kwh"] = h
-        elif any(k in hl for k in ["broker_rate", "mils", "mil"]):
-            mapping["rate"] = h
-        elif "rate" in hl and "billed" not in hl:
-            mapping["rate"] = h
+
         elif any(k in hl for k in ["customer_status", "acct_status", "account_status", "contract_status",
                                     "service_status", "enrollment_status", "cust_status", "status"]):
             mapping["customer_status"] = h
+
+        elif any(k in hl for k in ["service_address", "premise_address", "address"]):
+            mapping["service_address"] = h
+
+        elif any(k in hl for k in ["affinity_rate", "broker_rate", "commission_rate", "mils", "mil"]):
+            mapping["rate"] = h
+        elif "rate" in hl and "billed" not in hl and "start" not in hl and "end" not in hl:
+            mapping["rate"] = h
+
+        elif any(k in hl for k in ["affinity_amount", "commission", "residual", "amount", "payment"]):
+            mapping["amount"] = h
+
+        elif any(k in hl for k in ["kwh", "consumption", "usage", "billed_kwh"]):
+            mapping["kwh"] = h
+
+        elif any(k in hl for k in ["bill_start", "start_date", "period_start", "invoice_from", "from_date", "service_start"]):
+            mapping["bill_start_date"] = h
+        elif any(k in hl for k in ["bill_end", "end_date", "period_end", "invoice_to", "to_date", "service_end", "thru"]):
+            mapping["bill_end_date"] = h
+        elif any(k in hl for k in ["billing_month", "invoice_date", "bill_date", "period"]):
+            mapping["bill_start_date"] = h  # fallback: treat single date as start
 
     return {"mapping": mapping, "confidence": 0.7, "notes": "Rule-based mapping (no AI key set)"}

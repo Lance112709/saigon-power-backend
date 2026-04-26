@@ -139,11 +139,13 @@ def confirm_upload(
     name_col         = mapping.get("customer_name")
     first_name_col   = mapping.get("customer_first_name")
     last_name_col    = mapping.get("customer_last_name")
+    status_col       = mapping.get("customer_status")
+    address_col      = mapping.get("service_address")
+    rate_col         = mapping.get("rate")
     amount_col       = mapping.get("amount")
     kwh_col          = mapping.get("kwh")
-    rate_col         = mapping.get("rate")
-    date_col         = mapping.get("billing_month")
-    status_col       = mapping.get("customer_status")
+    start_col        = mapping.get("bill_start_date")
+    end_col          = mapping.get("bill_end_date")
 
     records = []
     skipped = 0
@@ -187,10 +189,10 @@ def confirm_upload(
             skipped += 1
             continue
 
-        # Use billing_month from form, fallback to row date
+        # Use billing_month from form, fallback to bill_start_date in row
         bm = billing_month
-        if not bm and date_col:
-            bm = _to_date(_extract_value(row, date_col))
+        if not bm and start_col:
+            bm = _to_date(_extract_value(row, start_col))
         if not bm:
             skipped += 1
             continue
