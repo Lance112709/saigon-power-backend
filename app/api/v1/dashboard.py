@@ -83,6 +83,7 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         leads_week      = db.table("leads").select("id", count="exact").eq("sales_agent", agent_name).gte("created_at", week_start).execute()
         active_deals    = db.table("lead_deals").select("id, est_kwh, adder", count="exact").eq("status", "Active").in_("lead_id", scoped_ids).execute()
         expiring        = db.table("lead_deals").select("id", count="exact").eq("status", "Active").in_("lead_id", scoped_ids).lte("end_date", thirty_days_out).gte("end_date", today_str).execute()
+        expiring_crm    = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE").ilike("sales_agent", f"%{agent_name}%").lte("contract_end_date", thirty_days_out).gte("contract_end_date", today_str).execute()
         leads_count     = db.table("leads").select("id", count="exact").eq("status", "lead").eq("sales_agent", agent_name).execute()
         converted_count = db.table("leads").select("id", count="exact").eq("status", "converted").eq("sales_agent", agent_name).execute()
         recent_raw      = db.table("leads").select("*, lead_deals(id, status, product_type)").eq("sales_agent", agent_name).order("created_at", desc=True).limit(5).execute()
@@ -91,6 +92,7 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         leads_week      = db.table("leads").select("id", count="exact").gte("created_at", week_start).execute()
         active_deals    = db.table("lead_deals").select("id, est_kwh, adder", count="exact").eq("status", "Active").execute()
         expiring        = db.table("lead_deals").select("id", count="exact").eq("status", "Active").lte("end_date", thirty_days_out).gte("end_date", today_str).execute()
+        expiring_crm    = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE").lte("contract_end_date", thirty_days_out).gte("contract_end_date", today_str).execute()
         leads_count     = db.table("leads").select("id", count="exact").eq("status", "lead").execute()
         converted_count = db.table("leads").select("id", count="exact").eq("status", "converted").execute()
         recent_raw      = db.table("leads").select("*, lead_deals(id, status, product_type)").order("created_at", desc=True).limit(5).execute()
@@ -113,13 +115,13 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         "leads_today":     leads_today.count or 0,
         "leads_this_week": leads_week.count or 0,
         "active_deals":    active_deals.count or 0,
-        "expiring_soon":   expiring.count or 0,
+        "expiring_soon":   (expiring.count or 0) + (expiring_crm.count or 0),
         "pipeline":        pipeline,
         "portfolio": {
             "active_contracts": active_deals.count or 0,
             "total_kwh":        round(total_kwh, 2),
             "commission_mo":    round(commission_mo, 2),
-            "at_risk":          expiring.count or 0,
+            "at_risk":          (expiring.count or 0) + (expiring_crm.count or 0),
         },
         "recent_leads": recent_leads,
     }
