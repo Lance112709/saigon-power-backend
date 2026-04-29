@@ -308,6 +308,13 @@ def create_deal_note(id: str, data: dict = Body(...), user: UserContext = Depend
     res = db.table("crm_deal_notes").insert({"crm_deal_id": id, "content": content, "author_name": author}).execute()
     return res.data[0]
 
+@router.delete("/deals/{id}")
+def delete_deal(id: str, user: UserContext = Depends(require_manager)):
+    db = get_client()
+    db.table("crm_deal_notes").delete().eq("crm_deal_id", id).execute()
+    db.table("crm_deals").delete().eq("id", id).execute()
+    return {"ok": True}
+
 @router.delete("/deals/{id}/notes/{note_id}")
 def delete_deal_note(id: str, note_id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
