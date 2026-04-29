@@ -20,14 +20,59 @@ ACTION_META = {
 }
 
 
+def _apply_rules(rules: dict, deal: dict, kwh: float) -> float:
+    """Apply an agent's commission_rules to a deal and return monthly commission $."""
+    # Check excluded plan types (rate_type or plan_name field)
+    plan_type     = (deal.get("rate_type") or deal.get("plan_name") or "").strip()
+    exclude_types = rules.get("exclude_plan_types") or []
+    if plan_type and any(pt.lower() == plan_type.lower() for pt in exclude_types):
+        return 0.0
+
+    # Supplier override?
+    supplier  = (deal.get("supplier") or "").strip().lower()
+    overrides = rules.get("overrides") or []
+    override  = next((o for o in overrides if (o.get("supplier") or "").lower() == supplier), None)
+
+    if override:
+        rate      = float(override.get("rate") or 0)
+        comm_type = override.get("type") or "per_kwh"
+    else:
+        rate      = float(rules.get("default_rate") or 0)
+        comm_type = rules.get("default_type") or "per_kwh"
+
+    # No commission_rules set → fall back to deal's adder
+    if not rules or (not rate and not overrides):
+        return kwh * float(deal.get("adder") or 0)
+
+    if comm_type == "per_kwh":
+        return kwh * rate
+    elif comm_type == "flat_monthly":
+        return rate
+    elif comm_type == "flat_per_deal":
+        return rate
+    elif comm_type == "percentage":
+        return kwh * float(deal.get("adder") or 0) * (rate / 100)
+    return kwh * rate
+
+
+def _agent_rules_map(db) -> dict:
+    """Return {agent_name_lower: commission_rules} for all agents."""
+    rows = db.table("sales_agents").select("name, commission_rules").execute().data or []
+    return {
+        (r.get("name") or "").strip().lower(): r.get("commission_rules") or {}
+        for r in rows
+    }
+
+
 def _calc_by_agent(db, month: int, year: int) -> dict:
-    """Return {agent_name: {deals, commission}} for a given month."""
-    first_day = date(year, month, 1).isoformat()
-    last_day  = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
+    """Return {agent_name: {deals, commission}} for a given month using commission_rules."""
+    first_day  = date(year, month, 1).isoformat()
+    last_day   = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
+    rules_map  = _agent_rules_map(db)
 
     rows = (
         db.table("lead_deals")
-        .select("id, sales_agent, est_kwh, adder, start_date, end_date")
+        .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date")
         .eq("status", "Active")
         .lte("start_date", last_day)
         .execute()
@@ -42,12 +87,14 @@ def _calc_by_agent(db, month: int, year: int) -> dict:
         agent = (r.get("sales_agent") or "").strip()
         if not agent:
             continue
-        kwh   = float(r.get("est_kwh")  or 0)
-        adder = float(r.get("adder")    or 0)
+        kwh   = float(r.get("est_kwh") or 0)
+        rules = rules_map.get(agent.lower(), {})
+        comm  = _apply_rules(rules, r, kwh)
+
         if agent not in by_agent:
             by_agent[agent] = {"deals": 0, "commission": 0.0}
         by_agent[agent]["deals"]      += 1
-        by_agent[agent]["commission"] += kwh * adder
+        by_agent[agent]["commission"] += comm
 
     return by_agent
 
@@ -224,9 +271,13 @@ def get_breakdown(id: str, user: UserContext = Depends(require_admin)):
     first_day = date(year, month, 1).isoformat()
     last_day  = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
 
+    # Load this agent's commission_rules
+    agent_row = db.table("sales_agents").select("commission_rules").ilike("name", f"%{agent}%").limit(1).execute().data
+    rules = (agent_row[0].get("commission_rules") or {}) if agent_row else {}
+
     rows = (
         db.table("lead_deals")
-        .select("id, sales_agent, est_kwh, adder, start_date, end_date, plan_name, supplier, lead_id, leads(first_name, last_name, phone)")
+        .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date, lead_id, leads(first_name, last_name, phone)")
         .eq("status", "Active")
         .ilike("sales_agent", f"%{agent}%")
         .lte("start_date", last_day)
@@ -241,19 +292,43 @@ def get_breakdown(id: str, user: UserContext = Depends(require_admin)):
             continue
         lead  = r.pop("leads", None) or {}
         kwh   = float(r.get("est_kwh")  or 0)
-        adder = float(r.get("adder")    or 0)
+
+        # Determine applied rate/type
+        plan_type  = (r.get("rate_type") or r.get("plan_name") or "").strip()
+        supplier_s = (r.get("supplier") or "").strip().lower()
+        overrides  = rules.get("overrides") or []
+        override   = next((o for o in overrides if (o.get("supplier") or "").lower() == supplier_s), None)
+        excluded   = bool(plan_type and any(pt.lower() == plan_type.lower() for pt in (rules.get("exclude_plan_types") or [])))
+
+        if excluded:
+            applied_rate = 0.0
+            applied_type = "excluded"
+        elif override:
+            applied_rate = float(override.get("rate") or 0)
+            applied_type = override.get("type") or "per_kwh"
+        elif rules.get("default_rate"):
+            applied_rate = float(rules.get("default_rate") or 0)
+            applied_type = rules.get("default_type") or "per_kwh"
+        else:
+            applied_rate = float(r.get("adder") or 0)
+            applied_type = "per_kwh"
+
+        comm = _apply_rules(rules, r, kwh)
+
         deals.append({
-            "deal_id":      r["id"],
-            "lead_id":      r.get("lead_id"),
+            "deal_id":       r["id"],
+            "lead_id":       r.get("lead_id"),
             "customer_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip() or "—",
-            "phone":        lead.get("phone"),
-            "supplier":     r.get("supplier") or "—",
-            "plan_name":    r.get("plan_name") or "—",
-            "est_kwh":      kwh,
-            "adder":        adder,
-            "commission":   round(kwh * adder, 4),
-            "start_date":   r.get("start_date"),
-            "end_date":     r.get("end_date"),
+            "phone":         lead.get("phone"),
+            "supplier":      r.get("supplier") or "—",
+            "plan_name":     plan_type or "—",
+            "est_kwh":       kwh,
+            "adder":         float(r.get("adder") or 0),
+            "applied_rate":  applied_rate,
+            "applied_type":  applied_type,
+            "commission":    round(comm, 4),
+            "start_date":    r.get("start_date"),
+            "end_date":      r.get("end_date"),
         })
 
     deals.sort(key=lambda x: x["commission"], reverse=True)
