@@ -208,6 +208,58 @@ def mark_paid(id: str, data: dict = Body(default={}), user: UserContext = Depend
     return _transition(id, "mark_paid", user, data.get("notes"))
 
 
+# ── Deal Breakdown ────────────────────────────────────────────────────────────
+
+@router.get("/{id}/breakdown")
+def get_breakdown(id: str, user: UserContext = Depends(require_admin)):
+    db  = get_client()
+    row = db.table("agent_commissions").select("*").eq("id", id).limit(1).execute().data
+    if not row:
+        raise HTTPException(status_code=404, detail="Commission not found")
+    rec   = row[0]
+    month = rec["month"]
+    year  = rec["year"]
+    agent = rec["agent_name"]
+
+    first_day = date(year, month, 1).isoformat()
+    last_day  = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
+
+    rows = (
+        db.table("lead_deals")
+        .select("id, sales_agent, est_kwh, adder, start_date, end_date, plan_name, supplier, lead_id, leads(first_name, last_name, phone)")
+        .eq("status", "Active")
+        .ilike("sales_agent", f"%{agent}%")
+        .lte("start_date", last_day)
+        .execute()
+        .data or []
+    )
+
+    deals = []
+    for r in rows:
+        end_d = r.get("end_date") or "9999-12-31"
+        if end_d < first_day:
+            continue
+        lead  = r.pop("leads", None) or {}
+        kwh   = float(r.get("est_kwh")  or 0)
+        adder = float(r.get("adder")    or 0)
+        deals.append({
+            "deal_id":      r["id"],
+            "lead_id":      r.get("lead_id"),
+            "customer_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip() or "—",
+            "phone":        lead.get("phone"),
+            "supplier":     r.get("supplier") or "—",
+            "plan_name":    r.get("plan_name") or "—",
+            "est_kwh":      kwh,
+            "adder":        adder,
+            "commission":   round(kwh * adder, 4),
+            "start_date":   r.get("start_date"),
+            "end_date":     r.get("end_date"),
+        })
+
+    deals.sort(key=lambda x: x["commission"], reverse=True)
+    return {"commission": rec, "deals": deals}
+
+
 # ── Logs ──────────────────────────────────────────────────────────────────────
 
 @router.get("/logs")
