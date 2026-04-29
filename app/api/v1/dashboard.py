@@ -128,14 +128,8 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
 def get_expiring_deals(user: UserContext = Depends(get_current_user)):
     db = get_client()
     today = datetime.now(timezone.utc).date()
-    thirty_out = (today + timedelta(days=30)).isoformat()
+    sixty_out = (today + timedelta(days=60)).isoformat()
     today_str = today.isoformat()
-
-    q = db.table("lead_deals").select(
-        "id, end_date, supplier, plan_name, contract_term, lead_id, leads(first_name, last_name, phone, sgp_customer_id, sales_agent)"
-    ).eq("status", "Active").lte("end_date", thirty_out).gte("end_date", today_str).order("end_date")
-
-    res = q.execute()
 
     agent_name = None
     if user.is_sales_agent:
@@ -143,25 +137,61 @@ def get_expiring_deals(user: UserContext = Depends(get_current_user)):
         agent_name = (u.data[0].get("sales_agent_name") or "").strip() or None
         if not agent_name:
             return []
+
     results = []
-    for d in res.data:
+
+    # ── CRM Leads deals ──────────────────────────────────────────────────────────
+    q = db.table("lead_deals").select(
+        "id, end_date, supplier, plan_name, contract_term, lead_id, leads(first_name, last_name, phone, sgp_customer_id, sales_agent)"
+    ).eq("status", "Active").lte("end_date", sixty_out).gte("end_date", today_str).order("end_date")
+    for d in q.execute().data:
         lead = d.pop("leads", None) or {}
         if agent_name and (lead.get("sales_agent") or "").lower() != agent_name.lower():
             continue
         end = d.get("end_date")
         days_left = (date.fromisoformat(end) - today).days if end else None
         results.append({
-            "deal_id":        d["id"],
-            "lead_id":        d.get("lead_id"),
+            "deal_id":         d["id"],
+            "lead_id":         d.get("lead_id"),
+            "customer_id":     None,
+            "source":          "crm",
             "sgp_customer_id": lead.get("sgp_customer_id"),
-            "full_name":      f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
-            "phone":          lead.get("phone"),
-            "supplier":       d.get("supplier"),
-            "plan_name":      d.get("plan_name"),
-            "contract_term":  d.get("contract_term"),
-            "end_date":       end,
-            "days_left":      days_left,
+            "full_name":       f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
+            "phone":           lead.get("phone"),
+            "supplier":        d.get("supplier"),
+            "plan_name":       d.get("plan_name"),
+            "contract_term":   d.get("contract_term"),
+            "end_date":        end,
+            "days_left":       days_left,
         })
+
+    # ── Imported Customers deals ─────────────────────────────────────────────────
+    q2 = db.table("crm_deals").select(
+        "id, contract_end_date, provider, contract_term, customer_id, sales_agent, "
+        "crm_customers(full_name, phone)"
+    ).eq("deal_status", "ACTIVE").lte("contract_end_date", sixty_out).gte("contract_end_date", today_str).order("contract_end_date")
+    for d in q2.execute().data:
+        cust = d.pop("crm_customers", None) or {}
+        if agent_name and (d.get("sales_agent") or "").lower() != agent_name.lower():
+            continue
+        end = d.get("contract_end_date")
+        days_left = (date.fromisoformat(end[:10]) - today).days if end else None
+        results.append({
+            "deal_id":         d["id"],
+            "lead_id":         None,
+            "customer_id":     d.get("customer_id"),
+            "source":          "imported",
+            "sgp_customer_id": None,
+            "full_name":       cust.get("full_name", ""),
+            "phone":           cust.get("phone"),
+            "supplier":        d.get("provider"),
+            "plan_name":       None,
+            "contract_term":   d.get("contract_term"),
+            "end_date":        end[:10] if end else None,
+            "days_left":       days_left,
+        })
+
+    results.sort(key=lambda x: x["end_date"] or "")
     return results
 
 @router.get("/commission-history")
