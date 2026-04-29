@@ -120,7 +120,7 @@ def list_customers(
             return []
 
     q = db.table("crm_customers").select(
-        "id, full_name, first_name, last_name, email, phone, city, state, created_at, "
+        "id, full_name, first_name, last_name, email, phone, city, state, notes, created_at, "
         "crm_deals(id, deal_status, provider, sales_agent, service_address)"
     )
     if search:
@@ -148,6 +148,7 @@ def list_customers(
             "phone": c.get("phone"),
             "city": c.get("city"),
             "state": c.get("state"),
+            "notes": c.get("notes"),
             "service_address": service_address,
             "deal_count": len(visible_deals),
             "active_deal_count": active_count,
