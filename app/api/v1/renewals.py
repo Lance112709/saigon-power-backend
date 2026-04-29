@@ -6,6 +6,24 @@ from app.api.v1.auth import get_current_user, UserContext
 
 router = APIRouter()
 
+@router.get("/filters")
+def get_renewal_filters(user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    providers, agents = set(), set()
+
+    for r in db.table("lead_deals").select("supplier, sales_agent").eq("status", "Active").execute().data:
+        if r.get("supplier"): providers.add(r["supplier"].strip())
+        if r.get("sales_agent"): agents.add(r["sales_agent"].strip())
+
+    for r in db.table("crm_deals").select("provider, sales_agent").eq("deal_status", "ACTIVE").execute().data:
+        if r.get("provider"): providers.add(r["provider"].strip())
+        if r.get("sales_agent"): agents.add(r["sales_agent"].strip())
+
+    return {
+        "providers": sorted(providers, key=str.upper),
+        "agents": sorted(agents, key=str.upper),
+    }
+
 @router.get("")
 def get_renewals(
     start_date: Optional[str] = Query(None),
