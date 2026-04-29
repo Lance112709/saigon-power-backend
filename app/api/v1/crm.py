@@ -216,7 +216,7 @@ def delete_crm_customer(id: str, user: UserContext = Depends(require_manager)):
     for deal in deals:
         db.table("crm_deal_notes").delete().eq("crm_deal_id", deal["id"]).execute()
     db.table("crm_deals").delete().eq("customer_id", id).execute()
-    db.table("crm_customer_notes").delete().eq("customer_id", id).execute()
+    db.table("crm_customer_notes").delete().eq("crm_customer_id", id).execute()
     db.table("crm_customers").delete().eq("id", id).execute()
     return {"ok": True}
 
