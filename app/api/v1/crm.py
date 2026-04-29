@@ -102,34 +102,45 @@ def list_customers(
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
+    agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
+
+    # When filtering by deal_status or provider, pre-fetch matching customer IDs from crm_deals
+    # so pagination operates on the filtered set, not the full customer list.
+    filter_ids: Optional[list] = None
+    if deal_status or provider or agent_name:
+        dq = db.table("crm_deals").select("customer_id")
+        if deal_status:
+            dq = dq.eq("deal_status", deal_status.upper())
+        if provider:
+            dq = dq.ilike("provider", provider)
+        if agent_name:
+            dq = dq.ilike("sales_agent", agent_name)
+        filter_ids = list({r["customer_id"] for r in dq.execute().data if r.get("customer_id")})
+        if not filter_ids:
+            return []
+
     q = db.table("crm_customers").select(
         "id, full_name, first_name, last_name, email, phone, city, state, created_at, "
         "crm_deals(id, deal_status, provider, sales_agent, service_address)"
     )
     if search:
         q = q.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%,phone.ilike.%{search}%")
+    if filter_ids is not None:
+        q = q.in_("id", filter_ids)
     res = q.order("full_name").range(offset, offset + limit - 1).execute()
-
-    agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
 
     results = []
     for c in res.data:
         deals = c.get("crm_deals", [])
-        # Sales agents only see customers where they have at least one deal
-        if agent_name:
-            deals = [d for d in deals if (d.get("sales_agent") or "").lower() == agent_name]
-            if not deals:
-                continue
-        # Apply deal filters in Python since we can't filter nested
-        if provider:
-            deals = [d for d in deals if d.get("provider", "").upper() == provider.upper()]
-        if deal_status:
-            deals = [d for d in deals if d.get("deal_status", "").upper() == deal_status.upper()]
-            if not deals:
-                continue
         active_count = sum(1 for d in deals if d.get("deal_status") == "ACTIVE")
         active_deals = [d for d in deals if d.get("deal_status") == "ACTIVE"]
-        service_address = (active_deals[0] if active_deals else (deals[0] if deals else {})).get("service_address")
+        # For service address: prefer active deal, fall back to any deal
+        svc_deals = active_deals or deals
+        service_address = svc_deals[0].get("service_address") if svc_deals else None
+        # deal_count reflects the filter context
+        visible_deals = deals
+        if deal_status:
+            visible_deals = [d for d in deals if d.get("deal_status", "").upper() == deal_status.upper()]
         results.append({
             "id": c["id"],
             "full_name": c["full_name"],
@@ -138,7 +149,7 @@ def list_customers(
             "city": c.get("city"),
             "state": c.get("state"),
             "service_address": service_address,
-            "deal_count": len(deals),
+            "deal_count": len(visible_deals),
             "active_deal_count": active_count,
             "created_at": c.get("created_at"),
         })
