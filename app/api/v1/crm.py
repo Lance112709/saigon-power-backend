@@ -104,7 +104,7 @@ def list_customers(
     db = get_client()
     q = db.table("crm_customers").select(
         "id, full_name, first_name, last_name, email, phone, city, state, created_at, "
-        "crm_deals(id, deal_status, provider, sales_agent)"
+        "crm_deals(id, deal_status, provider, sales_agent, service_address)"
     )
     if search:
         q = q.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%,phone.ilike.%{search}%")
@@ -128,6 +128,8 @@ def list_customers(
             if not deals:
                 continue
         active_count = sum(1 for d in deals if d.get("deal_status") == "ACTIVE")
+        active_deals = [d for d in deals if d.get("deal_status") == "ACTIVE"]
+        service_address = (active_deals[0] if active_deals else (deals[0] if deals else {})).get("service_address")
         results.append({
             "id": c["id"],
             "full_name": c["full_name"],
@@ -135,6 +137,7 @@ def list_customers(
             "phone": c.get("phone"),
             "city": c.get("city"),
             "state": c.get("state"),
+            "service_address": service_address,
             "deal_count": len(deals),
             "active_deal_count": active_count,
             "created_at": c.get("created_at"),
