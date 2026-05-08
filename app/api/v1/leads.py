@@ -66,6 +66,7 @@ def _deal_payload(data: dict) -> dict:
         "flag_deposit":      bool(data.get("flag_deposit")),
         "flag_special_deal": bool(data.get("flag_special_deal")),
         "flag_promo_10":     bool(data.get("flag_promo_10")),
+        "flag_delinked":     bool(data.get("flag_delinked")),
         # Contract
         "status":              data.get("status", "Future"),
         "supplier":            str(data.get("supplier") or "").strip() or None,
@@ -526,7 +527,7 @@ def delete_lead_note(id: str, note_id: str, user: UserContext = Depends(require_
 def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     allowed = {
-        "flag_tos", "flag_toao", "flag_deposit", "flag_special_deal", "flag_promo_10",
+        "flag_tos", "flag_toao", "flag_deposit", "flag_special_deal", "flag_promo_10", "flag_delinked",
         "status", "supplier", "plan_name", "product_type", "rate_type", "contract_term",
         "rate", "adder", "est_kwh", "expected_close_date", "start_date", "end_date",
         "service_address", "service_city", "service_state", "service_zip", "esiid",
