@@ -1,6 +1,9 @@
-from fastapi import APIRouter, HTTPException, Query, Body, Depends
+from fastapi import APIRouter, HTTPException, Query, Body, Depends, UploadFile, File
+from fastapi.responses import StreamingResponse
 from typing import Optional
 import re
+import io
+from datetime import datetime as dt
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 
@@ -17,6 +20,57 @@ PROVIDER_TO_CODE = {
     "CLEANSKY ENERGY": "CLEANSKY",
     "HUDSON ENERGY": "HUDSON",
 }
+
+# Flexible supplier name → code (lowercase keys)
+SUPPLIER_ALIASES: dict = {
+    "budget": "BUDGET", "budget power": "BUDGET",
+    "iron horse": "IRONHORSE", "ironhorse": "IRONHORSE",
+    "heritage": "HERITAGE", "heritage power": "HERITAGE",
+    "nrg": "NRG", "nrg energy": "NRG", "discount power": "NRG",
+    "chariot": "CHARIOT", "chariot energy": "CHARIOT",
+    "cleansky": "CLEANSKY", "cleansky energy": "CLEANSKY",
+    "hudson": "HUDSON", "hudson energy": "HUDSON",
+    "reliant": "RELIANT",
+    "direct energy": "DIRECT", "direct": "DIRECT",
+    "cirro": "CIRRO", "cirro energy": "CIRRO",
+    "true power": "TRUEPOWER", "truepower": "TRUEPOWER",
+    "nrg commercial": "NRG_COMM",
+    "value power": "VALUEPOWER", "value": "VALUEPOWER",
+    "tara energy": "TARA", "tara": "TARA",
+    "pulse power": "PULSE", "pulse": "PULSE",
+    "apg&e": "APGE", "apge": "APGE",
+    "power next": "POWERNEXT", "powernext": "POWERNEXT",
+    "goodcharlie": "GOODCHARLIE", "good charlie": "GOODCHARLIE",
+    "sfe energy": "SFE", "sfe": "SFE",
+}
+
+ACTIVE_STATUSES  = {"active", "yes", "open", "current", "enrolled", "a", "1"}
+INACTIVE_STATUSES = {"inactive", "no", "closed", "cancelled", "canceled",
+                     "churned", "terminated", "dropped", "drop", "cancel", "i", "0"}
+
+TEMPLATE_HEADERS = [
+    "First Name", "Last Name", "Email", "Phone", "Date of Birth",
+    "Mailing Address", "City", "State", "Zip Code",
+    "ESIID", "Supplier", "Deal Status", "Sales Agent", "Service Address",
+    "Contract Start Date", "Contract End Date", "Contract Signed Date",
+    "Term (Months)", "Energy Rate", "Adder", "Product Type", "Meter Type",
+    "ANXH", "Business Name", "Deal Owner",
+]
+
+SAMPLE_ROW = [
+    "John", "Smith", "john.smith@gmail.com", "5551234567", "01/15/1985",
+    "123 Main St", "Houston", "TX", "77001",
+    "10089012345678901", "Budget Power", "ACTIVE", "Lance Nguyen", "123 Main St",
+    "01/01/2024", "01/01/2026", "12/15/2023",
+    "24", "0.089", "0.0005", "Fixed Rate", "Residential",
+    "", "", "",
+]
+
+VALID_SUPPLIERS = [
+    "Budget Power", "Iron Horse", "Heritage Power", "NRG Energy",
+    "Discount Power", "Chariot Energy", "CleanSky Energy", "Hudson Energy",
+    "Reliant", "Direct Energy", "Cirro Energy", "True Power",
+]
 
 def _extract_email(contact_str: str) -> Optional[str]:
     if not contact_str:
@@ -97,6 +151,7 @@ def list_customers(
     search: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
     deal_status: Optional[str] = Query(None),
+    meter_type: Optional[str] = Query(None),
     limit: int = Query(50),
     offset: int = Query(0),
     user: UserContext = Depends(get_current_user),
@@ -107,7 +162,7 @@ def list_customers(
     # When filtering by deal_status or provider, pre-fetch matching customer IDs from crm_deals
     # so pagination operates on the filtered set, not the full customer list.
     filter_ids: Optional[list] = None
-    if deal_status or provider or agent_name:
+    if deal_status or provider or agent_name or meter_type:
         dq = db.table("crm_deals").select("customer_id")
         if deal_status:
             dq = dq.eq("deal_status", deal_status.upper())
@@ -115,13 +170,15 @@ def list_customers(
             dq = dq.ilike("provider", provider)
         if agent_name:
             dq = dq.ilike("sales_agent", agent_name)
+        if meter_type:
+            dq = dq.ilike("meter_type", f"%{meter_type}%")
         filter_ids = list({r["customer_id"] for r in dq.execute().data if r.get("customer_id")})
         if not filter_ids:
             return []
 
     q = db.table("crm_customers").select(
         "id, full_name, first_name, last_name, email, phone, city, state, notes, created_at, "
-        "crm_deals(id, deal_status, provider, sales_agent, service_address)"
+        "crm_deals(id, deal_status, provider, sales_agent, service_address, business_name)"
     )
     if search:
         q = q.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%,phone.ilike.%{search}%")
@@ -137,10 +194,13 @@ def list_customers(
         # For service address: prefer active deal, fall back to any deal
         svc_deals = active_deals or deals
         service_address = svc_deals[0].get("service_address") if svc_deals else None
+        business_name = next((d.get("business_name") for d in deals if d.get("business_name")), None)
         # deal_count reflects the filter context
         visible_deals = deals
         if deal_status:
             visible_deals = [d for d in deals if d.get("deal_status", "").upper() == deal_status.upper()]
+        # REP: prefer active deal's provider, fall back to any deal
+        provider = next((d.get("provider") for d in (active_deals or deals) if d.get("provider")), None)
         results.append({
             "id": c["id"],
             "full_name": c["full_name"],
@@ -150,6 +210,8 @@ def list_customers(
             "state": c.get("state"),
             "notes": c.get("notes"),
             "service_address": service_address,
+            "business_name": business_name,
+            "provider": provider,
             "deal_count": len(visible_deals),
             "active_deal_count": active_count,
             "created_at": c.get("created_at"),
@@ -324,6 +386,41 @@ def create_deal_note(id: str, data: dict = Body(...), user: UserContext = Depend
     res = db.table("crm_deal_notes").insert({"crm_deal_id": id, "content": content, "author_name": author}).execute()
     return res.data[0]
 
+@router.post("/deals/{id}/renew")
+def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    orig_res = db.table("crm_deals").select("*").eq("id", id).limit(1).execute()
+    if not orig_res.data:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    orig = orig_res.data[0]
+
+    # Mark original deal as RENEWED
+    db.table("crm_deals").update({"deal_status": "RENEWED"}).eq("id", id).execute()
+
+    # Build new deal — inherit ESIID/address/meter from original, override with form data
+    new_deal = {
+        "customer_id":          orig["customer_id"],
+        "esiid":                orig.get("esiid"),
+        "provider":             data.get("provider") or orig.get("provider"),
+        "deal_status":          "ACTIVE",
+        "sales_agent":          data.get("sales_agent") or orig.get("sales_agent"),
+        "deal_owner":           data.get("deal_owner") or orig.get("deal_owner"),
+        "service_address":      orig.get("service_address"),
+        "contract_start_date":  data.get("contract_start_date") or None,
+        "contract_end_date":    data.get("contract_end_date") or None,
+        "contract_signed_date": data.get("contract_signed_date") or None,
+        "contract_term":        data.get("contract_term") or orig.get("contract_term"),
+        "energy_rate":          data.get("energy_rate") or None,
+        "adder":                data.get("adder") or None,
+        "product_type":         data.get("product_type") or orig.get("product_type"),
+        "meter_type":           data.get("meter_type") or orig.get("meter_type"),
+        "anxh":                 orig.get("anxh"),
+        "business_name":        orig.get("business_name"),
+        "deal_name":            data.get("deal_name") or orig.get("deal_name"),
+    }
+    res = db.table("crm_deals").insert(new_deal).execute()
+    return res.data[0]
+
 @router.delete("/deals/{id}")
 def delete_deal(id: str, user: UserContext = Depends(require_manager)):
     db = get_client()
@@ -341,7 +438,9 @@ def delete_deal_note(id: str, note_id: str, user: UserContext = Depends(require_
 def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     allowed = {"deal_status", "deal_name", "provider", "adder", "energy_rate", "deal_owner",
-               "sales_agent", "contract_start_date", "contract_end_date", "notes"}
+               "sales_agent", "contract_start_date", "contract_end_date", "contract_signed_date",
+               "contract_term", "notes", "service_address", "meter_type", "deal_type",
+               "business_name", "anxh", "product_type"}
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
@@ -369,6 +468,10 @@ def import_deals(file_path: str = Body(..., embed=True), user: UserContext = Dep
     # Load existing customers by email (idempotency)
     existing_res = db.table("crm_customers").select("id, email").execute()
     customer_by_email: dict = {c["email"]: c["id"] for c in existing_res.data if c.get("email")}
+
+    # Load existing ESIIDs to prevent duplicate deals
+    esiid_res = db.table("crm_deals").select("esiid").execute()
+    existing_esiids = {r["esiid"] for r in (esiid_res.data or []) if r.get("esiid")}
 
     wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
     ws = wb.active
@@ -482,7 +585,12 @@ def import_deals(file_path: str = Body(..., embed=True), user: UserContext = Dep
             "sales_agent": sales_agent,
             "anxh": anxh,
         }
+        if esiid and esiid in existing_esiids:
+            deals_skipped += 1
+            continue
         db.table("crm_deals").insert(deal).execute()
+        if esiid:
+            existing_esiids.add(esiid)
         deals_created += 1
 
     wb.close()
@@ -494,16 +602,331 @@ def import_deals(file_path: str = Body(..., embed=True), user: UserContext = Dep
 
 # ── Providers list (for filter dropdowns) ─────────────────────────────────────
 
+def _paginate_distinct(db, table: str, column: str) -> list:
+    """Fetch all distinct non-null values for a column, paginating past the 1000-row limit."""
+    values: set = set()
+    offset = 0
+    while True:
+        batch = db.table(table).select(column).range(offset, offset + 999).execute().data or []
+        for r in batch:
+            v = r.get(column)
+            if v:
+                values.add(v)
+        if len(batch) < 1000:
+            break
+        offset += 1000
+    return sorted(values)
+
 @router.get("/providers")
 def list_providers(user: UserContext = Depends(get_current_user)):
     db = get_client()
-    res = db.table("crm_deals").select("provider").execute()
-    providers = sorted({r["provider"] for r in res.data if r.get("provider")})
-    return providers
+    return _paginate_distinct(db, "crm_deals", "provider")
 
 @router.get("/agents")
 def list_agents(user: UserContext = Depends(get_current_user)):
     db = get_client()
-    res = db.table("crm_deals").select("sales_agent").execute()
-    agents = sorted({r["sales_agent"] for r in res.data if r.get("sales_agent")})
-    return agents
+    return _paginate_distinct(db, "crm_deals", "sales_agent")
+
+
+# ── Import Template Download ───────────────────────────────────────────────────
+
+@router.get("/import-template")
+def download_import_template(user: UserContext = Depends(require_admin)):
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Import Template"
+
+    header_font   = Font(bold=True, color="FFFFFF", size=11)
+    header_fill   = PatternFill("solid", fgColor="0F1D5E")
+    sample_font   = Font(italic=True, color="888888")
+    note_font     = Font(bold=True, color="D97706")
+
+    # Row 1: headers
+    for col, h in enumerate(TEMPLATE_HEADERS, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font   = header_font
+        cell.fill   = header_fill
+        cell.alignment = Alignment(horizontal="center", wrap_text=True)
+
+    # Row 2: sample data
+    for col, val in enumerate(SAMPLE_ROW, 1):
+        cell = ws.cell(row=2, column=col, value=val)
+        cell.font = sample_font
+
+    # Row 4: valid suppliers note
+    note_cell = ws.cell(row=4, column=1, value="✦ Valid Supplier Names:")
+    note_cell.font = note_font
+    for col, sup in enumerate(VALID_SUPPLIERS, 2):
+        ws.cell(row=4, column=col, value=sup).font = Font(color="666666", italic=True)
+
+    # Row 5: required fields note
+    req_cell = ws.cell(row=5, column=1, value="✦ Required fields: First Name, Last Name, ESIID, Supplier")
+    req_cell.font = Font(color="DC2626", bold=True)
+
+    # Column widths
+    col_widths = [12, 12, 28, 14, 14, 28, 14, 8, 10,
+                  22, 18, 12, 18, 28, 18, 18, 20,
+                  12, 12, 10, 16, 14, 20, 20, 16]
+    for i, w in enumerate(col_widths, 1):
+        ws.column_dimensions[get_column_letter(i)].width = w
+
+    ws.freeze_panes = "A2"
+    ws.row_dimensions[1].height = 30
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+
+    return StreamingResponse(
+        buf,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="crm_import_template.xlsx"'},
+    )
+
+
+# ── Import Upload ──────────────────────────────────────────────────────────────
+
+def _norm_str(val) -> Optional[str]:
+    if val is None:
+        return None
+    s = str(val).strip()
+    return s if s and s.lower() not in ("nan", "none", "nat") else None
+
+def _norm_date(val) -> Optional[str]:
+    if not val:
+        return None
+    s = _norm_str(val)
+    if not s:
+        return None
+    if hasattr(val, "date"):
+        return val.date().isoformat()
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%-m/%-d/%Y", "%m-%d-%Y"):
+        try:
+            return dt.strptime(s[:10], fmt).date().isoformat()
+        except Exception:
+            continue
+    return None
+
+def _norm_float(val) -> Optional[float]:
+    try:
+        s = str(val).replace(",", "").strip()
+        return float(s) if s and s.lower() not in ("nan", "none", "") else None
+    except Exception:
+        return None
+
+def _norm_supplier(val) -> Optional[str]:
+    if not val:
+        return None
+    return SUPPLIER_ALIASES.get(str(val).strip().lower())
+
+def _norm_status(val) -> str:
+    s = str(val or "").strip().lower()
+    if s in INACTIVE_STATUSES:
+        return "INACTIVE"
+    return "ACTIVE"
+
+@router.post("/import-upload")
+async def import_upload(
+    file: UploadFile = File(...),
+    user: UserContext = Depends(require_admin),
+):
+    import openpyxl
+    import pandas as pd
+
+    contents = await file.read()
+    buf = io.BytesIO(contents)
+
+    # Parse file
+    fname = (file.filename or "").lower()
+    try:
+        if fname.endswith(".csv"):
+            df = pd.read_csv(buf)
+        else:
+            df = pd.read_excel(buf, engine="openpyxl")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not parse file: {e}")
+
+    # Normalize column names: strip, lowercase for lookup
+    col_map = {c.strip().lower(): c for c in df.columns}
+
+    def get_col(row, *names):
+        for n in names:
+            c = col_map.get(n.lower())
+            if c and c in row.index:
+                return row[c]
+        return None
+
+    db = get_client()
+
+    # Load supplier code → id
+    sup_res = db.table("suppliers").select("id, code").execute()
+    supplier_id_map = {s["code"]: s["id"] for s in (sup_res.data or [])}
+
+    # Load existing customer emails for dedup
+    existing_res = db.table("crm_customers").select("id, email, first_name, last_name").execute()
+    customer_by_key: dict = {}
+    for c in (existing_res.data or []):
+        if c.get("email"):
+            customer_by_key[c["email"].lower()] = c["id"]
+        else:
+            name_key = f"{c.get('first_name','')} {c.get('last_name','')}".strip().lower()
+            if name_key:
+                customer_by_key[name_key] = c["id"]
+
+    # Load existing ESIIDs for dedup
+    esiid_res = db.table("crm_deals").select("esiid").execute()
+    existing_esiids = {r["esiid"] for r in (esiid_res.data or []) if r.get("esiid")}
+
+    customers_created = 0
+    customers_reused  = 0
+    deals_created     = 0
+    deals_skipped     = 0
+    errors: list      = []
+
+    for idx, row in df.iterrows():
+        row_num = idx + 2  # 1-indexed + header row
+
+        first_name = _norm_str(get_col(row, "First Name", "firstname"))
+        last_name  = _norm_str(get_col(row, "Last Name", "lastname"))
+        if not first_name and not last_name:
+            errors.append(f"Row {row_num}: skipped — missing First Name and Last Name")
+            deals_skipped += 1
+            continue
+
+        esiid = _norm_str(get_col(row, "ESIID", "ESI ID", "esi_id"))
+        if not esiid:
+            errors.append(f"Row {row_num}: skipped — missing ESIID")
+            deals_skipped += 1
+            continue
+
+        email = _norm_str(get_col(row, "Email", "email address"))
+        email = email.lower() if email else None
+
+        # Customer dedup key
+        if email:
+            cust_key = email
+        else:
+            cust_key = f"{first_name or ''} {last_name or ''}".strip().lower()
+
+        # Get or create customer
+        if cust_key in customer_by_key:
+            customer_id = customer_by_key[cust_key]
+            customers_reused += 1
+        else:
+            full_name = f"{first_name or ''} {last_name or ''}".strip()
+            state_val = _norm_str(get_col(row, "State")) or "TX"
+            new_cust = {
+                "full_name":       full_name,
+                "first_name":      first_name,
+                "last_name":       last_name,
+                "email":           email,
+                "phone":           _norm_str(get_col(row, "Phone")),
+                "dob":             _norm_str(get_col(row, "Date of Birth", "DOB")),
+                "mailing_address": _norm_str(get_col(row, "Mailing Address", "Address")),
+                "city":            _norm_str(get_col(row, "City")),
+                "state":           state_val[:2].upper() if state_val else "TX",
+                "postal_code":     _norm_str(get_col(row, "Zip Code", "Postal Code", "ZIP")),
+            }
+            cres = db.table("crm_customers").insert(new_cust).execute()
+            customer_id = cres.data[0]["id"]
+            customer_by_key[cust_key] = customer_id
+            customers_created += 1
+
+        # ESIID dedup
+        if esiid in existing_esiids:
+            deals_skipped += 1
+            continue
+
+        # Supplier
+        supplier_raw  = _norm_str(get_col(row, "Supplier", "Provider"))
+        supplier_code = _norm_supplier(supplier_raw)
+        supplier_id   = supplier_id_map.get(supplier_code) if supplier_code else None
+        provider_name = supplier_raw.upper() if supplier_raw else None
+
+        deal = {
+            "customer_id":          customer_id,
+            "esiid":                esiid,
+            "provider":             provider_name,
+            "supplier_id":          supplier_id,
+            "deal_status":          _norm_status(get_col(row, "Deal Status", "Status")),
+            "sales_agent":          _norm_str(get_col(row, "Sales Agent")),
+            "deal_owner":           _norm_str(get_col(row, "Deal Owner")),
+            "service_address":      _norm_str(get_col(row, "Service Address")),
+            "contract_start_date":  _norm_date(get_col(row, "Contract Start Date", "Start Date")),
+            "contract_end_date":    _norm_date(get_col(row, "Contract End Date", "End Date")),
+            "contract_signed_date": _norm_date(get_col(row, "Contract Signed Date", "Signed Date")),
+            "contract_term":        _norm_str(get_col(row, "Term (Months)", "Term")),
+            "energy_rate":          _norm_float(get_col(row, "Energy Rate", "Rate")),
+            "adder":                _norm_float(get_col(row, "Adder")),
+            "product_type":         _norm_str(get_col(row, "Product Type")),
+            "meter_type":           _norm_str(get_col(row, "Meter Type")),
+            "anxh":                 _norm_str(get_col(row, "ANXH", "anxh")),
+            "business_name":        _norm_str(get_col(row, "Business Name")),
+            "deal_name":            _norm_str(get_col(row, "Deal Name")),
+        }
+        db.table("crm_deals").insert(deal).execute()
+        existing_esiids.add(esiid)
+        deals_created += 1
+
+    return {
+        "customers_created": customers_created,
+        "customers_reused":  customers_reused,
+        "deals_created":     deals_created,
+        "deals_skipped":     deals_skipped,
+        "errors":            errors,
+    }
+
+
+# ── Clear All Imported Data ────────────────────────────────────────────────────
+
+@router.delete("/clear")
+def clear_crm_data(user: UserContext = Depends(require_admin)):
+    db = get_client()
+
+    # Count before delete for reporting
+    cust_count = db.table("crm_customers").select("id", count="exact").execute().count or 0
+    deal_count = db.table("crm_deals").select("id", count="exact").execute().count or 0
+
+    # Wipe in FK order
+    deal_ids = [r["id"] for r in (db.table("crm_deals").select("id").execute().data or [])]
+    if deal_ids:
+        db.table("crm_deal_notes").delete().in_("crm_deal_id", deal_ids).execute()
+    db.table("crm_deals").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+
+    cust_ids = [r["id"] for r in (db.table("crm_customers").select("id").execute().data or [])]
+    if cust_ids:
+        db.table("crm_customer_notes").delete().in_("crm_customer_id", cust_ids).execute()
+    db.table("crm_customers").delete().neq("id", "00000000-0000-0000-0000-000000000000").execute()
+
+    return {"deleted_customers": cust_count, "deleted_deals": deal_count}
+
+
+# ── Deduplicate deals by ESIID ─────────────────────────────────────────────────
+
+@router.post("/deduplicate-deals")
+def deduplicate_deals(user: UserContext = Depends(require_admin)):
+    """Remove duplicate crm_deals rows, keeping the earliest (lowest created_at) per ESIID."""
+    db = get_client()
+
+    all_deals = db.table("crm_deals").select("id, esiid, created_at").order("created_at").execute().data or []
+
+    seen_esiids: set = set()
+    to_delete: list = []
+    for d in all_deals:
+        esiid = d.get("esiid")
+        if not esiid:
+            continue
+        if esiid in seen_esiids:
+            to_delete.append(d["id"])
+        else:
+            seen_esiids.add(esiid)
+
+    if to_delete:
+        db.table("crm_deal_notes").delete().in_("crm_deal_id", to_delete).execute()
+        db.table("crm_deals").delete().in_("id", to_delete).execute()
+
+    return {"duplicates_removed": len(to_delete)}

@@ -173,10 +173,14 @@ def confirm_upload(
             # Try to find matching lead
             lead_match = None
             try:
-                ld = db.table("lead_deals").select("lead_id, leads(id, name, phone)") \
+                ld = db.table("lead_deals").select("lead_id, leads(id, first_name, last_name, phone)") \
                     .eq("esiid", raw_esiid).limit(1).execute()
                 if ld.data:
-                    lead_match = ld.data[0].get("leads")
+                    raw_lead = ld.data[0].get("leads") or {}
+                    lead_match = {
+                        **raw_lead,
+                        "name": f"{raw_lead.get('first_name', '')} {raw_lead.get('last_name', '')}".strip(),
+                    } if raw_lead else None
             except Exception:
                 pass
             going_final.append({
@@ -268,7 +272,37 @@ def get_upload_records(
     if unmatched_only:
         q = q.is_("service_point_id", "null")
     res = q.order("raw_customer_name").range(offset, offset + limit - 1).execute()
-    return res.data or []
+    records = res.data or []
+
+    if not records:
+        return records
+
+    # Batch-check which ESIIDs exist in lead_deals (the new CRM, not the legacy service_points table)
+    esiids = list({r["raw_esiid"] for r in records if r.get("raw_esiid")})
+    esiid_lead_map: dict = {}
+    for i in range(0, len(esiids), 100):
+        chunk = esiids[i:i + 100]
+        ld = db.table("lead_deals").select("esiid, lead_id, leads(id, first_name, last_name)").in_("esiid", chunk).execute()
+        for row in (ld.data or []):
+            esiid = row.get("esiid")
+            if esiid and esiid not in esiid_lead_map:
+                lead = row.get("leads") or {}
+                esiid_lead_map[esiid] = {
+                    "lead_id": row.get("lead_id"),
+                    "lead_name": f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip(),
+                }
+
+    result = []
+    for r in records:
+        raw_esiid = r.get("raw_esiid", "")
+        lead_info = esiid_lead_map.get(raw_esiid)
+        r["lead_deal_matched"] = raw_esiid in esiid_lead_map
+        r["lead_match"] = lead_info
+        if unmatched_only and r["lead_deal_matched"]:
+            continue
+        result.append(r)
+
+    return result
 
 @router.patch("/{batch_id}/records/{record_id}")
 def match_record(
@@ -289,9 +323,10 @@ def match_record(
 
     # Look up lead via lead_deals
     lead_info = None
-    ld = db.table("lead_deals").select("lead_id, leads(id, name)").eq("esiid", esiid).limit(1).execute()
+    ld = db.table("lead_deals").select("lead_id, leads(id, first_name, last_name, phone)").eq("esiid", esiid).limit(1).execute()
     if ld.data:
-        lead_info = ld.data[0].get("leads")
+        raw_lead = ld.data[0].get("leads") or {}
+        lead_info = {**raw_lead, "name": f"{raw_lead.get('first_name', '')} {raw_lead.get('last_name', '')}".strip()} if raw_lead else None
 
     db.table("actual_commissions").update({
         "resolved_esiid":   esiid,

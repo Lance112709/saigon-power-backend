@@ -141,7 +141,7 @@ def update_agent(agent_id: str, data: dict = Body(...), user: UserContext = Depe
     if user.role not in ("admin", "manager"):
         raise HTTPException(status_code=403, detail="Admin or Manager only")
     db = get_client()
-    allowed = {"name", "agent_type", "email", "phone"}
+    allowed = {"name", "agent_type", "email", "phone", "commission_rules"}
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields")

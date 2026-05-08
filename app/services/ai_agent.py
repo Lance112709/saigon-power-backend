@@ -216,10 +216,46 @@ def get_daily_metrics(db) -> dict:
     active_deals = db.table("lead_deals").select("id", count="exact").eq("status", "Active").execute().count or 0
     total_leads  = db.table("leads").select("id", count="exact").execute().count or 0
 
-    # Deals missing data (open alerts)
-    missing_rate  = db.table("ai_alerts").select("id", count="exact").eq("type", "missing_rate").eq("status", "open").execute().count or 0
-    missing_esiid = db.table("ai_alerts").select("id", count="exact").eq("type", "missing_esiid").eq("status", "open").execute().count or 0
-    missing_agent = db.table("ai_alerts").select("id", count="exact").eq("type", "missing_agent").eq("status", "open").execute().count or 0
+    today_str = _today()
+
+    # Expired but still ACTIVE — lead_deals
+    expired_lead = db.table("lead_deals").select("id", count="exact") \
+        .eq("status", "Active").lt("end_date", today_str).execute().count or 0
+
+    # Expired but still ACTIVE — crm_deals
+    expired_crm = db.table("crm_deals").select("id", count="exact") \
+        .eq("deal_status", "ACTIVE").lt("contract_end_date", today_str).execute().count or 0
+
+    expired_active = expired_lead + expired_crm
+
+    # Revenue at risk — lead_deals active, expiring within 60 days
+    sixty_days = (_now() + __import__("datetime").timedelta(days=60)).date().isoformat()
+    at_risk_rows = db.table("lead_deals").select("est_kwh, adder") \
+        .eq("status", "Active").gte("end_date", today_str).lte("end_date", sixty_days).execute().data or []
+    revenue_at_risk = sum(
+        float(d.get("est_kwh") or 0) * float(d.get("adder") or 0)
+        for d in at_risk_rows
+    )
+    deals_at_risk = len(at_risk_rows)
+
+    # Duplicate deal detection (crm_deals)
+    crm_deals_raw = db.table("crm_deals").select("esiid, service_address, customer_id").execute().data or []
+
+    esiid_counts: dict = {}
+    for d in crm_deals_raw:
+        e = (d.get("esiid") or "").strip()
+        if e:
+            esiid_counts[e] = esiid_counts.get(e, 0) + 1
+    dup_esiid = sum(1 for v in esiid_counts.values() if v > 1)
+
+    addr_counts: dict = {}
+    for d in crm_deals_raw:
+        a = (d.get("service_address") or "").strip().upper()
+        cust = d.get("customer_id") or ""
+        if a:
+            key = (cust, a)
+            addr_counts[key] = addr_counts.get(key, 0) + 1
+    dup_address = sum(1 for v in addr_counts.values() if v > 1)
 
     # Renewals
     r30 = db.table("ai_alerts").select("id", count="exact").eq("type", "renewal_30").eq("status", "open").execute().count or 0
@@ -258,10 +294,14 @@ def get_daily_metrics(db) -> dict:
             "active_deals": active_deals,
         },
         "data_quality": {
-            "missing_rate": missing_rate,
-            "missing_esiid": missing_esiid,
-            "missing_agent": missing_agent,
-            "total_issues": missing_rate + missing_esiid + missing_agent,
+            "dup_esiid": dup_esiid,
+            "dup_address": dup_address,
+            "total_issues": dup_esiid + dup_address,
+        },
+        "health": {
+            "expired_active": expired_active,
+            "revenue_at_risk": round(revenue_at_risk, 2),
+            "deals_at_risk": deals_at_risk,
         },
         "renewals": {"30_days": r30, "60_days": r60, "90_days": r90},
         "alerts": {"critical": critical_alerts, "total_open": total_open},
@@ -484,3 +524,220 @@ def get_dashboard() -> dict:
         "recommendations": recs,
         "daily_report": daily_report,
     }
+
+
+# ── AI Chat (free, no API key required) ─────────────────────────────────────────
+
+def _fmt_money(v) -> str:
+    try:
+        return f"${float(v):,.2f}"
+    except Exception:
+        return "$0.00"
+
+def _days_until_str(date_str) -> str:
+    d = _days_until(date_str)
+    if d is None:
+        return "unknown"
+    if d < 0:
+        return f"expired {abs(d)} days ago"
+    if d == 0:
+        return "today"
+    return f"in {d} days"
+
+def _section(title: str, lines: list) -> str:
+    body = "\n".join(f"  • {l}" for l in lines) if lines else "  No data."
+    return f"**{title}**\n{body}"
+
+
+def chat_with_context(message: str, history: list) -> str:
+    db = get_client()
+    q = message.lower()
+
+    # ── helpers ──
+    def _want(*keywords):
+        return any(k in q for k in keywords)
+
+    parts = []
+
+    # ── Full summary / overview / status ──
+    if _want("summary", "overview", "status", "everything", "update", "report", "whats going on", "what's going on", "tell me about", "how are we", "how is"):
+        # Leads
+        leads = db.table("leads").select("id, status, created_at").execute().data or []
+        by_status: dict = {}
+        for l in leads:
+            s = (l.get("status") or "unknown").title()
+            by_status[s] = by_status.get(s, 0) + 1
+        lead_lines = [f"{s}: {c}" for s, c in sorted(by_status.items(), key=lambda x: -x[1])]
+        parts.append(_section(f"Leads — {len(leads)} total", lead_lines))
+
+        # Deals
+        deals = db.table("lead_deals").select("id, status, supplier, sales_agent, est_kwh, adder, end_date").execute().data or []
+        active = [d for d in deals if (d.get("status") or "").lower() == "active"]
+        future = [d for d in deals if (d.get("status") or "").lower() == "future"]
+        est_rev = sum(float(d.get("est_kwh") or 0) * float(d.get("adder") or 0) for d in active)
+        expiring_30 = [d for d in active if (_days_until(d.get("end_date")) or 999) <= 30]
+        deal_lines = [
+            f"Active: {len(active)}",
+            f"Future/Pending: {len(future)}",
+            f"Est. monthly commission: {_fmt_money(est_rev)}",
+            f"Expiring within 30 days: {len(expiring_30)}",
+        ]
+        parts.append(_section("Deals", deal_lines))
+
+        # Commissions
+        comms = db.table("actual_commissions").select("billing_month, raw_amount").order("billing_month", desc=True).limit(500).execute().data or []
+        by_month: dict = {}
+        for c in comms:
+            m = (c.get("billing_month") or "")[:7]
+            if m:
+                by_month[m] = by_month.get(m, 0.0) + (c.get("raw_amount") or 0.0)
+        comm_lines = [f"{m}: {_fmt_money(amt)}" for m, amt in sorted(by_month.items(), reverse=True)[:4]]
+        parts.append(_section("Commission Payments", comm_lines or ["No payments recorded yet."]))
+
+        # Alerts
+        alerts = db.table("ai_alerts").select("severity, message").eq("status", "open").order("severity").limit(10).execute().data or []
+        critical = [a for a in alerts if a.get("severity") == "high"]
+        alert_lines = [f"[URGENT] {a['message'][:100]}" for a in critical[:3]]
+        if len(alerts) > 3:
+            alert_lines.append(f"...and {len(alerts) - 3} more open alerts")
+        parts.append(_section(f"Open Alerts — {len(alerts)} total ({len(critical)} urgent)", alert_lines or ["All clear."]))
+
+        return "\n\n".join(parts)
+
+    # ── Agents / sales team (must come before generic "deals" check) ──
+    if _want("agent", "agents", "sales", "rep", "team", "staff", "top agent", "performing", "leaderboard", "who is", "who's"):
+        agents = db.table("users").select("id, first_name, last_name, role").eq("role", "sales_agent").execute().data or []
+        deals = db.table("lead_deals").select("sales_agent, status, est_kwh, adder").execute().data or []
+
+        agent_map: dict = {}
+        for d in deals:
+            name = d.get("sales_agent") or "Unassigned"
+            if name not in agent_map:
+                agent_map[name] = {"active": 0, "total": 0, "est": 0.0}
+            agent_map[name]["total"] += 1
+            if (d.get("status") or "").lower() == "active":
+                agent_map[name]["active"] += 1
+                agent_map[name]["est"] += float(d.get("est_kwh") or 0) * float(d.get("adder") or 0)
+
+        ranked = sorted(agent_map.items(), key=lambda x: -x[1]["active"])
+        lines = []
+        for i, (name, stats) in enumerate(ranked, 1):
+            lines.append(f"#{i} {name}: {stats['active']} active, {stats['total']} total deals, est. {_fmt_money(stats['est'])}/mo")
+        return _section(f"Sales Team Performance — {len(agents)} agent(s)", lines or ["No agent data found."])
+
+    # ── Expiring / renewals (must come before generic "deals" check) ──
+    if _want("expir", "renew", "renewal", "ending", "expire", "soon"):
+        deals = db.table("lead_deals").select("id, supplier, sales_agent, end_date, status").eq("status", "Active").execute().data or []
+        buckets = {"30 days": [], "60 days": [], "90 days": []}
+        for d in deals:
+            days = _days_until(d.get("end_date"))
+            if days is None:
+                continue
+            sup = d.get("supplier") or "Unknown"
+            agent = d.get("sales_agent") or "Unassigned"
+            label = f"{sup} (agent: {agent}) — expires {_days_until_str(d.get('end_date'))}"
+            if days <= 30:
+                buckets["30 days"].append(label)
+            elif days <= 60:
+                buckets["60 days"].append(label)
+            elif days <= 90:
+                buckets["90 days"].append(label)
+        lines = []
+        for bucket, items in buckets.items():
+            lines.append(f"Within {bucket}: {len(items)}")
+            lines += [f"  → {i}" for i in items[:4]]
+        return _section("Expiring Deals", lines or ["No deals expiring within 90 days."])
+
+    # ── Leads ──
+    if _want("lead", "leads", "prospect", "customer"):
+        leads = db.table("leads").select("id, first_name, last_name, status, created_at, address").execute().data or []
+        by_status: dict = {}
+        for l in leads:
+            s = (l.get("status") or "unknown").title()
+            by_status[s] = by_status.get(s, 0) + 1
+        lines = [f"{s}: {c}" for s, c in sorted(by_status.items(), key=lambda x: -x[1])]
+        recent = sorted(leads, key=lambda x: x.get("created_at") or "", reverse=True)[:5]
+        lines.append("")
+        lines.append("Most recent leads:")
+        for l in recent:
+            name = f"{l.get('first_name','')} {l.get('last_name','')}".strip()
+            lines.append(f"{name} — {(l.get('status') or '').title()}")
+        return _section(f"Leads — {len(leads)} total", lines)
+
+    # ── Deals / active / pipeline ──
+    if _want("deal", "deals", "active", "pipeline", "contract", "accounts"):
+        deals = db.table("lead_deals").select("id, status, supplier, sales_agent, est_kwh, adder, start_date, end_date").execute().data or []
+        active = [d for d in deals if (d.get("status") or "").lower() == "active"]
+        future = [d for d in deals if (d.get("status") or "").lower() == "future"]
+        est_rev = sum(float(d.get("est_kwh") or 0) * float(d.get("adder") or 0) for d in active)
+
+        by_supplier: dict = {}
+        for d in active:
+            s = d.get("supplier") or "Unknown"
+            by_supplier[s] = by_supplier.get(s, 0) + 1
+        sup_lines = [f"{s}: {c} deals" for s, c in sorted(by_supplier.items(), key=lambda x: -x[1])[:6]]
+
+        lines = [
+            f"Active deals: {len(active)}",
+            f"Future/Pending: {len(future)}",
+            f"Est. monthly commission from active: {_fmt_money(est_rev)}",
+            "",
+            "Active deals by supplier:",
+        ] + sup_lines
+        return _section(f"Deals — {len(deals)} total", lines)
+
+    # ── Commissions / money / revenue / finances ──
+    if _want("commission", "commissions", "money", "revenue", "payment", "paid", "earn", "financ", "income"):
+        comms = db.table("actual_commissions").select("billing_month, raw_amount, supplier_id").order("billing_month", desc=True).limit(1000).execute().data or []
+        by_month: dict = {}
+        for c in comms:
+            m = (c.get("billing_month") or "")[:7]
+            if m:
+                by_month[m] = by_month.get(m, 0.0) + (c.get("raw_amount") or 0.0)
+        total = sum(by_month.values())
+        lines = [f"{m}: {_fmt_money(amt)}" for m, amt in sorted(by_month.items(), reverse=True)[:6]]
+        lines.append(f"")
+        lines.append(f"Total recorded: {_fmt_money(total)} across {len(by_month)} months")
+
+        # Also show estimated from active deals
+        deals = db.table("lead_deals").select("est_kwh, adder").eq("status", "Active").execute().data or []
+        est = sum(float(d.get("est_kwh") or 0) * float(d.get("adder") or 0) for d in deals)
+        lines.append(f"Est. monthly commission (active deals): {_fmt_money(est)}")
+        return _section("Commission & Revenue", lines or ["No commission data recorded yet."])
+
+
+    # ── Alerts / issues / urgent ──
+    if _want("alert", "alerts", "issue", "issues", "problem", "urgent", "warning", "critical"):
+        alerts = db.table("ai_alerts").select("severity, message, type, created_at").eq("status", "open").order("severity").execute().data or []
+        critical = [a for a in alerts if a.get("severity") == "high"]
+        medium = [a for a in alerts if a.get("severity") == "medium"]
+        low = [a for a in alerts if a.get("severity") == "low"]
+        lines = [f"🔴 Urgent: {len(critical)}  🟡 Warning: {len(medium)}  🔵 Info: {len(low)}", ""]
+        for a in (critical + medium)[:8]:
+            prefix = "🔴" if a.get("severity") == "high" else "🟡"
+            lines.append(f"{prefix} {a.get('message','')[:120]}")
+        return _section(f"Open Alerts — {len(alerts)} total", lines or ["No open alerts. All clear!"])
+
+    # ── Uploads / statements ──
+    if _want("upload", "uploads", "statement", "statements", "file", "files"):
+        uploads = db.table("upload_batches").select("original_filename, status, rows_imported, created_at, suppliers(name)").order("created_at", desc=True).limit(10).execute().data or []
+        lines = []
+        for u in uploads:
+            supplier = (u.get("suppliers") or {}).get("name") or "Unknown"
+            rows = u.get("rows_imported") or 0
+            status = (u.get("status") or "").title()
+            lines.append(f"{u.get('original_filename','?')} — {supplier}, {rows} rows, {status}")
+        return _section("Recent Commission Uploads", lines or ["No uploads found."])
+
+    # ── Fallback — show help ──
+    return (
+        "I can answer questions about your business. Try asking:\n\n"
+        "  • **Summary** — full company overview\n"
+        "  • **Leads** — lead counts and recent prospects\n"
+        "  • **Deals** / **Active deals** — deal pipeline\n"
+        "  • **Expiring deals** — what's up for renewal\n"
+        "  • **Commissions** / **Revenue** — payment history\n"
+        "  • **Agents** — sales team performance\n"
+        "  • **Alerts** — open issues and warnings\n"
+        "  • **Uploads** — recent commission statements"
+    )

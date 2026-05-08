@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Body
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from collections import defaultdict
@@ -7,7 +7,7 @@ from app.auth.deps import require_admin, UserContext
 from app.db.client import get_client
 from app.services.ai_agent import (
     get_dashboard, run_full_scan, generate_daily_report,
-    generate_monthly_report, _resolve_alert
+    generate_monthly_report, _resolve_alert, chat_with_context
 )
 
 
@@ -532,3 +532,13 @@ def commission_tracker(months_back: int = Query(12), user: UserContext = Depends
         "missing_by_month": missing_by_month,
         "supplier_summary": supplier_summary,
     }
+
+
+@router.post("/chat")
+def ai_chat(data: dict = Body(...), user: UserContext = Depends(require_admin)):
+    message = str(data.get("message", "")).strip()
+    history = data.get("history", [])
+    if not message:
+        raise HTTPException(status_code=400, detail="message is required")
+    reply = chat_with_context(message, history)
+    return {"reply": reply}

@@ -75,8 +75,9 @@ app = FastAPI(
 )
 
 _origins = [o.strip() for o in settings.frontend_url.split(",") if o.strip()]
-if "http://localhost:3000" not in _origins:
-    _origins.append("http://localhost:3000")
+for _always in ["http://localhost:3000", "https://saigon-power-frontend.vercel.app"]:
+    if _always not in _origins:
+        _origins.append(_always)
 
 app.add_middleware(
     CORSMiddleware,

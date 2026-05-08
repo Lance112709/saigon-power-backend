@@ -216,79 +216,76 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
     today = date.today()
     cutoff = date(today.year + 2, today.month, 1)
 
-    # ── Fetch all rows from actual_commissions (paginate past 1000 limit) ────
-    all_rows = []
-    offset = 0
-    while True:
-        res = db.table("actual_commissions").select(
-            "raw_esiid, raw_kwh, raw_rate, billing_month, raw_row_data, suppliers(name)"
-        ).range(offset, offset + 999).execute()
-        if not res.data:
-            break
-        all_rows.extend(res.data)
-        if len(res.data) < 1000:
-            break
-        offset += 1000
-
-    # Keep latest billing_month record per ESIID
-    best: dict = {}
-    for r in all_rows:
-        esiid = r.get("raw_esiid") or ""
-        if not esiid:
-            continue
-        existing = best.get(esiid)
-        if not existing or (r.get("billing_month") or "") > (existing.get("billing_month") or ""):
-            best[esiid] = r
-
-    # Build ESIID → contract_end_date fallback from crm_deals
-    crm_end: dict = {}
-    offset2 = 0
-    while True:
-        res2 = db.table("crm_deals").select("esiid, contract_end_date").not_.is_("esiid", "null").not_.is_("contract_end_date", "null").range(offset2, offset2 + 999).execute()
-        if not res2.data:
-            break
-        for row in res2.data:
-            esiid = (row.get("esiid") or "").strip()
-            if esiid and row.get("contract_end_date"):
-                crm_end[esiid] = row["contract_end_date"]
-        if len(res2.data) < 1000:
-            break
-        offset2 += 1000
+    # kWh/month assumptions by meter type (Texas averages)
+    KWH_DEFAULTS = {"Residential": 1100.0, "Commercial": 2500.0}
+    DEFAULT_KWH = 1100.0
 
     monthly: dict = {}
     by_supplier: dict = {}
     contributing = 0
+    skipped = 0
 
-    for esiid, r in best.items():
-        kwh   = r.get("raw_kwh") or 0
-        adder = r.get("raw_rate") or 0
-        if not kwh or not adder:
-            continue
+    def _next_month(d: date) -> date:
+        return (d.replace(day=28) + timedelta(days=4)).replace(day=1)
 
-        # Try raw_row_data first, fall back to crm_deals
-        rd = r.get("raw_row_data") or {}
-        end_raw = rd.get("contract_end") or crm_end.get(esiid.strip()) or ""
-        if not end_raw:
-            continue
-
-        try:
-            end_d = datetime.strptime(end_raw[:10], "%Y-%m-%d").date()
-        except Exception:
-            continue
-
-        if end_d <= today:
-            continue
-
-        commission_mo = round(kwh * adder, 4)
-        supplier = (r.get("suppliers") or {}).get("name") or "Unknown"
+    def _project(kwh: float, adder: float, end_d: date, supplier: str):
+        nonlocal contributing
+        if not kwh or not adder or end_d <= today:
+            return
+        commission_mo = kwh * adder
         contributing += 1
-
         cur = today.replace(day=1)
         while cur <= end_d and cur < cutoff:
             key = cur.strftime("%Y-%m")
-            monthly[key]          = monthly.get(key, 0) + commission_mo
+            monthly[key] = monthly.get(key, 0) + commission_mo
             by_supplier[supplier] = by_supplier.get(supplier, 0) + commission_mo
-            cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+            cur = _next_month(cur)
+
+    # ── Source 1: lead_deals (est_kwh * adder) ───────────────────────────────
+    ld_offset = 0
+    while True:
+        rows = db.table("lead_deals").select(
+            "est_kwh, adder, end_date, supplier, status"
+        ).eq("status", "Active").range(ld_offset, ld_offset + 999).execute().data or []
+        for d in rows:
+            kwh   = float(d.get("est_kwh") or 0)
+            adder = float(d.get("adder") or 0)
+            end_raw = (d.get("end_date") or "")[:10]
+            if not kwh or not adder or not end_raw:
+                skipped += 1
+                continue
+            try:
+                end_d = datetime.strptime(end_raw, "%Y-%m-%d").date()
+            except Exception:
+                skipped += 1
+                continue
+            _project(kwh, adder, end_d, d.get("supplier") or "Unknown")
+        if len(rows) < 1000:
+            break
+        ld_offset += 1000
+
+    # ── Source 2: crm_deals (assumed kWh by meter_type * adder) ─────────────
+    cd_offset = 0
+    while True:
+        rows = db.table("crm_deals").select(
+            "adder, meter_type, contract_end_date, provider, deal_status"
+        ).eq("deal_status", "ACTIVE").not_.is_("adder", "null").not_.is_("contract_end_date", "null").range(cd_offset, cd_offset + 999).execute().data or []
+        for d in rows:
+            adder = float(d.get("adder") or 0)
+            kwh   = KWH_DEFAULTS.get(d.get("meter_type") or "", DEFAULT_KWH)
+            end_raw = (d.get("contract_end_date") or "")[:10]
+            if not adder or not end_raw:
+                skipped += 1
+                continue
+            try:
+                end_d = datetime.strptime(end_raw, "%Y-%m-%d").date()
+            except Exception:
+                skipped += 1
+                continue
+            _project(kwh, adder, end_d, d.get("provider") or "Unknown")
+        if len(rows) < 1000:
+            break
+        cd_offset += 1000
 
     sorted_months = sorted(monthly.keys())
     total = sum(monthly.values())
@@ -298,7 +295,7 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
         "total_projected": round(total, 2),
         "avg_monthly": round(total / len(monthly), 2) if monthly else 0,
         "contributing_deals": contributing,
-        "total_in_report": len(all_rows),
+        "total_in_report": contributing + skipped,
         "months_out": len(sorted_months),
     }
 

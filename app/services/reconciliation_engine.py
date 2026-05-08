@@ -33,11 +33,20 @@ def run_reconciliation(billing_month: str, supplier_id: str = None, run_by: str 
     actual_rows = q_act.execute().data
 
     # Build lookup dicts by normalized ESIID
+    # Batch-load all service_points to avoid N+1
+    sp_ids = list({row["service_point_id"] for row in expected_rows if row.get("service_point_id")})
+    sp_map: dict = {}
+    for i in range(0, len(sp_ids), 200):
+        chunk = sp_ids[i:i + 200]
+        batch = db.table("service_points").select("id,esiid").in_("id", chunk).execute().data or []
+        for sp in batch:
+            sp_map[sp["id"]] = sp["esiid"]
+
     expected_by_esiid = {}
     for row in expected_rows:
-        sp = db.table("service_points").select("esiid").eq("id", row["service_point_id"]).single().execute()
-        if sp.data:
-            key = normalize_esiid(sp.data["esiid"])
+        raw_esiid = sp_map.get(row["service_point_id"])
+        if raw_esiid:
+            key = normalize_esiid(raw_esiid)
             expected_by_esiid[key] = row
 
     actual_by_esiid = {}

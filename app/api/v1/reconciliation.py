@@ -1,5 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, Depends
-from typing import Optional
+from typing import Optional, List
+from pydantic import BaseModel
 from app.db.client import get_client
 from app.services.reconciliation_engine import run_reconciliation
 from app.auth.deps import require_admin, UserContext
@@ -47,6 +48,25 @@ def get_run_items(
         q = q.eq("is_resolved", is_resolved)
 
     return q.execute().data
+
+class BulkResolveBody(BaseModel):
+    item_ids: List[str]
+    resolution_notes: str = ""
+
+@router.post("/items/bulk-resolve")
+def bulk_resolve_items(body: BulkResolveBody, user: UserContext = Depends(require_admin)):
+    db = get_client()
+    from datetime import datetime
+    now = datetime.utcnow().isoformat()
+    updated = 0
+    for item_id in body.item_ids:
+        db.table("reconciliation_items").update({
+            "is_resolved": True,
+            "resolution_notes": body.resolution_notes,
+            "resolved_at": now,
+        }).eq("id", item_id).execute()
+        updated += 1
+    return {"resolved": updated}
 
 @router.patch("/items/{id}")
 def resolve_item(id: str, resolution_notes: str = "", is_resolved: bool = True, user: UserContext = Depends(require_admin)):
