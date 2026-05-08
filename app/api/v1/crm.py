@@ -447,7 +447,7 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
     allowed = {"deal_status", "deal_name", "provider", "adder", "energy_rate", "deal_owner",
                "sales_agent", "contract_start_date", "contract_end_date", "contract_signed_date",
                "contract_term", "notes", "service_address", "meter_type", "deal_type",
-               "business_name", "anxh", "product_type"}
+               "business_name", "anxh", "product_type", "flag_delinked"}
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
