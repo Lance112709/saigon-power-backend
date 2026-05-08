@@ -263,12 +263,19 @@ def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends
     allowed = {"full_name", "first_name", "last_name", "email", "phone", "dob",
                "mailing_address", "city", "state", "postal_code", "notes"}
     payload = {k: v for k, v in data.items() if k in allowed}
-    if not payload:
-        raise HTTPException(status_code=400, detail="No valid fields to update")
     from datetime import datetime, timezone
-    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    res = db.table("crm_customers").update(payload).eq("id", id).execute()
-    return res.data[0] if res.data else {}
+    result = {}
+    if payload:
+        payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+        res = db.table("crm_customers").update(payload).eq("id", id).execute()
+        result = res.data[0] if res.data else {}
+    # ANXH lives on crm_deals — update all deals for this customer
+    if "anxh" in data:
+        db.table("crm_deals").update({"anxh": data["anxh"] or None}).eq("customer_id", id).execute()
+        result["anxh"] = data["anxh"]
+    if not payload and "anxh" not in data:
+        raise HTTPException(status_code=400, detail="No valid fields to update")
+    return result
 
 @router.delete("/customers/{id}")
 def delete_crm_customer(id: str, user: UserContext = Depends(require_manager)):
