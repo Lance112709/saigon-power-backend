@@ -364,6 +364,90 @@ def list_deals(
         deals = [d for d in deals if (d.get("sales_agent") or "").lower() == user.sales_agent_name.lower()]
     return deals
 
+@router.get("/deals/check-duplicate")
+def check_duplicate_deal(
+    esiid: Optional[str] = Query(None),
+    service_address: Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    db = get_client()
+    matches = []
+
+    if esiid and esiid.strip():
+        esiid_clean = esiid.strip()
+        # Check crm_deals
+        res = db.table("crm_deals").select(
+            "id, deal_name, provider, deal_status, esiid, service_address, crm_customers(id, full_name)"
+        ).eq("esiid", esiid_clean).eq("deal_status", "ACTIVE").execute()
+        for d in (res.data or []):
+            matches.append({
+                "source": "crm",
+                "deal_id": d["id"],
+                "deal_name": d.get("deal_name") or "Unnamed Deal",
+                "provider": d.get("provider") or "",
+                "esiid": d.get("esiid") or "",
+                "service_address": d.get("service_address") or "",
+                "customer_name": (d.get("crm_customers") or {}).get("full_name") or "",
+                "customer_id": (d.get("crm_customers") or {}).get("id") or "",
+            })
+        # Check lead_deals
+        res2 = db.table("lead_deals").select(
+            "id, plan_name, supplier, status, esiid, service_address, crm_leads(id, first_name, last_name)"
+        ).eq("esiid", esiid_clean).eq("status", "Active").execute()
+        for d in (res2.data or []):
+            lead = d.get("crm_leads") or {}
+            matches.append({
+                "source": "lead",
+                "deal_id": d["id"],
+                "deal_name": d.get("plan_name") or "Unnamed Deal",
+                "provider": d.get("supplier") or "",
+                "esiid": d.get("esiid") or "",
+                "service_address": d.get("service_address") or "",
+                "customer_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
+                "customer_id": lead.get("id") or "",
+            })
+
+    if service_address and service_address.strip():
+        addr_clean = service_address.strip()
+        existing_ids = {m["deal_id"] for m in matches}
+        # Check crm_deals
+        res3 = db.table("crm_deals").select(
+            "id, deal_name, provider, deal_status, esiid, service_address, crm_customers(id, full_name)"
+        ).ilike("service_address", addr_clean).eq("deal_status", "ACTIVE").execute()
+        for d in (res3.data or []):
+            if d["id"] not in existing_ids:
+                existing_ids.add(d["id"])
+                matches.append({
+                    "source": "crm",
+                    "deal_id": d["id"],
+                    "deal_name": d.get("deal_name") or "Unnamed Deal",
+                    "provider": d.get("provider") or "",
+                    "esiid": d.get("esiid") or "",
+                    "service_address": d.get("service_address") or "",
+                    "customer_name": (d.get("crm_customers") or {}).get("full_name") or "",
+                    "customer_id": (d.get("crm_customers") or {}).get("id") or "",
+                })
+        # Check lead_deals
+        res4 = db.table("lead_deals").select(
+            "id, plan_name, supplier, status, esiid, service_address, crm_leads(id, first_name, last_name)"
+        ).ilike("service_address", addr_clean).eq("status", "Active").execute()
+        for d in (res4.data or []):
+            if d["id"] not in existing_ids:
+                existing_ids.add(d["id"])
+                lead = d.get("crm_leads") or {}
+                matches.append({
+                    "source": "lead",
+                    "deal_id": d["id"],
+                    "deal_name": d.get("plan_name") or "Unnamed Deal",
+                    "provider": d.get("supplier") or "",
+                    "esiid": d.get("esiid") or "",
+                    "service_address": d.get("service_address") or "",
+                    "customer_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
+                    "customer_id": lead.get("id") or "",
+                })
+
+    return {"matches": matches}
+
 @router.get("/deals/{id}")
 def get_deal(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
