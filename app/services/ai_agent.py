@@ -500,9 +500,6 @@ def generate_monthly_report() -> dict:
 def get_dashboard() -> dict:
     db = get_client()
 
-    # Run scan to refresh alerts
-    run_full_scan()
-
     metrics = get_daily_metrics(db)
     summary = generate_ai_summary(metrics)
     recs    = get_recommendations(db)
