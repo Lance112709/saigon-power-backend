@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions
+from app.api.v1 import suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions, search as search_module
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -24,3 +24,4 @@ router.include_router(sms_module.router, prefix="/sms", tags=["SMS"])
 router.include_router(landing.router, prefix="/landing-plans", tags=["Landing"])
 router.include_router(renewals.router, prefix="/renewals", tags=["Renewals"])
 router.include_router(agent_commissions.router, prefix="/agent-commissions", tags=["Agent Commissions"])
+router.include_router(search_module.router, prefix="/search", tags=["Search"])
