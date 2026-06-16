@@ -327,8 +327,9 @@ def _template_summary(m: dict) -> str:
     )
     if dq["total_issues"] > 0:
         parts.append(
-            f"{dq['total_issues']} deal{'s are' if dq['total_issues'] != 1 else ' is'} missing critical data "
-            f"({dq['missing_rate']} missing rate, {dq['missing_esiid']} missing ESIID, {dq['missing_agent']} unassigned)."
+            f"{dq['total_issues']} data quality issue{'s' if dq['total_issues'] != 1 else ''} found: "
+            f"{dq['dup_esiid']} duplicate ESI ID{'s' if dq['dup_esiid'] != 1 else ''}, "
+            f"{dq['dup_address']} duplicate address{'es' if dq['dup_address'] != 1 else ''}."
         )
     if r["30_days"] > 0:
         parts.append(f"⚠️ {r['30_days']} deal{'s' if r['30_days'] != 1 else ''} expiring within 30 days — urgent renewal action needed.")
@@ -343,9 +344,9 @@ def _template_summary(m: dict) -> str:
 
 def generate_ai_summary(metrics: dict) -> str:
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        return _template_summary(metrics)
     try:
+        if not api_key:
+            return _template_summary(metrics)
         import anthropic
         client = anthropic.Anthropic(api_key=api_key)
         msg = client.messages.create(
@@ -357,7 +358,10 @@ Metrics: {metrics}"""}]
         )
         return msg.content[0].text.strip()
     except Exception:
-        return _template_summary(metrics)
+        try:
+            return _template_summary(metrics)
+        except Exception:
+            return "All systems operating normally."
 
 # ── Recommendations ────────────────────────────────────────────────────────────
 
