@@ -35,173 +35,182 @@ def _days_ago(date_str: Optional[str]) -> Optional[int]:
 
 # ── Alert Engine ────────────────────────────────────────────────────────────────
 
-def _open_alert_key(db, alert_type: str, entity_id: str) -> bool:
-    """Return True if an open alert already exists for this type+entity."""
-    res = db.table("ai_alerts").select("id").eq("type", alert_type).eq("entity_id", str(entity_id)).eq("status", "open").execute()
-    return bool(res.data)
-
-def _create_alert(db, alert_type: str, entity_type: str, entity_id: str,
-                  message: str, severity: str, user_id: Optional[str] = None,
-                  metadata: Optional[dict] = None):
-    if _open_alert_key(db, alert_type, entity_id):
-        return
-    db.table("ai_alerts").insert({
-        "type": alert_type,
-        "entity_type": entity_type,
-        "entity_id": str(entity_id),
-        "user_id": user_id,
-        "message": message,
-        "severity": severity,
-        "status": "open",
-        "metadata": metadata or {},
-    }).execute()
-
 def _resolve_alert(db, alert_type: str, entity_id: str):
     db.table("ai_alerts").update({
         "status": "resolved",
         "updated_at": _now().isoformat(),
     }).eq("type", alert_type).eq("entity_id", str(entity_id)).eq("status", "open").execute()
 
-# ── Data Quality Scan ──────────────────────────────────────────────────────────
+# ── Optimized Batch Scan ───────────────────────────────────────────────────────
 
-def scan_lead_deals(db) -> dict:
-    """Scan lead_deals for missing critical fields."""
-    deals = db.table("lead_deals").select("*").neq("status", "Inactive").execute().data or []
-    issues = {"missing_rate": 0, "missing_esiid": 0, "missing_agent": 0,
-              "missing_dates": 0, "missing_rate_ids": [], "total_scanned": len(deals)}
+def run_full_scan() -> dict:
+    """
+    Run all scans using batch DB queries.
+    Pre-fetches all open alerts once, accumulates inserts/resolves in memory,
+    then writes in batches — O(~8 queries) regardless of data size.
+    """
+    db = get_client()
+
+    # 1. Pre-load all open alerts into a dict keyed by (type, entity_id)
+    existing_raw = db.table("ai_alerts").select("id, type, entity_id").eq("status", "open").execute().data or []
+    open_alerts: dict = {(a["type"], a["entity_id"]): a["id"] for a in existing_raw}
+
+    to_insert: list = []
+    to_resolve_ids: set = set()
+
+    def _add(alert_type, entity_type, entity_id, message, severity, metadata=None):
+        key = (alert_type, str(entity_id))
+        if key not in open_alerts:
+            to_insert.append({
+                "type": alert_type, "entity_type": entity_type,
+                "entity_id": str(entity_id), "message": message,
+                "severity": severity, "status": "open",
+                "metadata": metadata or {},
+            })
+            open_alerts[key] = "__pending__"
+
+    def _resolve(alert_type, entity_id):
+        key = (alert_type, str(entity_id))
+        aid = open_alerts.get(key)
+        if aid and aid != "__pending__":
+            to_resolve_ids.add(aid)
+
+    # 2. Scan lead_deals
+    deals = db.table("lead_deals").select(
+        "id, lead_id, supplier, esiid, rate, sales_agent, start_date, end_date, status"
+    ).neq("status", "Inactive").execute().data or []
+
+    deal_issues = {"missing_rate": 0, "missing_esiid": 0, "missing_agent": 0,
+                   "missing_dates": 0, "missing_rate_ids": [], "total_scanned": len(deals)}
 
     for d in deals:
         did = d["id"]
         lead_id = d.get("lead_id", "")
         supplier = d.get("supplier") or "Unknown Supplier"
         esiid = str(d.get("esiid") or "").strip()
-        rate = d.get("rate")
         agent = str(d.get("sales_agent") or "").strip()
         start = d.get("start_date")
         end = d.get("end_date")
 
-        # Missing rate
-        if rate is None or float(rate) <= 0:
-            issues["missing_rate"] += 1
-            issues["missing_rate_ids"].append(did)
-            _create_alert(db, "missing_rate", "deal", did,
-                f"Deal ({supplier}) is missing a valid rate. This will impact commission calculations.",
-                "high", metadata={"lead_id": lead_id})
-        else:
-            _resolve_alert(db, "missing_rate", did)
+        try:
+            has_rate = d.get("rate") is not None and float(d["rate"]) > 0
+        except (ValueError, TypeError):
+            has_rate = False
 
-        # Missing ESIID (only relevant for active deals)
+        if not has_rate:
+            deal_issues["missing_rate"] += 1
+            deal_issues["missing_rate_ids"].append(did)
+            _add("missing_rate", "deal", did,
+                 f"Deal ({supplier}) is missing a valid rate. This will impact commission calculations.",
+                 "high", metadata={"lead_id": lead_id})
+        else:
+            _resolve("missing_rate", did)
+
         if d.get("status") == "Active" and not esiid:
-            issues["missing_esiid"] += 1
-            _create_alert(db, "missing_esiid", "deal", did,
-                f"Active deal ({supplier}) is missing ESIID. Required for commission reconciliation.",
-                "high", metadata={"lead_id": lead_id})
+            deal_issues["missing_esiid"] += 1
+            _add("missing_esiid", "deal", did,
+                 f"Active deal ({supplier}) is missing ESIID. Required for commission reconciliation.",
+                 "high", metadata={"lead_id": lead_id})
         elif esiid:
-            _resolve_alert(db, "missing_esiid", did)
+            _resolve("missing_esiid", did)
 
-        # Missing agent
         if not agent:
-            issues["missing_agent"] += 1
-            _create_alert(db, "missing_agent", "deal", did,
-                f"Deal ({supplier}) has no assigned sales agent.",
-                "medium", metadata={"lead_id": lead_id})
+            deal_issues["missing_agent"] += 1
+            _add("missing_agent", "deal", did,
+                 f"Deal ({supplier}) has no assigned sales agent.",
+                 "medium", metadata={"lead_id": lead_id})
         else:
-            _resolve_alert(db, "missing_agent", did)
+            _resolve("missing_agent", did)
 
-        # Missing dates on active deals
         if d.get("status") == "Active" and (not start or not end):
-            issues["missing_dates"] += 1
-            _create_alert(db, "missing_dates", "deal", did,
-                f"Active deal ({supplier}) is missing start or end date.",
-                "medium", metadata={"lead_id": lead_id})
+            deal_issues["missing_dates"] += 1
+            _add("missing_dates", "deal", did,
+                 f"Active deal ({supplier}) is missing start or end date.",
+                 "medium", metadata={"lead_id": lead_id})
         elif start and end:
-            _resolve_alert(db, "missing_dates", did)
+            _resolve("missing_dates", did)
 
-    return issues
-
-def scan_renewals(db) -> dict:
-    """Flag deals expiring within 90 days."""
-    deals = db.table("lead_deals").select("id, lead_id, supplier, end_date, sales_agent").eq("status", "Active").execute().data or []
-    r = {"30_days": 0, "60_days": 0, "90_days": 0}
-
+    # 3. Scan renewals (reuse already-fetched deals)
+    renewals = {"30_days": 0, "60_days": 0, "90_days": 0}
     for d in deals:
+        if d.get("status") != "Active":
+            continue
         days = _days_until(d.get("end_date"))
         if days is None:
             continue
         did = d["id"]
         supplier = d.get("supplier") or "Unknown"
         if days <= 30:
-            r["30_days"] += 1
-            _create_alert(db, "renewal_30", "deal", did,
-                f"URGENT: Deal ({supplier}) expires in {days} day(s). Immediate renewal action required.",
-                "high", metadata={"lead_id": d.get("lead_id"), "days_until": days})
+            renewals["30_days"] += 1
+            _add("renewal_30", "deal", did,
+                 f"URGENT: Deal ({supplier}) expires in {days} day(s). Immediate renewal action required.",
+                 "high", metadata={"lead_id": d.get("lead_id"), "days_until": days})
         elif days <= 60:
-            r["60_days"] += 1
-            _create_alert(db, "renewal_60", "deal", did,
-                f"Deal ({supplier}) expires in {days} days. Begin renewal conversation.",
-                "medium", metadata={"lead_id": d.get("lead_id"), "days_until": days})
+            renewals["60_days"] += 1
+            _add("renewal_60", "deal", did,
+                 f"Deal ({supplier}) expires in {days} days. Begin renewal conversation.",
+                 "medium", metadata={"lead_id": d.get("lead_id"), "days_until": days})
         elif days <= 90:
-            r["90_days"] += 1
-            _create_alert(db, "renewal_90", "deal", did,
-                f"Deal ({supplier}) expires in {days} days. Start renewal planning.",
-                "low", metadata={"lead_id": d.get("lead_id"), "days_until": days})
+            renewals["90_days"] += 1
+            _add("renewal_90", "deal", did,
+                 f"Deal ({supplier}) expires in {days} days. Start renewal planning.",
+                 "low", metadata={"lead_id": d.get("lead_id"), "days_until": days})
 
-    return r
-
-def scan_inactive_leads(db) -> int:
-    """Flag leads with no activity in 14+ days."""
+    # 4. Scan inactive leads (2 queries total)
     leads = db.table("leads").select("id, first_name, last_name, created_at").eq("status", "lead").execute().data or []
-    flagged = 0
-    lead_ids = [l["id"] for l in leads]
-    if not lead_ids:
-        return 0
+    inactive_count = 0
+    if leads:
+        lead_ids = [l["id"] for l in leads]
+        recent_tasks = db.table("tasks").select("lead_id").in_("lead_id", lead_ids).eq("status", "completed").execute().data or []
+        active_lead_ids = {t["lead_id"] for t in recent_tasks}
+        for lead in leads:
+            lid = lead["id"]
+            age = _days_ago(lead.get("created_at")) or 0
+            if age >= 14 and lid not in active_lead_ids:
+                inactive_count += 1
+                name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip()
+                _add("inactive_lead", "lead", lid,
+                     f"Lead '{name}' has had no activity for {age} days.", "low")
+            elif lid in active_lead_ids:
+                _resolve("inactive_lead", lid)
 
-    recent_tasks = db.table("tasks").select("lead_id").in_("lead_id", lead_ids).eq("status", "completed").execute().data or []
-    active_lead_ids = {t["lead_id"] for t in recent_tasks}
-
-    for lead in leads:
-        lid = lead["id"]
-        age = _days_ago(lead.get("created_at")) or 0
-        if age >= 14 and lid not in active_lead_ids:
-            flagged += 1
-            name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip()
-            _create_alert(db, "inactive_lead", "lead", lid,
-                f"Lead '{name}' has had no activity for {age} days.",
-                "low")
-        elif lid in active_lead_ids:
-            _resolve_alert(db, "inactive_lead", lid)
-
-    return flagged
-
-def scan_duplicate_leads(db) -> int:
-    """Detect leads with same name + address."""
-    leads = db.table("leads").select("id, first_name, last_name, address").execute().data or []
+    # 5. Scan duplicate leads (1 query, in-memory dedup)
+    all_leads = db.table("leads").select("id, first_name, last_name, address").execute().data or []
     seen: dict = {}
     dupes = 0
-    for l in leads:
-        key = f"{(l.get('first_name') or '').strip().lower()}|{(l.get('last_name') or '').strip().lower()}|{(l.get('address') or '').strip().lower()[:30]}"
+    for l in all_leads:
+        key = (
+            f"{(l.get('first_name') or '').strip().lower()}|"
+            f"{(l.get('last_name') or '').strip().lower()}|"
+            f"{(l.get('address') or '').strip().lower()[:30]}"
+        )
         if key in seen:
             dupes += 1
-            _create_alert(db, "duplicate_lead", "lead", l["id"],
-                f"Possible duplicate lead: '{l.get('first_name','')} {l.get('last_name','')}' at '{l.get('address','')}'",
-                "medium", metadata={"original_id": seen[key]})
+            _add("duplicate_lead", "lead", l["id"],
+                 f"Possible duplicate lead: '{l.get('first_name','')} {l.get('last_name','')}' at '{l.get('address','')}'",
+                 "medium", metadata={"original_id": seen[key]})
         else:
             seen[key] = l["id"]
-    return dupes
 
-def run_full_scan() -> dict:
-    """Run all scans and return summary."""
-    db = get_client()
-    deal_issues = scan_lead_deals(db)
-    renewals    = scan_renewals(db)
-    inactive    = scan_inactive_leads(db)
-    dupes       = scan_duplicate_leads(db)
+    # 6. Batch write — inserts chunked at 50, resolves chunked at 50
+    for i in range(0, len(to_insert), 50):
+        db.table("ai_alerts").insert(to_insert[i:i + 50]).execute()
+
+    resolved_list = list(to_resolve_ids)
+    for i in range(0, len(resolved_list), 50):
+        db.table("ai_alerts").update({
+            "status": "resolved",
+            "updated_at": _now().isoformat(),
+        }).in_("id", resolved_list[i:i + 50]).execute()
+
     return {
         "scanned_at": _now().isoformat(),
         "deal_issues": deal_issues,
         "renewals": renewals,
-        "inactive_leads": inactive,
+        "inactive_leads": inactive_count,
         "duplicate_leads": dupes,
+        "alerts_created": len(to_insert),
+        "alerts_resolved": len(to_resolve_ids),
     }
 
 # ── Metrics ────────────────────────────────────────────────────────────────────
