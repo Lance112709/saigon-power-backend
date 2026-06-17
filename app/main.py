@@ -55,17 +55,29 @@ def _run_renewal_sms():
     except Exception:
         pass
 
-scheduler = BackgroundScheduler(timezone="America/Chicago")
-scheduler.add_job(_run_reminders, "cron", hour=8, minute=0)
-scheduler.add_job(_run_ai_daily, "cron", hour=6, minute=0)
-scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
-scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
+try:
+    scheduler = BackgroundScheduler(timezone="America/Chicago")
+    scheduler.add_job(_run_reminders, "cron", hour=8, minute=0)
+    scheduler.add_job(_run_ai_daily, "cron", hour=6, minute=0)
+    scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
+    scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
+    _scheduler_ok = True
+except Exception:
+    _scheduler_ok = False
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    scheduler.start()
+    if _scheduler_ok:
+        try:
+            scheduler.start()
+        except Exception:
+            pass
     yield
-    scheduler.shutdown()
+    if _scheduler_ok:
+        try:
+            scheduler.shutdown()
+        except Exception:
+            pass
 
 app = FastAPI(
     lifespan=lifespan,
