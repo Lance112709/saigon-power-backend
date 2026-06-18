@@ -322,6 +322,12 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         "sales_agent":           str(data.get("sales_agent") or "").strip() or None,
         "deal_owner":            str(data.get("deal_owner") or "").strip() or None,
         "product_type":          str(data.get("product_type") or "").strip() or None,
+        "flag_tos":              bool(data.get("flag_tos", False)),
+        "flag_toao":             bool(data.get("flag_toao", False)),
+        "flag_deposit":          bool(data.get("flag_deposit", False)),
+        "flag_special_deal":     bool(data.get("flag_special_deal", False)),
+        "flag_promo_10":         bool(data.get("flag_promo_10", False)),
+        "flag_delinked":         bool(data.get("flag_delinked", False)),
     }
     res = db.table("crm_deals").insert(payload).execute()
     if not res.data:
