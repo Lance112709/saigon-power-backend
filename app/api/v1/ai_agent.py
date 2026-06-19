@@ -314,6 +314,92 @@ def deals_by_agent(
     }
 
 
+@router.get("/data-quality/dup-addresses")
+def get_dup_addresses(user: UserContext = Depends(require_admin)):
+    db = get_client()
+    rows = (
+        db.table("crm_deals")
+        .select("id, customer_id, service_address, deal_status, provider, created_at, sales_agent, esiid, crm_customers(id, full_name)")
+        .execute()
+        .data or []
+    )
+
+    groups: dict = {}
+    for r in rows:
+        addr = (r.get("service_address") or "").strip().upper()
+        cust = r.get("customer_id") or ""
+        if not addr or not cust:
+            continue
+        key = (cust, addr)
+        deal = {
+            "id":            r.get("id"),
+            "customer_id":   cust,
+            "customer_name": (r.get("crm_customers") or {}).get("full_name") or "Unknown",
+            "service_address": r.get("service_address") or addr,
+            "deal_status":   r.get("deal_status"),
+            "provider":      r.get("provider"),
+            "sales_agent":   r.get("sales_agent"),
+            "esiid":         r.get("esiid"),
+            "created_at":    r.get("created_at"),
+        }
+        groups.setdefault(key, []).append(deal)
+
+    duplicates = []
+    for (cust, addr), deals in groups.items():
+        if len(deals) > 1:
+            duplicates.append({
+                "customer_id":    cust,
+                "customer_name":  deals[0]["customer_name"],
+                "service_address": deals[0]["service_address"],
+                "deal_count":     len(deals),
+                "deals":          sorted(deals, key=lambda d: d.get("created_at") or "", reverse=True),
+            })
+
+    duplicates.sort(key=lambda x: x["deal_count"], reverse=True)
+    return duplicates
+
+
+@router.get("/data-quality/dup-esiids")
+def get_dup_esiids(user: UserContext = Depends(require_admin)):
+    db = get_client()
+    rows = (
+        db.table("crm_deals")
+        .select("id, customer_id, esiid, service_address, deal_status, provider, created_at, sales_agent, crm_customers(id, full_name)")
+        .execute()
+        .data or []
+    )
+
+    groups: dict = {}
+    for r in rows:
+        esiid = (r.get("esiid") or "").strip()
+        if not esiid:
+            continue
+        deal = {
+            "id":            r.get("id"),
+            "customer_id":   r.get("customer_id") or "",
+            "customer_name": (r.get("crm_customers") or {}).get("full_name") or "Unknown",
+            "service_address": r.get("service_address") or "",
+            "deal_status":   r.get("deal_status"),
+            "provider":      r.get("provider"),
+            "sales_agent":   r.get("sales_agent"),
+            "esiid":         esiid,
+            "created_at":    r.get("created_at"),
+        }
+        groups.setdefault(esiid, []).append(deal)
+
+    duplicates = []
+    for esiid, deals in groups.items():
+        if len(deals) > 1:
+            duplicates.append({
+                "esiid":       esiid,
+                "deal_count":  len(deals),
+                "deals":       sorted(deals, key=lambda d: d.get("created_at") or "", reverse=True),
+            })
+
+    duplicates.sort(key=lambda x: x["deal_count"], reverse=True)
+    return duplicates
+
+
 @router.get("/reconciliation-gap")
 def reconciliation_gap(user: UserContext = Depends(require_admin)):
     db = get_client()
