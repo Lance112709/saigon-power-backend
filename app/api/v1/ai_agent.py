@@ -249,18 +249,28 @@ def pipeline_value(user: UserContext = Depends(require_admin)):
 def deals_by_agent(
     mode: str = Query("month", regex="^(day|month)$"),
     months_back: int = Query(6, ge=1, le=24),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
     user: UserContext = Depends(require_admin),
 ):
     db = get_client()
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=months_back * 30)).isoformat()
 
-    deals = (
+    if date_from:
+        cutoff = date_from if "T" in date_from else f"{date_from}T00:00:00+00:00"
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=months_back * 30)).isoformat()
+
+    query = (
         db.table("lead_deals")
         .select("sales_agent, status, created_at")
         .gte("created_at", cutoff)
-        .execute()
-        .data or []
     )
+
+    if date_to:
+        end = date_to if "T" in date_to else f"{date_to}T23:59:59+00:00"
+        query = query.lte("created_at", end)
+
+    deals = query.execute().data or []
 
     # Group by agent → period → count
     # "closed" = Active or Inactive (anything that was signed)
