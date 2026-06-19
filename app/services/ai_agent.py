@@ -225,6 +225,11 @@ def get_daily_metrics(db) -> dict:
     active_deals = db.table("lead_deals").select("id", count="exact").eq("status", "Active").execute().count or 0
     total_leads  = db.table("leads").select("id", count="exact").execute().count or 0
 
+    # Leads with NO active deal (potential to work / convert)
+    leads_with_active_rows = db.table("lead_deals").select("lead_id").eq("status", "Active").execute().data or []
+    leads_with_active_ids  = set(d["lead_id"] for d in leads_with_active_rows if d.get("lead_id"))
+    leads_no_active_deal   = max(total_leads - len(leads_with_active_ids), 0)
+
     today_str = _today()
 
     # Expired but still ACTIVE — lead_deals
@@ -246,6 +251,10 @@ def get_daily_metrics(db) -> dict:
         for d in at_risk_rows
     )
     deals_at_risk = len(at_risk_rows)
+
+    # Active imported customer accounts (distinct customers with at least 1 ACTIVE crm_deal)
+    crm_active_rows     = db.table("crm_deals").select("customer_id").eq("deal_status", "ACTIVE").execute().data or []
+    active_crm_customers = len(set(d["customer_id"] for d in crm_active_rows if d.get("customer_id")))
 
     # Duplicate deal detection (crm_deals)
     crm_deals_raw = db.table("crm_deals").select("esiid, service_address, customer_id").execute().data or []
@@ -301,6 +310,8 @@ def get_daily_metrics(db) -> dict:
         "pipeline": {
             "total_leads": total_leads,
             "active_deals": active_deals,
+            "leads_no_active_deal": leads_no_active_deal,
+            "active_crm_customers": active_crm_customers,
         },
         "data_quality": {
             "dup_esiid": dup_esiid,
