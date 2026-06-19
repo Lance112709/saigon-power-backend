@@ -374,6 +374,7 @@ def list_deals(
 def check_duplicate_deal(
     esiid: Optional[str] = Query(None),
     service_address: Optional[str] = Query(None),
+    active_only: bool = Query(False),
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
@@ -417,21 +418,35 @@ def check_duplicate_deal(
 
     if esiid and esiid.strip():
         esiid_clean = esiid.strip()
-        _add_crm(db.table("crm_deals").select(
+        crm_q = db.table("crm_deals").select(
             "id, deal_name, provider, deal_status, esiid, service_address, crm_customers(id, full_name)"
-        ).eq("esiid", esiid_clean).execute().data)
-        _add_lead(db.table("lead_deals").select(
+        ).eq("esiid", esiid_clean)
+        if active_only:
+            crm_q = crm_q.eq("deal_status", "ACTIVE")
+        _add_crm(crm_q.execute().data)
+
+        lead_q = db.table("lead_deals").select(
             "id, plan_name, supplier, status, esiid, service_address, crm_leads(id, first_name, last_name)"
-        ).eq("esiid", esiid_clean).execute().data)
+        ).eq("esiid", esiid_clean)
+        if active_only:
+            lead_q = lead_q.eq("status", "Active")
+        _add_lead(lead_q.execute().data)
 
     if service_address and service_address.strip():
         addr_clean = service_address.strip()
-        _add_crm(db.table("crm_deals").select(
+        crm_q = db.table("crm_deals").select(
             "id, deal_name, provider, deal_status, esiid, service_address, crm_customers(id, full_name)"
-        ).ilike("service_address", addr_clean).execute().data)
-        _add_lead(db.table("lead_deals").select(
+        ).ilike("service_address", f"%{addr_clean}%")
+        if active_only:
+            crm_q = crm_q.eq("deal_status", "ACTIVE")
+        _add_crm(crm_q.execute().data)
+
+        lead_q = db.table("lead_deals").select(
             "id, plan_name, supplier, status, esiid, service_address, crm_leads(id, first_name, last_name)"
-        ).ilike("service_address", addr_clean).execute().data)
+        ).ilike("service_address", f"%{addr_clean}%")
+        if active_only:
+            lead_q = lead_q.eq("status", "Active")
+        _add_lead(lead_q.execute().data)
 
     return {"matches": matches}
 
