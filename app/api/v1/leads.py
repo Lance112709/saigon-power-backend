@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 import re
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
@@ -44,8 +44,34 @@ def _try_convert(db, lead_id: str) -> None:
     else:
         db.table("leads").update({"status": "converted", "updated_at": _now()}).eq("id", lead_id).execute()
 
-def _shape_lead(lead: dict) -> dict:
+def _auto_promote_deals(db, deals: list) -> list:
+    """Promote 'Future' deals to 'Active' once start_date has passed.
+    Mutates and returns the same list. Persists status changes to DB."""
+    if not deals:
+        return deals
+    today = date.today()
+    for d in deals:
+        if d.get("status") != "Future":
+            continue
+        sd = d.get("start_date")
+        if not sd:
+            continue
+        try:
+            start = date.fromisoformat(str(sd)[:10])
+        except Exception:
+            continue
+        if start <= today:
+            try:
+                db.table("lead_deals").update({"status": "Active", "updated_at": _now()}).eq("id", d["id"]).execute()
+                d["status"] = "Active"
+            except Exception:
+                pass
+    return deals
+
+def _shape_lead(lead: dict, db=None) -> dict:
     deals = lead.pop("lead_deals", []) or []
+    if db is not None:
+        deals = _auto_promote_deals(db, deals)
     return {
         **lead,
         "full_name": _full_name(lead),
@@ -189,7 +215,7 @@ def list_lead_customers(
     agent_name = user.sales_agent_name if user.is_sales_agent else None
     for c in res.data:
         lead = c.get("leads") or {}
-        deals = lead.pop("lead_deals", []) or []
+        deals = _auto_promote_deals(db, lead.pop("lead_deals", []) or [])
         if agent_name:
             lead_agent = (lead.get("sales_agent") or "").strip().lower()
             deal_agents = [(d.get("sales_agent") or "").strip().lower() for d in deals]
@@ -328,7 +354,7 @@ def list_leads(
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
-    q = db.table("leads").select("*, lead_deals(id, status)")
+    q = db.table("leads").select("*, lead_deals(id, status, start_date)")
     if search:
         q = q.or_(
             f"first_name.ilike.%{search}%,"
@@ -348,7 +374,7 @@ def list_leads(
         res = q.execute()
         return {"count": len(res.data)}
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
-    return [_shape_lead(lead) for lead in res.data]
+    return [_shape_lead(lead, db) for lead in res.data]
 
 @router.post("")
 def create_lead(data: dict = Body(...)):
@@ -415,7 +441,8 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
         if (lead.data[0].get("sales_agent") or "").lower() != user.sales_agent_name.lower():
             raise HTTPException(status_code=403, detail="Access denied")
     deals = db.table("lead_deals").select("*").eq("lead_id", id).order("created_at", desc=True).execute()
-    return {**lead.data[0], "full_name": _full_name(lead.data[0]), "deals": deals.data}
+    deals_list = _auto_promote_deals(db, deals.data or [])
+    return {**lead.data[0], "full_name": _full_name(lead.data[0]), "deals": deals_list}
 
 @router.patch("/{id}")
 def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
