@@ -448,13 +448,27 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
 def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     allowed = {"first_name", "last_name", "address", "city", "state", "zip", "phone", "email", "business_name", "phone2", "email2", "referral_by", "sales_agent", "anxh", "dob", "dl_number", "account_flag"}
-    payload = {k: str(v).strip() for k, v in data.items() if k in allowed and v is not None}
+    # Empty optional fields should clear the column (None), not write "".
+    nullable = {"business_name", "phone2", "email", "email2", "referral_by", "sales_agent", "anxh", "dob", "dl_number", "account_flag"}
+    payload: dict = {}
+    for k, v in data.items():
+        if k not in allowed or v is None:
+            continue
+        s = str(v).strip()
+        if s == "":
+            if k in nullable:
+                payload[k] = None
+            continue
+        payload[k] = s
     if "phone" in payload and not _validate_phone(payload["phone"]):
         raise HTTPException(status_code=400, detail="Invalid phone number format")
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     payload["updated_at"] = _now()
-    res = db.table("leads").update(payload).eq("id", id).execute()
+    try:
+        res = db.table("leads").update(payload).eq("id", id).execute()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Update failed: {e}")
     return res.data[0] if res.data else {}
 
 # ── Delete Lead ───────────────────────────────────────────────────────────────
