@@ -257,6 +257,85 @@ def delete_customer_note(id: str, note_id: str, user: UserContext = Depends(requ
     db.table("crm_customer_notes").delete().eq("id", note_id).eq("crm_customer_id", id).execute()
     return {"ok": True}
 
+# ── Customer attachments ──
+
+ATTACH_BUCKET = "crm-attachments"
+MAX_ATTACH_BYTES = 25 * 1024 * 1024  # 25 MB
+
+@router.get("/customers/{id}/attachments")
+def list_customer_attachments(id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    res = db.table("crm_customer_attachments").select("*").eq("crm_customer_id", id).order("created_at", desc=True).execute()
+    return res.data or []
+
+@router.post("/customers/{id}/attachments")
+async def upload_customer_attachment(id: str, file: UploadFile = File(...), user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    customer = db.table("crm_customers").select("id").eq("id", id).limit(1).execute()
+    if not customer.data:
+        raise HTTPException(status_code=404, detail="Customer not found")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(file_bytes) > MAX_ATTACH_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 25 MB).")
+
+    original = file.filename or "upload"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", original)
+    stamp = dt.utcnow().strftime("%Y%m%d%H%M%S%f")
+    path = f"{id}/{stamp}_{safe}"
+    content_type = file.content_type or "application/octet-stream"
+
+    try:
+        db.storage.from_(ATTACH_BUCKET).upload(path, file_bytes, {"content-type": content_type, "upsert": "true"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    row = {
+        "crm_customer_id": id,
+        "file_name": original,
+        "storage_path": path,
+        "file_type": content_type,
+        "file_size": len(file_bytes),
+        "uploaded_by": user.name or user.email or None,
+    }
+    res = db.table("crm_customer_attachments").insert(row).execute()
+    return res.data[0]
+
+@router.get("/customers/{id}/attachments/{attachment_id}/url")
+def get_customer_attachment_url(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    res = db.table("crm_customer_attachments").select("storage_path").eq("id", attachment_id).eq("crm_customer_id", id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path = res.data[0]["storage_path"]
+    try:
+        result = db.storage.from_(ATTACH_BUCKET).create_signed_url(path, 3600)
+        if hasattr(result, "data"):
+            url = (result.data or {}).get("signedUrl") or (result.data or {}).get("signedURL")
+        else:
+            url = result.get("signedUrl") or result.get("signedURL")
+        if not url:
+            raise ValueError("Empty signed URL")
+        return {"url": url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate signed URL: {str(e)}")
+
+@router.delete("/customers/{id}/attachments/{attachment_id}")
+def delete_customer_attachment(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    res = db.table("crm_customer_attachments").select("storage_path").eq("id", attachment_id).eq("crm_customer_id", id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path = res.data[0]["storage_path"]
+    try:
+        db.storage.from_(ATTACH_BUCKET).remove([path])
+    except Exception:
+        pass  # row removal still proceeds even if the blob is already gone
+    db.table("crm_customer_attachments").delete().eq("id", attachment_id).eq("crm_customer_id", id).execute()
+    return {"ok": True}
+
 @router.patch("/customers/{id}")
 def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
