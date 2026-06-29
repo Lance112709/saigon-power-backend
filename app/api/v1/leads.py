@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, Body, Depends
+from fastapi import APIRouter, HTTPException, Query, Body, Depends, UploadFile, File
 from typing import Optional
 from datetime import datetime, timezone, date
 import re
@@ -562,6 +562,85 @@ def update_lead_note(id: str, note_id: str, data: dict = Body(...), user: UserCo
 def delete_lead_note(id: str, note_id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
     db.table("lead_notes").delete().eq("id", note_id).eq("lead_id", id).execute()
+    return {"ok": True}
+
+# ── Lead attachments ──
+
+LEAD_ATTACH_BUCKET = "crm-attachments"
+MAX_LEAD_ATTACH_BYTES = 25 * 1024 * 1024  # 25 MB
+
+@router.get("/{id}/attachments")
+def list_lead_attachments(id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    res = db.table("lead_attachments").select("*").eq("lead_id", id).order("created_at", desc=True).execute()
+    return res.data or []
+
+@router.post("/{id}/attachments")
+async def upload_lead_attachment(id: str, file: UploadFile = File(...), user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    lead = db.table("leads").select("id").eq("id", id).limit(1).execute()
+    if not lead.data:
+        raise HTTPException(status_code=404, detail="Lead not found")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(file_bytes) > MAX_LEAD_ATTACH_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 25 MB).")
+
+    original = file.filename or "upload"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", original)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    path = f"leads/{id}/{stamp}_{safe}"
+    content_type = file.content_type or "application/octet-stream"
+
+    try:
+        db.storage.from_(LEAD_ATTACH_BUCKET).upload(path, file_bytes, {"content-type": content_type, "upsert": "true"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    row = {
+        "lead_id": id,
+        "file_name": original,
+        "storage_path": path,
+        "file_type": content_type,
+        "file_size": len(file_bytes),
+        "uploaded_by": user.name or user.email or None,
+    }
+    res = db.table("lead_attachments").insert(row).execute()
+    return res.data[0]
+
+@router.get("/{id}/attachments/{attachment_id}/url")
+def get_lead_attachment_url(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    res = db.table("lead_attachments").select("storage_path").eq("id", attachment_id).eq("lead_id", id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path = res.data[0]["storage_path"]
+    try:
+        result = db.storage.from_(LEAD_ATTACH_BUCKET).create_signed_url(path, 3600)
+        if hasattr(result, "data"):
+            url = (result.data or {}).get("signedUrl") or (result.data or {}).get("signedURL")
+        else:
+            url = result.get("signedUrl") or result.get("signedURL")
+        if not url:
+            raise ValueError("Empty signed URL")
+        return {"url": url}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate signed URL: {str(e)}")
+
+@router.delete("/{id}/attachments/{attachment_id}")
+def delete_lead_attachment(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    res = db.table("lead_attachments").select("storage_path").eq("id", attachment_id).eq("lead_id", id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+    path = res.data[0]["storage_path"]
+    try:
+        db.storage.from_(LEAD_ATTACH_BUCKET).remove([path])
+    except Exception:
+        pass  # row removal still proceeds even if the blob is already gone
+    db.table("lead_attachments").delete().eq("id", attachment_id).eq("lead_id", id).execute()
     return {"ok": True}
 
 @router.patch("/{id}/deals/{deal_id}")
