@@ -255,36 +255,37 @@ def deals_by_agent(
 ):
     db = get_client()
 
+    # Filter & group by contract signed date. On lead_deals the signed date is
+    # stored in expected_close_date (the "Contract Signed Date" field in the deal form).
     if date_from:
-        cutoff = date_from if "T" in date_from else f"{date_from}T00:00:00+00:00"
+        cutoff = date_from[:10]
     else:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=months_back * 30)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=months_back * 30)).date().isoformat()
 
     query = (
         db.table("lead_deals")
-        .select("sales_agent, status, created_at")
-        .gte("created_at", cutoff)
+        .select("sales_agent, status, expected_close_date")
+        .in_("status", ["Active", "Inactive"])
+        .gte("expected_close_date", cutoff)
     )
 
     if date_to:
-        end = date_to if "T" in date_to else f"{date_to}T23:59:59+00:00"
-        query = query.lte("created_at", end)
+        query = query.lte("expected_close_date", date_to[:10])
 
     deals = query.execute().data or []
 
-    # Group by agent → period → count
-    # "closed" = Active or Inactive (anything that was signed)
-    closed_statuses = {"Active", "Inactive"}
+    # Group by agent → period → count (period = month or day of the signed date)
     counts: dict = defaultdict(lambda: defaultdict(int))
     agents: set = set()
 
     for d in deals:
-        if d.get("status") not in closed_statuses:
+        signed = d.get("expected_close_date")
+        if not signed:
             continue
         agent = d.get("sales_agent") or "Unassigned"
         agents.add(agent)
         try:
-            dt = datetime.fromisoformat(d["created_at"].replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(str(signed)[:10])
             period = dt.strftime("%Y-%m-%d") if mode == "day" else dt.strftime("%Y-%m")
         except Exception:
             continue
@@ -325,20 +326,22 @@ def deals_by_agent_details(
     """Individual closed deals for one agent within the same period as deals-by-agent."""
     db = get_client()
 
+    # Filter by contract signed date (expected_close_date on lead_deals).
     if date_from:
-        cutoff = date_from if "T" in date_from else f"{date_from}T00:00:00+00:00"
+        cutoff = date_from[:10]
     else:
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=months_back * 30)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=months_back * 30)).date().isoformat()
 
     query = (
         db.table("lead_deals")
         .select(
             "id, lead_id, esiid, service_address, service_city, service_state, service_zip, "
-            "supplier, plan_name, status, rate, adder, contract_term, start_date, end_date, created_at, "
+            "supplier, plan_name, status, rate, adder, contract_term, start_date, end_date, "
+            "expected_close_date, created_at, "
             "leads(first_name, last_name, address, city, state, zip, phone, email)"
         )
         .in_("status", ["Active", "Inactive"])
-        .gte("created_at", cutoff)
+        .gte("expected_close_date", cutoff)
     )
     # "Unassigned" bucket = deals with no sales_agent set
     if agent == "Unassigned":
@@ -347,10 +350,9 @@ def deals_by_agent_details(
         query = query.eq("sales_agent", agent)
 
     if date_to:
-        end = date_to if "T" in date_to else f"{date_to}T23:59:59+00:00"
-        query = query.lte("created_at", end)
+        query = query.lte("expected_close_date", date_to[:10])
 
-    deals = query.order("created_at", desc=True).execute().data or []
+    deals = query.order("expected_close_date", desc=True).execute().data or []
 
     result = []
     for d in deals:
@@ -377,6 +379,7 @@ def deals_by_agent_details(
             "contract_term": d.get("contract_term"),
             "start_date": d.get("start_date"),
             "end_date": d.get("end_date"),
+            "signed_date": d.get("expected_close_date"),
             "created_at": d.get("created_at"),
         })
 
