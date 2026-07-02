@@ -314,6 +314,75 @@ def deals_by_agent(
     }
 
 
+@router.get("/deals-by-agent/details")
+def deals_by_agent_details(
+    agent: str = Query(...),
+    months_back: int = Query(6, ge=1, le=24),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    user: UserContext = Depends(require_admin),
+):
+    """Individual closed deals for one agent within the same period as deals-by-agent."""
+    db = get_client()
+
+    if date_from:
+        cutoff = date_from if "T" in date_from else f"{date_from}T00:00:00+00:00"
+    else:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=months_back * 30)).isoformat()
+
+    query = (
+        db.table("lead_deals")
+        .select(
+            "id, lead_id, esiid, service_address, service_city, service_state, service_zip, "
+            "supplier, plan_name, status, rate, adder, contract_term, start_date, end_date, created_at, "
+            "leads(first_name, last_name, address, city, state, zip, phone, email)"
+        )
+        .in_("status", ["Active", "Inactive"])
+        .gte("created_at", cutoff)
+    )
+    # "Unassigned" bucket = deals with no sales_agent set
+    if agent == "Unassigned":
+        query = query.is_("sales_agent", "null")
+    else:
+        query = query.eq("sales_agent", agent)
+
+    if date_to:
+        end = date_to if "T" in date_to else f"{date_to}T23:59:59+00:00"
+        query = query.lte("created_at", end)
+
+    deals = query.order("created_at", desc=True).execute().data or []
+
+    result = []
+    for d in deals:
+        lead = d.get("leads") or {}
+        name = f"{lead.get('first_name', '') or ''} {lead.get('last_name', '') or ''}".strip()
+        address = d.get("service_address") or lead.get("address") or ""
+        city = d.get("service_city") or lead.get("city") or ""
+        state = d.get("service_state") or lead.get("state") or ""
+        zip_code = d.get("service_zip") or lead.get("zip") or ""
+        full_address = ", ".join([p for p in [address, city, state, zip_code] if p])
+        result.append({
+            "deal_id": d.get("id"),
+            "lead_id": d.get("lead_id"),
+            "customer_name": name or "—",
+            "phone": lead.get("phone"),
+            "email": lead.get("email"),
+            "service_address": full_address or "—",
+            "esiid": d.get("esiid"),
+            "provider": d.get("supplier"),
+            "plan_name": d.get("plan_name"),
+            "status": d.get("status"),
+            "rate": d.get("rate"),
+            "adder": d.get("adder"),
+            "contract_term": d.get("contract_term"),
+            "start_date": d.get("start_date"),
+            "end_date": d.get("end_date"),
+            "created_at": d.get("created_at"),
+        })
+
+    return {"agent": agent, "count": len(result), "deals": result}
+
+
 @router.get("/data-quality/dup-addresses")
 def get_dup_addresses(user: UserContext = Depends(require_admin)):
     db = get_client()
