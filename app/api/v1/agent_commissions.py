@@ -70,14 +70,21 @@ def _calc_by_agent(db, month: int, year: int) -> dict:
     last_day   = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
     rules_map  = _agent_rules_map(db)
 
-    rows = (
-        db.table("lead_deals")
-        .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date")
-        .eq("status", "Active")
-        .lte("start_date", last_day)
-        .execute()
-        .data or []
-    )
+    rows, _off = [], 0
+    while True:
+        page = (
+            db.table("lead_deals")
+            .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date")
+            .eq("status", "Active")
+            .lte("start_date", last_day)
+            .range(_off, _off + 999)
+            .execute()
+            .data or []
+        )
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        _off += 1000
 
     by_agent: dict = {}
     for r in rows:
@@ -275,15 +282,22 @@ def get_breakdown(id: str, user: UserContext = Depends(require_admin)):
     agent_row = db.table("sales_agents").select("commission_rules").ilike("name", f"%{agent}%").limit(1).execute().data
     rules = (agent_row[0].get("commission_rules") or {}) if agent_row else {}
 
-    rows = (
-        db.table("lead_deals")
-        .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date, lead_id, leads(first_name, last_name, phone)")
-        .eq("status", "Active")
-        .ilike("sales_agent", f"%{agent}%")
-        .lte("start_date", last_day)
-        .execute()
-        .data or []
-    )
+    rows, _off = [], 0
+    while True:
+        page = (
+            db.table("lead_deals")
+            .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date, lead_id, leads(first_name, last_name, phone)")
+            .eq("status", "Active")
+            .ilike("sales_agent", f"%{agent}%")
+            .lte("start_date", last_day)
+            .range(_off, _off + 999)
+            .execute()
+            .data or []
+        )
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        _off += 1000
 
     deals = []
     for r in rows:

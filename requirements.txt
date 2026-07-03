@@ -14,3 +14,4 @@ bcrypt==4.2.1
 python-jose[cryptography]==3.3.0
 resend==2.4.0
 apscheduler==3.10.4
+xlrd==2.0.2

@@ -55,12 +55,22 @@ def _run_renewal_sms():
     except Exception:
         pass
 
+def _run_statement_watchdog():
+    """Providers pay by the 7th. On the 10th, alert if any provider's
+    statement for last month has not been uploaded and reconciled."""
+    try:
+        from app.services.statement_watchdog import check_missing_statements
+        check_missing_statements()
+    except Exception:
+        pass
+
 try:
     scheduler = BackgroundScheduler(timezone="America/Chicago")
     scheduler.add_job(_run_reminders, "cron", hour=8, minute=0)
     scheduler.add_job(_run_ai_daily, "cron", hour=6, minute=0)
     scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
     scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
+    scheduler.add_job(_run_statement_watchdog, "cron", day=10, hour=9, minute=30)
     _scheduler_ok = True
 except Exception:
     _scheduler_ok = False
