@@ -96,16 +96,33 @@ def test_iron_horse_legacy_result_format():
 
 
 def test_budget_power_detected_with_status_and_going_final():
+    def bp_row(esiid, status):
+        return {"Premise ID": esiid, "Usage": "661",
+                "Affinity Rate in ($)": "0.008", "Affinity Amount": "5.29",
+                "Premise Address": "3532 OMEARA DR", "Premise City": "HOUSTON", "Premise Zip": "77025",
+                "Cust First Name": "Hoang", "Cust Last Name": "Nguyen",
+                "Cust Status": status, "Start Date": "2026-02-18", "End Date": "2026-03-19"}
     data = xlsx({"Sheet1": [
-        {"Premise ID": "1008901023900175571", "Usage": "661",
-         "Affinity Rate in ($)": "0.008", "Affinity Amount": "5.29",
-         "Premise Address": "3532 OMEARA DR", "Premise City": "HOUSTON", "Premise Zip": "77025",
-         "Cust First Name": "Hoang", "Cust Last Name": "Nguyen",
-         "Cust Status": "Inactive", "Start Date": "2026-02-18", "End Date": "2026-03-19"},
+        bp_row("1008901023900175571", "Inactive"),
+        bp_row("1008901023900175572", "Active"),
+        bp_row("1008901023900175573", "Active"),
     ]})
     res = detect_and_parse(data, "Affinity Report_Saigon_Power_LLC_MAY 2026.xlsx")
     assert res and res["provider_group"] == "Budget Power"
-    assert len(res["going_final"]) == 1  # Inactive flagged for follow-up
+    assert len(res["going_final"]) == 1  # the Inactive minority flagged for follow-up
+
+
+def test_mass_churn_statement_suppresses_going_final():
+    def bp_row(esiid):
+        return {"Premise ID": esiid, "Usage": "661",
+                "Affinity Rate in ($)": "0.008", "Affinity Amount": "5.29",
+                "Premise Address": "X", "Premise City": "HOUSTON", "Premise Zip": "77025",
+                "Cust First Name": "A", "Cust Last Name": "B",
+                "Cust Status": "Inactive", "Start Date": "2026-02-18", "End Date": "2026-03-19"}
+    data = xlsx({"Sheet1": [bp_row("1008901023900175571"), bp_row("1008901023900175572")]})
+    res = detect_and_parse(data, "Affinity Report_Saigon_Power_LLC_APR 2026.xlsx")
+    assert res["going_final"] == []
+    assert any("unreliable" in w for w in res["warnings"])
 
 
 def test_chariot_clawback_rows_separated():

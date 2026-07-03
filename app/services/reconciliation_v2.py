@@ -202,13 +202,31 @@ def _sev(pct: float) -> str:
 
 def rows_from_db(db, supplier_id: str, label: str) -> list:
     """Rebuild normalized rows from every imported batch for a supplier+month,
-    so supplemental statements merge into one reconciliation."""
+    so supplemental statements merge into one reconciliation.
+
+    Identical rows (esiid + service period + amount) appearing in more than
+    one BATCH are the same payment re-listed (e.g. a cumulative report
+    overlapping a monthly one) — keep only the batch that has the most copies
+    of that row, so genuine within-statement duplicates still surface."""
     recs = fetch_all(db, "actual_commissions",
-                     "raw_esiid,raw_customer_name,raw_amount,raw_kwh,raw_rate,raw_row_data",
+                     "upload_batch_id,raw_esiid,raw_customer_name,raw_amount,raw_kwh,raw_rate,raw_row_data",
                      filters=[("eq", ("supplier_id", supplier_id)),
                               ("eq", ("billing_month", f"{label}-01"))])
-    rows = []
+
+    per_key_batch = {}
     for r in recs:
+        norm = (r.get("raw_row_data") or {}).get("_norm") or {}
+        key = (r["raw_esiid"], norm.get("service_start"), norm.get("service_end"),
+               float(r["raw_amount"]) if r.get("raw_amount") is not None else 0.0)
+        per_key_batch.setdefault(key, {}).setdefault(r["upload_batch_id"], []).append(r)
+
+    kept = []
+    for key, batches in per_key_batch.items():
+        best = max(batches.values(), key=len)
+        kept.extend(best)
+
+    rows = []
+    for r in kept:
         norm = (r.get("raw_row_data") or {}).get("_norm") or {}
         rows.append({
             "esiid": r["raw_esiid"], "customer_name": r.get("raw_customer_name") or "",
@@ -255,6 +273,14 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
             and r.get("statement_label") == label]
     stmt_esiids = {r["esiid"] for r in comm}
 
+    # When most of a statement is marked churned, the provider's status column
+    # is unreliable that month (e.g. Budget Power flagged 94% of accounts
+    # "Inactive" in Apr 2026) — suppress per-account churn conflicts and note
+    # it once on the run instead.
+    churn_rows = sum(1 for r in comm if r.get("provider_status")
+                     and any(k in r["provider_status"].lower() for k in CHURN_KEYWORDS))
+    status_reliable = not comm or (churn_rows / len(comm)) <= 0.5
+
     items = []
     totals = {"expected": 0.0, "actual": 0.0, "matched": 0, "short_paid": 0,
               "over_paid": 0, "missing": 0, "unexpected": 0}
@@ -285,19 +311,23 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
                     if r["rate"] < deal["adder"] and r.get("usage_kwh"):
                         rate_loss += (deal["adder"] - r["rate"]) * r["usage_kwh"]
 
-        # churn status conflict
-        churn_status = next((r["provider_status"] for r in group if r.get("provider_status")
-                             and any(k in r["provider_status"].lower() for k in CHURN_KEYWORDS)), "")
+        # churn status conflict (only when the status column is trustworthy)
+        churn_status = ""
+        if status_reliable:
+            churn_status = next((r["provider_status"] for r in group if r.get("provider_status")
+                                 and any(k in r["provider_status"].lower() for k in CHURN_KEYWORDS)), "")
 
         expected = actual + rate_loss - dup_extra
         totals["expected"] += expected
 
         name = (deal["name"] if deal else "") or group[0].get("customer_name", "")
+        pct = (actual - expected) / expected * 100 if expected else 0.0
+        pct = max(-9999.0, min(9999.0, pct))  # column is NUMERIC(8,4)
         base = {
             "esiid": es, "supplier_id": supplier_id, "billing_month": f"{label}-01",
             "actual_amount": round(actual, 4), "expected_amount": round(expected, 4),
             "discrepancy_amount": round(actual - expected, 4),
-            "discrepancy_percentage": round((actual - expected) / expected * 100, 2) if expected else 0.0,
+            "discrepancy_percentage": round(pct, 2),
         }
 
         if deal is None:
@@ -372,7 +402,10 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
         "missing_count": totals["missing"],
         "unexpected_count": totals["unexpected"],
         "notes": json.dumps({"engine": "v2", "provider_group": provider_group,
-                             "upload_batch_id": batch_id, "run_by": actor}),
+                             "upload_batch_id": batch_id, "run_by": actor,
+                             **({} if status_reliable else
+                                {"status_column_unreliable":
+                                 f"{churn_rows}/{len(comm)} rows marked churned — provider status ignored this month"})}),
     }).execute().data[0]
 
     now = datetime.now(timezone.utc).isoformat()

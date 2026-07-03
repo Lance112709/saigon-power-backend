@@ -379,6 +379,12 @@ def detect_and_parse(file_bytes: bytes, filename: str):
             for r in rows
             if r["provider_status"] and any(k in r["provider_status"].lower() for k in CHURN_KEYWORDS)
         ]
+        # If most of the statement is marked churned, the status column is
+        # unreliable that month — don't raise thousands of false alarms.
+        if rows and len(going_final) / len(rows) > 0.5:
+            warnings.append(f"status column unreliable: {len(going_final)}/{len(rows)} rows "
+                            f"marked churned — per-account churn alerts suppressed")
+            going_final = []
 
         return {
             "provider_group": group,

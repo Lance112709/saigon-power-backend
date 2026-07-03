@@ -136,9 +136,12 @@ def test_unknown_esiid_flagged_unexpected():
 
 
 def test_provider_churn_status_conflict():
-    out, db = run([deal(E1)], [row(E1, 8.0, status="Inactive")])
+    # churn status on a minority of rows → flagged with the status in the note
+    E3 = "1008901000000000000003"
+    out, db = run([deal(E1), deal(E2), deal(E3)],
+                  [row(E1, 8.0, status="Inactive"), row(E2, 8.0), row(E3, 8.0)])
     assert out["unexpected"] == 1
-    item = db.tables["reconciliation_items"][0]
+    item = next(i for i in db.tables["reconciliation_items"] if i["status"] == "unexpected")
     assert "Inactive" in item["resolution_notes"]
 
 
@@ -154,3 +157,22 @@ def test_addr_normalization():
     assert norm_addr("3532 Omeara Drive") == norm_addr("3532 OMEARA DR")
     assert norm_addr("4601 Avenue H, Apt 3") == norm_addr("4601 AVENUE H #3")
     assert norm_addr("123 North Main Street") == norm_addr("123 N MAIN ST")
+
+
+def test_mass_churn_status_suppressed():
+    # provider glitch: nearly every row marked Inactive → no churn item flood
+    E3 = "1008901000000000000003"
+    out, db = run([deal(E1), deal(E2), deal(E3)],
+                  [row(E1, 8.0, status="Inactive"),
+                   row(E2, 8.0, status="Inactive"),
+                   row(E3, 8.0, status="Active")])
+    assert out["unexpected"] == 0
+    assert out["matched"] == 3
+
+
+def test_minority_churn_status_still_flagged():
+    E3 = "1008901000000000000003"
+    out, _ = run([deal(E1), deal(E2), deal(E3)],
+                 [row(E1, 8.0, status="Inactive"),
+                  row(E2, 8.0), row(E3, 8.0)])
+    assert out["unexpected"] == 1
