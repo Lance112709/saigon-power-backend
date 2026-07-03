@@ -2,14 +2,40 @@ from fastapi import APIRouter, HTTPException, Query, Depends
 from typing import Optional, List
 from pydantic import BaseModel
 from app.db.client import get_client
-from app.services.reconciliation_engine import run_reconciliation
+from app.services.reconciliation_v2 import (
+    rows_from_db, replace_prior_runs, run_reconciliation_v2, load_deals,
+)
+from app.services.file_parser.provider_parsers import PROVIDER_SUPPLIERS
 from app.auth.deps import require_admin, UserContext
 
 router = APIRouter()
 
 @router.post("/run")
 def trigger_reconciliation(billing_month: str, supplier_id: Optional[str] = None, user: UserContext = Depends(require_admin)):
-    return run_reconciliation(billing_month, supplier_id)
+    """Re-reconcile one month against imported statement rows, per provider.
+    Replaces each provider's existing run for the month (resolutions carry over)."""
+    db = get_client()
+    label = billing_month[:7]
+    results = []
+    for group, sdef in PROVIDER_SUPPLIERS.items():
+        sup = db.table("suppliers").select("id").eq("code", sdef["code"]).limit(1).execute().data
+        if not sup:
+            continue
+        sup_id = sup[0]["id"]
+        if supplier_id and sup_id != supplier_id:
+            continue
+        rows = rows_from_db(db, sup_id, label)
+        if not rows:
+            continue
+        carry = replace_prior_runs(db, sup_id, label)
+        deals = load_deals(db, group)
+        results.append(run_reconciliation_v2(
+            db, sup_id, group, label, rows,
+            deals=deals, actor=user.email or "admin", carry_resolved=carry))
+    if not results:
+        raise HTTPException(status_code=404,
+                            detail=f"No imported statement rows for {label}. Upload the statements first.")
+    return {"billing_month": label, "runs": results}
 
 @router.get("/runs")
 def list_runs(billing_month: Optional[str] = Query(None), user: UserContext = Depends(require_admin)):
