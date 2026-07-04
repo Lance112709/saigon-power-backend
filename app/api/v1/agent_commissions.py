@@ -1,9 +1,19 @@
-from fastapi import APIRouter, Depends, Body, HTTPException, Query
-from typing import Optional
+"""Sales-agent commission payouts.
+
+Calculated from ACTUAL provider payments (actual_commissions) using each
+agent's custom plan (sales_agents.commission_rules) — see
+app/services/agent_commission_engine.py. Workflow per agent per month:
+calculated → approved → closed_out → paid, with an action log.
+"""
+import json
 from datetime import datetime, timezone, date
-import calendar
+from typing import Optional
+
+from fastapi import APIRouter, Depends, Body, HTTPException, Query
+
 from app.db.client import get_client
 from app.auth.deps import require_admin, UserContext
+from app.services.agent_commission_engine import calculate_month, norm_name
 
 router = APIRouter()
 
@@ -18,92 +28,6 @@ ACTION_META = {
     "close_out": ("approved",    "closed_out_at",  "closed_out_by"),
     "mark_paid": ("closed_out",  "paid_at",        "paid_by"),
 }
-
-
-def _apply_rules(rules: dict, deal: dict, kwh: float) -> float:
-    """Apply an agent's commission_rules to a deal and return monthly commission $."""
-    # Check excluded plan types (rate_type or plan_name field)
-    plan_type     = (deal.get("rate_type") or deal.get("plan_name") or "").strip()
-    exclude_types = rules.get("exclude_plan_types") or []
-    if plan_type and any(pt.lower() == plan_type.lower() for pt in exclude_types):
-        return 0.0
-
-    # Supplier override?
-    supplier  = (deal.get("supplier") or "").strip().lower()
-    overrides = rules.get("overrides") or []
-    override  = next((o for o in overrides if (o.get("supplier") or "").lower() == supplier), None)
-
-    if override:
-        rate      = float(override.get("rate") or 0)
-        comm_type = override.get("type") or "per_kwh"
-    else:
-        rate      = float(rules.get("default_rate") or 0)
-        comm_type = rules.get("default_type") or "per_kwh"
-
-    # No commission_rules set → fall back to deal's adder
-    if not rules or (not rate and not overrides):
-        return kwh * float(deal.get("adder") or 0)
-
-    if comm_type == "per_kwh":
-        return kwh * rate
-    elif comm_type == "flat_monthly":
-        return rate
-    elif comm_type == "flat_per_deal":
-        return rate
-    elif comm_type == "percentage":
-        return kwh * float(deal.get("adder") or 0) * (rate / 100)
-    return kwh * rate
-
-
-def _agent_rules_map(db) -> dict:
-    """Return {agent_name_lower: commission_rules} for all agents."""
-    rows = db.table("sales_agents").select("name, commission_rules").execute().data or []
-    return {
-        (r.get("name") or "").strip().lower(): r.get("commission_rules") or {}
-        for r in rows
-    }
-
-
-def _calc_by_agent(db, month: int, year: int) -> dict:
-    """Return {agent_name: {deals, commission}} for a given month using commission_rules."""
-    first_day  = date(year, month, 1).isoformat()
-    last_day   = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
-    rules_map  = _agent_rules_map(db)
-
-    rows, _off = [], 0
-    while True:
-        page = (
-            db.table("lead_deals")
-            .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date")
-            .eq("status", "Active")
-            .lte("start_date", last_day)
-            .range(_off, _off + 999)
-            .execute()
-            .data or []
-        )
-        rows.extend(page)
-        if len(page) < 1000:
-            break
-        _off += 1000
-
-    by_agent: dict = {}
-    for r in rows:
-        end_d = r.get("end_date") or "9999-12-31"
-        if end_d < first_day:
-            continue
-        agent = (r.get("sales_agent") or "").strip()
-        if not agent:
-            continue
-        kwh   = float(r.get("est_kwh") or 0)
-        rules = rules_map.get(agent.lower(), {})
-        comm  = _apply_rules(rules, r, kwh)
-
-        if agent not in by_agent:
-            by_agent[agent] = {"deals": 0, "commission": 0.0}
-        by_agent[agent]["deals"]      += 1
-        by_agent[agent]["commission"] += comm
-
-    return by_agent
 
 
 # ── List ──────────────────────────────────────────────────────────────────────
@@ -122,17 +46,16 @@ def list_commissions(
     if year:   q = q.eq("year",  year)
     if status: q = q.eq("status", status)
     if agent:  q = q.ilike("agent_name", f"%{agent}%")
-    rows = (
+    return (
         q.order("year",  desc=True)
          .order("month", desc=True)
          .order("agent_name")
          .execute()
          .data or []
     )
-    return rows
 
 
-# ── Calculate / Recalculate ───────────────────────────────────────────────────
+# ── Calculate / Recalculate (from provider-paid dollars) ─────────────────────
 
 @router.post("/calculate")
 def calculate_commissions(
@@ -144,48 +67,57 @@ def calculate_commissions(
     db    = get_client()
     now   = datetime.now(timezone.utc).isoformat()
 
-    by_agent = _calc_by_agent(db, month, year)
-    results  = []
+    result = calculate_month(db, year, month)
+    if result["rows"] == 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No provider payments imported for {year}-{month:02d}. "
+                   f"Upload the commission statements first — agents are paid from received dollars.")
 
-    for agent, vals in by_agent.items():
-        total_comm = round(vals["commission"], 4)
+    saved, locked = [], []
+    for agent, vals in result["agents"].items():
         existing = (
             db.table("agent_commissions")
             .select("id, status")
-            .eq("agent_name", agent)
-            .eq("month", month)
-            .eq("year",  year)
-            .limit(1)
-            .execute()
-            .data
+            .eq("agent_name", agent).eq("month", month).eq("year", year)
+            .limit(1).execute().data
         )
+        summary_note = json.dumps({
+            "engine": "actuals-v1",
+            "gross_received": vals["gross_received"],
+            "residual": vals["residual"],
+            "bonuses": vals["bonuses"],
+            "flat_monthly": vals["flat_monthly"],
+            "excluded_deals": vals["excluded_deals"],
+        })
 
         if existing:
-            rec    = existing[0]
-            rec_id = rec["id"]
+            rec = existing[0]
             if rec["status"] in ("approved", "closed_out", "paid"):
-                results.append(rec)
+                locked.append(agent)
                 continue
             db.table("agent_commissions").update({
-                "total_deals":      vals["deals"],
-                "total_commission": total_comm,
+                "total_deals":      vals["deals_paid"],
+                "total_commission": vals["total"],
                 "status":           "calculated",
+                "notes":            summary_note,
                 "updated_at":       now,
-            }).eq("id", rec_id).execute()
+            }).eq("id", rec["id"]).execute()
+            rec_id = rec["id"]
         else:
             ins = db.table("agent_commissions").insert({
                 "agent_name":       agent,
                 "month":            month,
                 "year":             year,
-                "total_deals":      vals["deals"],
-                "total_commission": total_comm,
+                "total_deals":      vals["deals_paid"],
+                "total_commission": vals["total"],
                 "status":           "calculated",
+                "notes":            summary_note,
                 "created_at":       now,
                 "updated_at":       now,
-            }).execute()
-            rec_id = ins.data[0]["id"] if ins.data else None
+            }).execute().data
+            rec_id = ins[0]["id"] if ins else None
 
-        # Audit log
         db.table("commission_logs").insert({
             "commission_id": rec_id,
             "action":        "recalculated",
@@ -193,20 +125,30 @@ def calculate_commissions(
             "agent_name":    agent,
             "month":         month,
             "year":          year,
-            "notes":         f"{vals['deals']} deals · ${total_comm}",
+            "notes":         f"{vals['deals_paid']} paid deals · gross ${vals['gross_received']} · payout ${vals['total']}",
             "created_at":    now,
         }).execute()
+        saved.append({"agent_name": agent, "total_commission": vals["total"],
+                      "deals_paid": vals["deals_paid"], "gross_received": vals["gross_received"]})
 
-        results.append({"agent_name": agent, "total_commission": total_comm})
-
-    return {"ok": True, "calculated": len(results), "month": month, "year": year}
+    return {
+        "ok": True,
+        "month": month, "year": year,
+        "calculated": len(saved),
+        "locked": locked,  # already approved/paid — untouched
+        "agents": saved,
+        "unassigned": result["unassigned"],
+        "warnings": result["warnings"],
+        "statement_rows": result["rows"],
+        "gross_total": result["gross_total"],
+    }
 
 
 # ── Shared transition helper ──────────────────────────────────────────────────
 
 def _transition(commission_id: str, action: str, user: UserContext, notes: Optional[str]):
-    db    = get_client()
-    row   = db.table("agent_commissions").select("*").eq("id", commission_id).limit(1).execute().data
+    db  = get_client()
+    row = db.table("agent_commissions").select("*").eq("id", commission_id).limit(1).execute().data
     if not row:
         raise HTTPException(status_code=404, detail="Commission not found")
     rec = row[0]
@@ -221,8 +163,6 @@ def _transition(commission_id: str, action: str, user: UserContext, notes: Optio
     now        = datetime.now(timezone.utc).isoformat()
     new_status = VALID_TRANSITIONS[required_status]
     payload    = {"status": new_status, ts_field: now, by_field: user.name or user.email, "updated_at": now}
-    if notes:
-        payload["notes"] = notes
 
     db.table("agent_commissions").update(payload).eq("id", commission_id).execute()
 
@@ -234,119 +174,92 @@ def _transition(commission_id: str, action: str, user: UserContext, notes: Optio
         "agent_name":    rec["agent_name"],
         "month":         rec["month"],
         "year":          rec["year"],
-        "notes":         notes or f"Status → {new_status} | Admin: {user.name or user.email} | Agent: {rec['agent_name']} — {month_str}",
+        "notes":         notes or f"Status → {new_status} | {rec['agent_name']} — {month_str}",
         "created_at":    now,
     }).execute()
 
     return {"ok": True, "new_status": new_status}
 
 
-# ── Approve ───────────────────────────────────────────────────────────────────
-
 @router.patch("/{id}/approve")
 def approve(id: str, data: dict = Body(default={}), user: UserContext = Depends(require_admin)):
     return _transition(id, "approve", user, data.get("notes"))
 
-
-# ── Close Out ─────────────────────────────────────────────────────────────────
 
 @router.patch("/{id}/close-out")
 def close_out(id: str, data: dict = Body(default={}), user: UserContext = Depends(require_admin)):
     return _transition(id, "close_out", user, data.get("notes"))
 
 
-# ── Mark Paid ─────────────────────────────────────────────────────────────────
-
 @router.patch("/{id}/mark-paid")
 def mark_paid(id: str, data: dict = Body(default={}), user: UserContext = Depends(require_admin)):
     return _transition(id, "mark_paid", user, data.get("notes"))
 
 
-# ── Deal Breakdown ────────────────────────────────────────────────────────────
+# ── Deal Breakdown (recomputed live from actual payments) ─────────────────────
+
+def _load_record(db, id: str) -> dict:
+    row = db.table("agent_commissions").select("*").eq("id", id).limit(1).execute().data
+    if not row:
+        raise HTTPException(status_code=404, detail="Commission not found")
+    return row[0]
+
 
 @router.get("/{id}/breakdown")
 def get_breakdown(id: str, user: UserContext = Depends(require_admin)):
     db  = get_client()
-    row = db.table("agent_commissions").select("*").eq("id", id).limit(1).execute().data
-    if not row:
-        raise HTTPException(status_code=404, detail="Commission not found")
-    rec   = row[0]
-    month = rec["month"]
-    year  = rec["year"]
-    agent = rec["agent_name"]
+    rec = _load_record(db, id)
+    result = calculate_month(db, rec["year"], rec["month"])
+    match = next((v for k, v in result["agents"].items()
+                  if norm_name(k) == norm_name(rec["agent_name"])), None)
+    deals = match["deals"] if match else []
+    summary = {k: v for k, v in (match or {}).items() if k != "deals"}
+    return {"commission": rec, "summary": summary, "deals": deals,
+            "warnings": result["warnings"]}
 
-    first_day = date(year, month, 1).isoformat()
-    last_day  = date(year, month, calendar.monthrange(year, month)[1]).isoformat()
 
-    # Load this agent's commission_rules
-    agent_row = db.table("sales_agents").select("commission_rules").ilike("name", f"%{agent}%").limit(1).execute().data
-    rules = (agent_row[0].get("commission_rules") or {}) if agent_row else {}
+@router.get("/{id}/export")
+def export_statement(id: str, user: UserContext = Depends(require_admin)):
+    """Excel commission statement for one agent-month (to send to the agent)."""
+    import io
+    import pandas as pd
+    from fastapi.responses import StreamingResponse
 
-    rows, _off = [], 0
-    while True:
-        page = (
-            db.table("lead_deals")
-            .select("id, sales_agent, est_kwh, adder, rate_type, plan_name, supplier, start_date, end_date, lead_id, leads(first_name, last_name, phone)")
-            .eq("status", "Active")
-            .ilike("sales_agent", f"%{agent}%")
-            .lte("start_date", last_day)
-            .range(_off, _off + 999)
-            .execute()
-            .data or []
-        )
-        rows.extend(page)
-        if len(page) < 1000:
-            break
-        _off += 1000
+    db  = get_client()
+    rec = _load_record(db, id)
+    result = calculate_month(db, rec["year"], rec["month"])
+    match = next((v for k, v in result["agents"].items()
+                  if norm_name(k) == norm_name(rec["agent_name"])), None)
+    deals = match["deals"] if match else []
 
-    deals = []
-    for r in rows:
-        end_d = r.get("end_date") or "9999-12-31"
-        if end_d < first_day:
-            continue
-        lead  = r.pop("leads", None) or {}
-        kwh   = float(r.get("est_kwh")  or 0)
+    month_str = date(rec["year"], rec["month"], 1).strftime("%B %Y")
+    summary = pd.DataFrame([{
+        "Agent": rec["agent_name"], "Month": month_str,
+        "Paid deals": (match or {}).get("deals_paid", 0),
+        "Gross commission received": (match or {}).get("gross_received", 0),
+        "Residuals": (match or {}).get("residual", 0),
+        "New-deal bonuses": (match or {}).get("bonuses", 0),
+        "Flat monthly": (match or {}).get("flat_monthly", 0),
+        "TOTAL PAYOUT": (match or {}).get("total", rec.get("total_commission", 0)),
+        "Status": rec.get("status"),
+    }])
+    detail = pd.DataFrame([{
+        "Customer": d["customer"], "ESI ID": d["esiid"], "Provider": d["supplier"],
+        "Plan type": d["plan_type"], "kWh paid": d["kwh_paid"],
+        "Gross received $": d["gross_received"],
+        "New deal": "Yes" if d["first_payment"] else "",
+        "How calculated": d["applied"], "Commission $": d["commission"],
+    } for d in deals])
 
-        # Determine applied rate/type
-        plan_type  = (r.get("rate_type") or r.get("plan_name") or "").strip()
-        supplier_s = (r.get("supplier") or "").strip().lower()
-        overrides  = rules.get("overrides") or []
-        override   = next((o for o in overrides if (o.get("supplier") or "").lower() == supplier_s), None)
-        excluded   = bool(plan_type and any(pt.lower() == plan_type.lower() for pt in (rules.get("exclude_plan_types") or [])))
-
-        if excluded:
-            applied_rate = 0.0
-            applied_type = "excluded"
-        elif override:
-            applied_rate = float(override.get("rate") or 0)
-            applied_type = override.get("type") or "per_kwh"
-        elif rules.get("default_rate"):
-            applied_rate = float(rules.get("default_rate") or 0)
-            applied_type = rules.get("default_type") or "per_kwh"
-        else:
-            applied_rate = float(r.get("adder") or 0)
-            applied_type = "per_kwh"
-
-        comm = _apply_rules(rules, r, kwh)
-
-        deals.append({
-            "deal_id":       r["id"],
-            "lead_id":       r.get("lead_id"),
-            "customer_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip() or "—",
-            "phone":         lead.get("phone"),
-            "supplier":      r.get("supplier") or "—",
-            "plan_name":     plan_type or "—",
-            "est_kwh":       kwh,
-            "adder":         float(r.get("adder") or 0),
-            "applied_rate":  applied_rate,
-            "applied_type":  applied_type,
-            "commission":    round(comm, 4),
-            "start_date":    r.get("start_date"),
-            "end_date":      r.get("end_date"),
-        })
-
-    deals.sort(key=lambda x: x["commission"], reverse=True)
-    return {"commission": rec, "deals": deals}
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        summary.to_excel(w, sheet_name="Summary", index=False)
+        (detail if len(detail) else pd.DataFrame(columns=["Customer"])).to_excel(w, sheet_name="Deals", index=False)
+    buf.seek(0)
+    fname = f"commission_{rec['agent_name'].replace(' ', '_')}_{rec['year']}-{rec['month']:02d}.xlsx"
+    return StreamingResponse(
+        buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 # ── Logs ──────────────────────────────────────────────────────────────────────
