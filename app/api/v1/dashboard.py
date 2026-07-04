@@ -30,23 +30,52 @@ def sum_all(db, table: str, column: str, filters: dict) -> float:
         offset += limit
     return total
 
+def _latest_v2_runs(db, billing_month: Optional[str] = None) -> list:
+    """Latest reconciliation-v2 run per supplier (optionally pinned to a month)."""
+    q = db.table("reconciliation_runs").select(
+        "id,billing_month,supplier_id,total_expected,total_actual,total_discrepancy,"
+        "missing_count,short_paid_count,over_paid_count,matched_count,unexpected_count,"
+        "suppliers(name,code)"
+    ).like("notes", '%"engine": "v2"%').order("billing_month", desc=True)
+    if billing_month:
+        q = q.eq("billing_month", billing_month)
+    runs = q.limit(1000).execute().data or []
+    latest = {}
+    for r in runs:
+        key = r["supplier_id"]
+        if key not in latest:
+            latest[key] = r
+    return list(latest.values())
+
+
 @router.get("/overview")
 def get_overview(billing_month: Optional[str] = Query(None), user: UserContext = Depends(require_manager)):
+    """Reconciliation snapshot from engine-v2 runs (latest per provider)."""
     db = get_client()
-    month = billing_month or get_latest_month(db)
+    runs = _latest_v2_runs(db, billing_month)
 
-    total_actual = sum_all(db, "actual_commissions", "raw_amount", {"billing_month": month})
-    total_expected = sum_all(db, "expected_commissions", "expected_amount", {"billing_month": month})
-    unresolved = db.table("reconciliation_items").select("id", count="exact").eq("is_resolved", False).execute()
+    total_expected = sum(r["total_expected"] or 0 for r in runs)
+    total_actual = sum(r["total_actual"] or 0 for r in runs)
+    missing = sum(r["missing_count"] or 0 for r in runs)
+    wrong_rate = sum(r["short_paid_count"] or 0 for r in runs)
+    unresolved = db.table("reconciliation_items").select("id", count="exact") \
+        .eq("is_resolved", False).in_("status", ["missing", "short_paid", "over_paid"]).execute()
     pending_uploads = db.table("upload_batches").select("id", count="exact").in_("status", ["pending", "review"]).execute()
 
     return {
-        "billing_month": month,
+        "billing_month": billing_month or (max((r["billing_month"] for r in runs), default=None)),
         "total_expected": round(total_expected, 2),
         "total_actual": round(total_actual, 2),
         "net_discrepancy": round(total_actual - total_expected, 2),
+        "missing_payments": missing,
+        "wrong_rate_accounts": wrong_rate,
         "unresolved_discrepancies": unresolved.count or 0,
         "pending_uploads": pending_uploads.count or 0,
+        "providers": [
+            {"name": r["suppliers"]["name"], "month": r["billing_month"][:7],
+             "received": r["total_actual"], "missing": r["missing_count"]}
+            for r in sorted(runs, key=lambda x: -(x["total_actual"] or 0))
+        ],
     }
 
 @router.get("/leads-stats")
@@ -301,21 +330,20 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
 
 @router.get("/supplier-breakdown")
 def supplier_breakdown(billing_month: Optional[str] = Query(None), user: UserContext = Depends(get_current_user)):
+    """Per-provider expected vs received from the latest v2 reconciliation runs."""
     db = get_client()
-    month = billing_month or get_latest_month(db)
-
-    suppliers = db.table("suppliers").select("id, name, code").eq("is_active", True).execute()
+    runs = _latest_v2_runs(db, billing_month)
     result = []
-    for s in suppliers.data:
-        total_act = sum_all(db, "actual_commissions", "raw_amount", {"supplier_id": s["id"], "billing_month": month})
-        total_exp = sum_all(db, "expected_commissions", "expected_amount", {"supplier_id": s["id"], "billing_month": month})
-        if total_exp > 0 or total_act > 0:
-            result.append({
-                "supplier_id": s["id"],
-                "supplier_name": s["name"],
-                "supplier_code": s["code"],
-                "expected": round(total_exp, 2),
-                "actual": round(total_act, 2),
-                "discrepancy": round(total_act - total_exp, 2),
-            })
+    for r in sorted(runs, key=lambda x: -(x["total_actual"] or 0)):
+        result.append({
+            "supplier_id": r["supplier_id"],
+            "supplier_name": r["suppliers"]["name"],
+            "supplier_code": r["suppliers"]["code"],
+            "billing_month": r["billing_month"][:7],
+            "expected": round(r["total_expected"] or 0, 2),
+            "actual": round(r["total_actual"] or 0, 2),
+            "discrepancy": round((r["total_actual"] or 0) - (r["total_expected"] or 0), 2),
+            "missing": r["missing_count"] or 0,
+            "wrong_rate": r["short_paid_count"] or 0,
+        })
     return result
