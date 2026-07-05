@@ -106,10 +106,11 @@ def load_deal_book(db) -> dict:
 
     for d in fetch_all(db, "lead_deals",
                        "id,status,supplier,esiid,adder,rate_type,plan_name,contract_term,sales_agent,"
-                       "leads(first_name,last_name)"):
+                       "provider_status,leads(first_name,last_name)"):
         lead = d.get("leads") or {}
         put(d.get("esiid"), {
             "source": "lead_deals", "id": d["id"], "active": d.get("status") == "Active",
+            "provider_status": d.get("provider_status"),
             "agent": (d.get("sales_agent") or "").strip(),
             "supplier": (d.get("supplier") or "").strip(),
             "plan_type": (d.get("rate_type") or d.get("plan_name") or d.get("contract_term") or "").strip(),
@@ -118,10 +119,11 @@ def load_deal_book(db) -> dict:
         })
     for d in fetch_all(db, "crm_deals",
                        "id,deal_status,provider,esiid,adder,product_type,contract_term,sales_agent,business_name,"
-                       "crm_customers(full_name)"):
+                       "provider_status,crm_customers(full_name)"):
         cust = d.get("crm_customers") or {}
         put(d.get("esiid"), {
             "source": "crm_deals", "id": d["id"], "active": d.get("deal_status") == "ACTIVE",
+            "provider_status": d.get("provider_status"),
             "agent": (d.get("sales_agent") or "").strip(),
             "supplier": (d.get("provider") or "").strip(),
             "plan_type": (d.get("product_type") or d.get("contract_term") or "").strip(),

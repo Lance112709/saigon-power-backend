@@ -130,6 +130,16 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
     total_kwh     = sum((r.get("est_kwh") or 0) for r in active_deals.data)
     commission_mo = sum((r.get("est_kwh") or 0) * (r.get("adder") or 0) for r in active_deals.data)
 
+    # Deals added recently to the pipeline CRM
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).isoformat()
+    nd_q = db.table("lead_deals").select("id", count="exact").gte("created_at", month_start)
+    nw_q = db.table("lead_deals").select("id", count="exact").gte("created_at", week_start)
+    if is_agent:
+        nd_q = nd_q.in_("lead_id", scoped_ids)
+        nw_q = nw_q.in_("lead_id", scoped_ids)
+    deals_added_month = nd_q.limit(1).execute().count or 0
+    deals_added_week = nw_q.limit(1).execute().count or 0
+
     # Full book: pipeline deals (lead_deals) + imported contracts (crm_deals)
     crm_q = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE")
     if is_agent:
@@ -175,6 +185,8 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         "active_deals":    pipeline_active + crm_active,
         "active_deals_pipeline": pipeline_active,
         "active_deals_imported": crm_active,
+        "deals_added_this_month": deals_added_month,
+        "deals_added_this_week": deals_added_week,
         "expiring_soon":   (expiring.count or 0) + (expiring_crm.count or 0),
         "pipeline":        pipeline,
         "finance":         finance,

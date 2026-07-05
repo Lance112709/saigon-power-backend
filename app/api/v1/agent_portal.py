@@ -130,6 +130,7 @@ def book(agent: Optional[str] = Query(None), user: UserContext = Depends(get_cur
         out.append({
             "customer": d["customer"], "esiid": d["esiid"], "provider": d["supplier"],
             "plan_type": d["plan_type"], "active": d["active"],
+            "provider_status": d.get("provider_status"),
             "start": d.get("start"), "end": d.get("end"),
             "paid_by_month": paid,
             "paid_latest": bool(labels) and paid.get(labels[0], False),

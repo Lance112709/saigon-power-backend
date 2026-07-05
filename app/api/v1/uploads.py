@@ -25,6 +25,7 @@ from app.services.reconciliation_v2 import (
     load_deals, backfill_esiids, run_reconciliation_v2, get_or_create_supplier,
     rows_from_db, replace_prior_runs,
 )
+from app.services.status_sync import sync_statuses, TRUSTED_STATUS_GROUPS
 from app.services.audit import audit
 from app.auth.deps import require_admin, UserContext
 
@@ -73,12 +74,23 @@ def _to_month(val) -> Optional[str]:
 
 def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id: str,
                   rows: list, amount_received: Optional[float], actor: str,
-                  warnings: list, going_final: list) -> dict:
+                  warnings: list, going_final: list, trust_status: bool = False) -> dict:
     """Shared pipeline: match rows to deals, backfill ESIIDs, insert
-    actual_commissions, reconcile each statement month."""
+    actual_commissions, sync provider-reported statuses, reconcile each month."""
     deals = load_deals(db, provider_group) if provider_group else {"by_esiid": {}, "no_esiid": [], "addr_index": {}}
 
     backfilled = backfill_esiids(db, deals, rows, actor) if provider_group else []
+
+    # Auto-update deal statuses from the provider's status column (trusted sources only)
+    status_sync = None
+    if provider_group and (trust_status or provider_group in TRUSTED_STATUS_GROUPS):
+        batch_meta = db.table("upload_batches").select("original_filename").eq("id", batch_id).limit(1).execute().data
+        source = f"{provider_group} — {(batch_meta[0]['original_filename'] if batch_meta else batch_id)}"
+        status_sync = sync_statuses(db, rows, deals, source, actor)
+        if status_sync.get("pending"):
+            warnings.append(
+                f"Status column looks unreliable this month ({int(status_sync['churn_ratio']*100)}% of accounts "
+                f"marked churned) — {status_sync['deactivated']} deactivations held for your review.")
 
     records, matched_count = [], 0
     for r in rows:
@@ -165,6 +177,7 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
         "difference": difference,
         "amounts_match": abs(difference) < 0.02 if difference is not None else None,
         "runs": runs,
+        "status_sync": status_sync,
         "warnings": warnings,
     }
 
@@ -354,7 +367,8 @@ def confirm_upload(
                 break
 
     result = _process_rows(db, id, provider_group, supplier_id, rows,
-                           amount_received, user.email or "admin", [], going_final)
+                           amount_received, user.email or "admin", [], going_final,
+                           trust_status=bool(mapping.get("customer_status")))
     result["rows_skipped"] = skipped
     audit(db, "upload_batches", id, "manual_import", None,
           {"rows": len(rows), "supplier_id": supplier_id, "billing_month": billing_month},
@@ -378,6 +392,40 @@ def get_upload(id: str, user: UserContext = Depends(require_admin)):
     if not res.data:
         raise HTTPException(status_code=404, detail="Upload not found")
     return res.data
+
+
+@router.post("/{id}/apply-statuses")
+def apply_statuses(id: str, user: UserContext = Depends(require_admin)):
+    """Force-apply the provider-reported status changes from a batch whose
+    status column tripped the mass-churn safety check."""
+    db = get_client()
+    batch = db.table("upload_batches").select("*").eq("id", id).single().execute().data
+    if not batch:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    provider_group = (batch.get("ai_column_mapping") or {}).get("provider_group")
+    if not provider_group:
+        raise HTTPException(status_code=400, detail="This batch has no detected provider.")
+
+    recs, off = [], 0
+    while True:
+        page = db.table("actual_commissions").select("raw_esiid,raw_row_data") \
+            .eq("upload_batch_id", id).range(off, off + 999).execute().data or []
+        recs.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    rows = []
+    for r in recs:
+        norm = (r.get("raw_row_data") or {}).get("_norm") or {}
+        rows.append({"esiid": r["raw_esiid"], "provider_status": norm.get("provider_status") or "",
+                     "statement_label": norm.get("statement_label") or ""})
+
+    deals = load_deals(db, provider_group)
+    source = f"{provider_group} — {batch.get('original_filename')} (force-applied)"
+    result = sync_statuses(db, rows, deals, source, user.email or "admin", force=True)
+    audit(db, "upload_batches", id, "force_apply_statuses", None, result,
+          reason="Admin confirmed status changes despite mass-churn warning", actor=user.email or "admin")
+    return result
 
 
 @router.post("/{id}/reject")
