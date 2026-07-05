@@ -266,6 +266,7 @@ def list_dropped_deals(
     search: Optional[str] = Query(None),
     supplier: Optional[str] = Query(None),
     sales_agent: Optional[str] = Query(None),
+    month: Optional[str] = Query(None, description="YYYY-MM — filter by drop month"),
     limit: int = Query(100),
     offset: int = Query(0),
     user: UserContext = Depends(get_current_user),
@@ -345,9 +346,34 @@ def list_dropped_deals(
                   or s in (d.get("sales_agent") or "").lower()
                   or s in (d.get("esiid") or "").lower()]
 
-    # Most recently dropped first (statement month beats record-update noise)
-    merged.sort(key=lambda d: str(d.get("provider_status_date") or d.get("updated_at") or ""), reverse=True)
-    return merged[offset:offset + limit]
+    # When it was dropped: statement month when reported by the provider,
+    # otherwise the record's last update.
+    for d in merged:
+        drop_date = str(d.get("provider_status_date") or d.get("updated_at") or "")[:10]
+        d["drop_date"] = drop_date or None
+        d["drop_month"] = drop_date[:7] if drop_date else None
+
+    # Month histogram BEFORE the month filter, so the chart always shows the full picture
+    by_month: dict = {}
+    for d in merged:
+        if d["drop_month"]:
+            b = by_month.setdefault(d["drop_month"], {"count": 0, "provider_reported": 0})
+            b["count"] += 1
+            if d.get("provider_status"):
+                b["provider_reported"] += 1
+
+    if month:
+        merged = [d for d in merged if d["drop_month"] == month]
+
+    merged.sort(key=lambda d: str(d.get("drop_date") or ""), reverse=True)
+    return {
+        "summary": {
+            "total": len(merged),
+            "provider_reported": sum(1 for d in merged if d.get("provider_status")),
+            "by_month": [{"month": m, **v} for m, v in sorted(by_month.items())],
+        },
+        "deals": merged[offset:offset + limit],
+    }
 
 @router.get("/all-deals")
 def list_all_lead_deals(
