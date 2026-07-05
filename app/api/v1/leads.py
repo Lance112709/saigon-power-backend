@@ -270,30 +270,84 @@ def list_dropped_deals(
     offset: int = Query(0),
     user: UserContext = Depends(get_current_user),
 ):
+    """Every dropped contract across BOTH deal tables (pipeline + imported),
+    including why: the provider-reported status from commission statements."""
     db = get_client()
-    q = db.table("lead_deals").select("*, leads(first_name, last_name, phone, address, city, state)").eq("status", "Inactive")
-    if supplier:
-        q = q.eq("supplier", supplier)
-    if sales_agent:
-        q = q.eq("sales_agent", sales_agent)
-    # Sales agents only see their own deals — if no agent name mapped, return nothing
+
+    def fetch_pages(q):
+        out, off = [], 0
+        while True:
+            page = q.range(off, off + 999).execute().data or []
+            out.extend(page)
+            if len(page) < 1000 or len(out) >= 5000:
+                break
+            off += 1000
+        return out
+
+    merged = []
+
+    # Pipeline deals (lead_deals)
+    for d in fetch_pages(db.table("lead_deals")
+                         .select("*, leads(first_name, last_name, phone, address, city, state)")
+                         .eq("status", "Inactive").order("updated_at", desc=True)):
+        lead = d.pop("leads", None) or {}
+        merged.append({
+            **d,
+            "source": "pipeline",
+            "lead_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
+            "lead_phone": lead.get("phone"),
+            "lead_address": f"{lead.get('address','')} {lead.get('city','')} {lead.get('state','')}".strip(),
+        })
+
+    # Imported contracts (crm_deals)
+    for d in fetch_pages(db.table("crm_deals")
+                         .select("id, customer_id, provider, esiid, energy_rate, sales_agent, contract_start_date, "
+                                 "contract_end_date, updated_at, provider_status, provider_status_date, "
+                                 "provider_status_source, crm_customers(full_name, phone)")
+                         .eq("deal_status", "INACTIVE").order("updated_at", desc=True)):
+        cust = d.pop("crm_customers", None) or {}
+        merged.append({
+            "id": d["id"],
+            "source": "imported",
+            "customer_id": d.get("customer_id"),
+            "lead_id": None,
+            "lead_name": cust.get("full_name") or "",
+            "lead_phone": cust.get("phone"),
+            "lead_address": "",
+            "supplier": d.get("provider"),
+            "esiid": d.get("esiid"),
+            "rate": d.get("energy_rate"),
+            "sales_agent": d.get("sales_agent"),
+            "start_date": d.get("contract_start_date"),
+            "end_date": d.get("contract_end_date"),
+            "updated_at": d.get("updated_at"),
+            "provider_status": d.get("provider_status"),
+            "provider_status_date": d.get("provider_status_date"),
+            "provider_status_source": d.get("provider_status_source"),
+        })
+
+    # Filters (applied uniformly to both sources)
     if user.is_sales_agent:
         if not user.sales_agent_name:
             return []
-        q = q.eq("sales_agent", user.sales_agent_name)
-    res = q.order("updated_at", desc=True).range(offset, offset + limit - 1).execute()
-    results = []
-    for d in res.data:
-        lead = d.pop("leads", None) or {}
-        name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip()
-        if search:
-            s = search.lower()
-            if not (s in name.lower() or s in (d.get("supplier") or "").lower()
-                    or s in (d.get("sales_agent") or "").lower()
-                    or s in (d.get("esiid") or "").lower()):
-                continue
-        results.append({**d, "lead_name": name, "lead_phone": lead.get("phone"), "lead_address": f"{lead.get('address','')} {lead.get('city','')} {lead.get('state','')}".strip()})
-    return results
+        me = user.sales_agent_name.strip().lower()
+        merged = [d for d in merged if (d.get("sales_agent") or "").strip().lower() == me]
+    if supplier:
+        s = supplier.strip().lower()
+        merged = [d for d in merged if (d.get("supplier") or "").strip().lower() == s]
+    if sales_agent:
+        a = sales_agent.strip().lower()
+        merged = [d for d in merged if (d.get("sales_agent") or "").strip().lower() == a]
+    if search:
+        s = search.lower()
+        merged = [d for d in merged if s in (d.get("lead_name") or "").lower()
+                  or s in (d.get("supplier") or "").lower()
+                  or s in (d.get("sales_agent") or "").lower()
+                  or s in (d.get("esiid") or "").lower()]
+
+    # Most recently dropped first (statement month beats record-update noise)
+    merged.sort(key=lambda d: str(d.get("provider_status_date") or d.get("updated_at") or ""), reverse=True)
+    return merged[offset:offset + limit]
 
 @router.get("/all-deals")
 def list_all_lead_deals(
