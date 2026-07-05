@@ -130,6 +130,35 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
     total_kwh     = sum((r.get("est_kwh") or 0) for r in active_deals.data)
     commission_mo = sum((r.get("est_kwh") or 0) * (r.get("adder") or 0) for r in active_deals.data)
 
+    # Full book: pipeline deals (lead_deals) + imported contracts (crm_deals)
+    crm_q = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE")
+    if is_agent:
+        crm_q = crm_q.ilike("sales_agent", f"%{agent_name}%")
+    crm_active = crm_q.limit(1).execute().count or 0
+    pipeline_active = active_deals.count or 0
+
+    # Real dollars: commission received per month from reconciliation-v2 runs
+    finance = None
+    if not is_agent:
+        runs = db.table("reconciliation_runs").select("billing_month,total_actual,supplier_id") \
+            .like("notes", '%"engine": "v2"%').limit(1000).execute().data or []
+        by_month: dict = {}
+        provs_by_month: dict = {}
+        for r in runs:
+            m = r["billing_month"][:7]
+            by_month[m] = by_month.get(m, 0) + (r["total_actual"] or 0)
+            provs_by_month.setdefault(m, set()).add(r["supplier_id"])
+        months = sorted(by_month.keys())[-6:]
+        total_providers = len({p for s in provs_by_month.values() for p in s})
+        finance = {
+            "received_history": [{"month": m, "amount": round(by_month[m], 2),
+                                  "providers_reported": len(provs_by_month.get(m, set()))} for m in months],
+            "received_last_month": round(by_month[months[-1]], 2) if months else 0,
+            "received_month": months[-1] if months else None,
+            "providers_reported": len(provs_by_month.get(months[-1], set())) if months else 0,
+            "total_providers": total_providers,
+        }
+
     recent_leads = []
     for l in recent_raw.data:
         deals = l.pop("lead_deals", []) or []
@@ -143,11 +172,14 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
     return {
         "leads_today":     leads_today.count or 0,
         "leads_this_week": leads_week.count or 0,
-        "active_deals":    active_deals.count or 0,
+        "active_deals":    pipeline_active + crm_active,
+        "active_deals_pipeline": pipeline_active,
+        "active_deals_imported": crm_active,
         "expiring_soon":   (expiring.count or 0) + (expiring_crm.count or 0),
         "pipeline":        pipeline,
+        "finance":         finance,
         "portfolio": {
-            "active_contracts": active_deals.count or 0,
+            "active_contracts": pipeline_active + crm_active,
             "total_kwh":        round(total_kwh, 2),
             "commission_mo":    round(commission_mo, 2),
             "at_risk":          (expiring.count or 0) + (expiring_crm.count or 0),
