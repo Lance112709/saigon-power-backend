@@ -362,7 +362,96 @@ def _template_summary(m: dict) -> str:
 
     return " ".join(parts) if parts else "All systems operating normally. No critical issues detected."
 
+def executive_context(db) -> dict:
+    """The whole business, condensed for the AI: verified money, growth,
+    book value, provider quality, churn risk, agents, payouts, pipeline."""
+    import json as _json
+    from app.services.business_health import build_business_health
+
+    health = build_business_health(db)
+
+    # payout pipeline
+    payouts = db.table("agent_commissions").select("agent_name,month,year,total_commission,status") \
+        .order("year", desc=True).order("month", desc=True).limit(20).execute().data or []
+
+    # statement coverage this month (providers pay by the 7th)
+    from app.services.statement_watchdog import last_month_label
+    from app.services.file_parser.provider_parsers import PROVIDER_SUPPLIERS
+    label = last_month_label()
+    reported = set()
+    for p in health.get("providers", []):
+        if p.get("latest_month") and p["latest_month"] >= label:
+            reported.add(p["name"])
+    awaiting = [PROVIDER_SUPPLIERS[g]["name"] for g in PROVIDER_SUPPLIERS
+                if PROVIDER_SUPPLIERS[g]["name"] not in reported]
+
+    metrics = get_daily_metrics(db)
+
+    ctx = {
+        "company": "Saigon Power LLC — Texas retail energy broker. Revenue = residual commissions "
+                   "from providers (REPs) on customer electricity usage, paid monthly by the 7th.",
+        "book_value": health.get("book"),
+        "account_growth_recent_months": [
+            {k: v for k, v in g.items() if k != "by_provider"} for g in health.get("growth", [])
+        ],
+        "providers": health.get("providers"),
+        "winback": {k: v for k, v in (health.get("winback") or {}).items() if k != "queue"},
+        "winback_top": (health.get("winback") or {}).get("queue", [])[:5],
+        "open_money_issues": health.get("chasing"),
+        "agents": health.get("agents"),
+        "agent_payouts_recent": payouts,
+        "statement_month_expected": label,
+        "statements_still_awaited_from": awaiting,
+        "pipeline_today": metrics.get("today"),
+        "pipeline": metrics.get("pipeline"),
+        "month_to_date": metrics.get("mtd"),
+        "renewals_open": metrics.get("renewals"),
+        "data_quality": metrics.get("data_quality"),
+    }
+    # keep the prompt lean
+    return _json.loads(_json.dumps(ctx, default=str))
+
+
+EXEC_SYSTEM = """You are the AI Chief of Staff for Saigon Power LLC — part CEO advisor, part CFO, part operations manager.
+The owner (Lance) is scaling this brokerage toward multi-million revenue. You are direct, numerate, and action-oriented.
+
+Rules:
+- Use ONLY the numbers in the business context. Never invent figures. Money formatted like $1,234.
+- "book_value" numbers come from VERIFIED provider payments — treat them as the financial truth.
+- Distinguish verified money (received) from estimates (pipeline est_kwh × adder).
+- When something needs doing, name the page in the CRM: Reconciliation, Uploads, My Business, Sales Agents, Commission Management, Renewals.
+- Be concise. Bullets over paragraphs. Lead with what matters most to cash."""
+
+
+def generate_executive_briefing(db) -> str:
+    """CEO daily/on-demand briefing from the full business context."""
+    import json as _json
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    ctx = executive_context(db)
+    if not api_key:
+        return _template_summary(get_daily_metrics(db))
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-sonnet-5",
+            max_tokens=900,
+            system=EXEC_SYSTEM,
+            messages=[{"role": "user", "content":
+                "Write today's executive briefing in markdown with exactly these sections:\n"
+                "**💰 Money** (received vs expected, dollars being chased, payouts owed to agents)\n"
+                "**📈 Growth** (net accounts, book value trend, what's driving it)\n"
+                "**⚠️ Risks** (churn/win-back, provider concentration, missing statements)\n"
+                "**✅ Do today** (max 3 actions, most valuable first, each with its dollar impact and the CRM page to do it on)\n\n"
+                f"Business context JSON:\n{_json.dumps(ctx)}"}]
+        )
+        return msg.content[0].text.strip()
+    except Exception:
+        return _template_summary(get_daily_metrics(db))
+
+
 def generate_ai_summary(metrics: dict) -> str:
+    """Short dashboard blurb. Prefers today's stored briefing headline."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     try:
         if not api_key:
@@ -387,6 +476,29 @@ Metrics: {metrics}"""}]
 
 def get_recommendations(db) -> list[dict]:
     recs = []
+
+    # Money first — from verified reconciliation / status data
+    try:
+        from app.services.business_health import build_business_health
+        h = build_business_health(db)
+        chasing = h.get("chasing") or {}
+        if (chasing.get("total") or 0) > 50:
+            recs.append({"icon": "💵", "priority": "high",
+                         "text": f"${chasing['total']:,.0f} is owed to you on the latest statements "
+                                 f"(${chasing.get('missing_dollars', 0):,.0f} missing + "
+                                 f"${chasing.get('underpaid_dollars', 0):,.0f} underpaid) — work the Reconciliation list."})
+        wb = h.get("winback") or {}
+        if (wb.get("count") or 0) > 0:
+            recs.append({"icon": "📉", "priority": "high",
+                         "text": f"{wb['count']} account{'s' if wb['count'] != 1 else ''} flagged as leaving "
+                                 f"(${wb.get('monthly_value_at_risk', 0):,.0f}/mo at stake) — call them from the Win-Back Queue."})
+        for p in h.get("providers", []):
+            if p.get("months_not_reporting", 0) >= 2:
+                recs.append({"icon": "📄", "priority": "medium",
+                             "text": f"{p['name']} has {p['months_not_reporting']} months without a statement — "
+                                     f"request the missing reports and upload them."})
+    except Exception:
+        pass
 
     unassigned = db.table("ai_alerts").select("id", count="exact").eq("type", "missing_agent").eq("status", "open").execute().count or 0
     if unassigned > 0:
@@ -423,7 +535,7 @@ def generate_daily_report() -> dict:
     db = get_client()
     run_full_scan()
     metrics  = get_daily_metrics(db)
-    summary  = generate_ai_summary(metrics)
+    summary  = generate_executive_briefing(db)
     recs     = get_recommendations(db)
 
     report = {
@@ -525,7 +637,11 @@ def get_dashboard() -> dict:
     db = get_client()
 
     metrics = get_daily_metrics(db)
-    summary = generate_ai_summary(metrics)
+    # Prefer today's stored executive briefing (rich, already paid for);
+    # fall back to a short generated blurb.
+    stored = db.table("ai_reports").select("summary").eq("report_type", "daily") \
+        .eq("report_date", _today()).limit(1).execute().data
+    summary = stored[0]["summary"] if stored else generate_ai_summary(metrics)
     recs    = get_recommendations(db)
 
     # Recent open alerts grouped by severity
@@ -571,6 +687,36 @@ def _section(title: str, lines: list) -> str:
 
 
 def chat_with_context(message: str, history: list) -> str:
+    """CEO-advisor chat over the full business context. Falls back to the
+    keyword engine when no API key is configured or the API errors."""
+    import json as _json
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if api_key:
+        try:
+            db = get_client()
+            ctx = executive_context(db)
+            import anthropic
+            client = anthropic.Anthropic(api_key=api_key)
+            msgs = []
+            for h in (history or [])[-10:]:
+                role = h.get("role")
+                content = str(h.get("content") or "")[:4000]
+                if role in ("user", "assistant") and content:
+                    msgs.append({"role": role, "content": content})
+            msgs.append({"role": "user", "content": message[:4000]})
+            msg = client.messages.create(
+                model="claude-sonnet-5",
+                max_tokens=1000,
+                system=EXEC_SYSTEM + "\n\nCurrent business context JSON:\n" + _json.dumps(ctx),
+                messages=msgs,
+            )
+            return msg.content[0].text.strip()
+        except Exception:
+            pass
+    return _keyword_chat(message, history)
+
+
+def _keyword_chat(message: str, history: list) -> str:
     db = get_client()
     q = message.lower()
 

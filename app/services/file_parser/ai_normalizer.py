@@ -46,7 +46,7 @@ def normalize_columns(headers: list, sample_rows: list) -> dict:
     user_msg = f"Headers: {json.dumps(headers)}\n\nSample rows:\n{json.dumps(sample_rows, indent=2)}"
 
     response = client.messages.create(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         max_tokens=500,
         system=SYSTEM_PROMPT,
         messages=[{"role": "user", "content": user_msg}]
