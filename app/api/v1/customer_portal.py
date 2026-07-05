@@ -1,0 +1,227 @@
+"""Customer Portal ("My Saigon Power") — self-service for END CUSTOMERS.
+
+Login is passwordless: phone number + SMS code. The OTP flow is stateless —
+the server signs a short-lived challenge JWT containing a hash of the code,
+so nothing is stored and restarts can't strand a login.
+
+Portal sessions use a separate JWT role ('customer') that can never access
+staff endpoints.
+"""
+import hashlib
+import os
+import random
+import re
+from datetime import datetime, timedelta, timezone
+from typing import Optional
+
+from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from jose import jwt, JWTError
+
+from app.db.client import get_client
+from app.auth.core import SECRET_KEY, ALGORITHM
+from app.services.audit import audit
+from app.services.sms import send_sms
+from app.utils.deals import is_month_to_month
+
+router = APIRouter()
+
+OTP_TTL_MINUTES = 10
+SESSION_DAYS = 30
+
+
+def phone10(v) -> str:
+    d = re.sub(r"\D", "", str(v or ""))
+    return d[-10:] if len(d) >= 10 else d
+
+
+def _hash_code(code: str, phone: str) -> str:
+    return hashlib.sha256(f"{code}:{phone}:{SECRET_KEY}".encode()).hexdigest()
+
+
+def _find_customer(db, p10: str) -> Optional[dict]:
+    """Match a phone against leads and imported customers (any format)."""
+    for l in _fetch(db, "leads", "id, first_name, last_name, phone"):
+        if phone10(l.get("phone")) == p10:
+            return {"kind": "lead", "id": l["id"],
+                    "name": f"{l.get('first_name','')} {l.get('last_name','')}".strip()}
+    for c in _fetch(db, "crm_customers", "id, full_name, phone"):
+        if phone10(c.get("phone")) == p10:
+            return {"kind": "customer", "id": c["id"], "name": c.get("full_name") or ""}
+    return None
+
+
+def _fetch(db, table, cols):
+    out, off = [], 0
+    while True:
+        page = db.table(table).select(cols).range(off, off + 999).execute().data or []
+        out.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    return out
+
+
+# ── OTP login ─────────────────────────────────────────────────────────────────
+
+@router.post("/request-code")
+def request_code(data: dict = Body(...)):
+    p10 = phone10(data.get("phone"))
+    if len(p10) != 10:
+        raise HTTPException(status_code=400, detail="Enter a valid 10-digit phone number.")
+
+    db = get_client()
+    cust = _find_customer(db, p10)
+    if cust is None:
+        raise HTTPException(status_code=404,
+                            detail="We couldn't find an account with that number. Call us at (832) 937-9999 and we'll get you set up.")
+
+    code = f"{random.SystemRandom().randint(0, 999999):06d}"
+    sent = send_sms(f"+1{p10}", f"Your Saigon Power login code is {code}. It expires in {OTP_TTL_MINUTES} minutes.")
+    if not sent.get("ok"):
+        raise HTTPException(status_code=503,
+                            detail="We couldn't text you right now — please call us at (832) 937-9999.")
+
+    challenge = jwt.encode({
+        "purpose": "portal_otp",
+        "phone": p10,
+        "code_hash": _hash_code(code, p10),
+        "name": cust["name"],
+        "exp": datetime.now(timezone.utc) + timedelta(minutes=OTP_TTL_MINUTES),
+    }, SECRET_KEY, algorithm=ALGORITHM)
+
+    first = (cust["name"].split() or ["there"])[0]
+    return {"ok": True, "challenge": challenge, "hint": f"Code sent to •••-•••-{p10[-4:]}", "first_name": first}
+
+
+@router.post("/verify-code")
+def verify_code(data: dict = Body(...)):
+    p10 = phone10(data.get("phone"))
+    code = re.sub(r"\D", "", str(data.get("code") or ""))
+    try:
+        payload = jwt.decode(str(data.get("challenge") or ""), SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=400, detail="That code expired — request a new one.")
+    if payload.get("purpose") != "portal_otp" or payload.get("phone") != p10:
+        raise HTTPException(status_code=400, detail="That code expired — request a new one.")
+    if _hash_code(code, p10) != payload.get("code_hash"):
+        raise HTTPException(status_code=400, detail="Wrong code — check the text message and try again.")
+
+    token = jwt.encode({
+        "role": "customer",
+        "phone": p10,
+        "name": payload.get("name") or "",
+        "exp": datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS),
+    }, SECRET_KEY, algorithm=ALGORITHM)
+    return {"ok": True, "token": token, "name": payload.get("name") or ""}
+
+
+def portal_user(authorization: str = Header(default="")) -> dict:
+    token = authorization.replace("Bearer ", "").strip()
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Please log in again.")
+    if payload.get("role") != "customer":
+        raise HTTPException(status_code=401, detail="Please log in again.")
+    return payload
+
+
+# ── My account ────────────────────────────────────────────────────────────────
+
+def _days_left(end) -> Optional[int]:
+    try:
+        return (datetime.strptime(str(end)[:10], "%Y-%m-%d").date() - datetime.now(timezone.utc).date()).days
+    except Exception:
+        return None
+
+
+@router.get("/me")
+def me(user: dict = Depends(portal_user)):
+    db = get_client()
+    p10 = user["phone"]
+
+    plans = []
+    lead_ids = [l["id"] for l in _fetch(db, "leads", "id, phone") if phone10(l.get("phone")) == p10]
+    for i in range(0, len(lead_ids), 50):
+        for d in db.table("lead_deals").select("*").in_("lead_id", lead_ids[i:i + 50]).execute().data or []:
+            plans.append({
+                "source": "lead_deals", "id": d["id"],
+                "plan_name": d.get("plan_name") or d.get("rate_type") or "Electricity plan",
+                "provider": d.get("supplier"), "rate": d.get("rate"),
+                "term": d.get("contract_term"),
+                "address": d.get("service_address"),
+                "start": d.get("start_date"), "end": d.get("end_date"),
+                "active": d.get("status") == "Active", "status": d.get("status"),
+                "provider_status": d.get("provider_status"),
+                "month_to_month": is_month_to_month(d.get("rate_type"), d.get("plan_name"), d.get("contract_term")),
+                "days_left": _days_left(d.get("end_date")),
+                "esiid_tail": (d.get("esiid") or "")[-6:] or None,
+            })
+    cust_ids = [c["id"] for c in _fetch(db, "crm_customers", "id, phone") if phone10(c.get("phone")) == p10]
+    for i in range(0, len(cust_ids), 50):
+        for d in db.table("crm_deals").select("*").in_("customer_id", cust_ids[i:i + 50]).execute().data or []:
+            plans.append({
+                "source": "crm_deals", "id": d["id"],
+                "plan_name": d.get("product_type") or "Electricity plan",
+                "provider": d.get("provider"), "rate": d.get("energy_rate"),
+                "term": d.get("contract_term"),
+                "address": d.get("service_address"),
+                "start": d.get("contract_start_date"), "end": d.get("contract_end_date"),
+                "active": d.get("deal_status") == "ACTIVE", "status": d.get("deal_status"),
+                "provider_status": d.get("provider_status"),
+                "month_to_month": is_month_to_month(d.get("product_type"), d.get("contract_term")),
+                "days_left": _days_left(d.get("contract_end_date")),
+                "esiid_tail": (d.get("esiid") or "")[-6:] or None,
+            })
+    plans.sort(key=lambda p: (not p["active"], p["days_left"] if p["days_left"] is not None else 9999))
+
+    enrollments = [e for e in _fetch(db, "enrollments",
+                                     "id, status, plan_name, provider, created_at, requested_start_date, phone")
+                   if phone10(e.get("phone")) == p10]
+    enrollments.sort(key=lambda e: e["created_at"], reverse=True)
+
+    ref_code = p10
+    referrals = [e for e in _fetch(db, "enrollments", "id, status, source, created_at")
+                 if f"ref:{ref_code}" in (e.get("source") or "")]
+
+    return {
+        "name": user.get("name") or "",
+        "phone_tail": p10[-4:],
+        "plans": plans,
+        "enrollments": [{k: v for k, v in e.items() if k != "phone"} for e in enrollments[:10]],
+        "referral": {
+            "code": ref_code,
+            "link": f"https://saigonpowertx.com/enroll?ref={ref_code}",
+            "count": len(referrals),
+            "active": sum(1 for r in referrals if r["status"] in ("accepted", "active")),
+        },
+    }
+
+
+@router.post("/renewal-request")
+def renewal_request(data: dict = Body(...), user: dict = Depends(portal_user)):
+    """Customer taps 'Renew / get me a better rate' — lands as an urgent task."""
+    db = get_client()
+    plan = data.get("plan") or {}
+    title = f"📱 Portal renewal request: {user.get('name') or user['phone']}"
+    db.table("tasks").insert({
+        "task_type": "renewal",
+        "title": title,
+        "description": f"Customer requested renewal from the portal.\n"
+                       f"Phone: {user['phone']}\n"
+                       f"Plan: {plan.get('plan_name') or '—'} · {plan.get('provider') or '—'} · "
+                       f"ends {plan.get('end') or '—'}",
+        "due_date": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat(),
+        "status": "pending",
+        "priority": "high",
+        "lead_id": None, "customer_id": None, "deal_id": None,
+    }).execute()
+    audit(db, "portal", user["phone"], "renewal_request", None, plan,
+          reason="Customer self-service renewal request", actor=f"customer:{user['phone']}")
+    # let the office know right away (best effort)
+    try:
+        send_sms(os.environ.get("ADMIN_ALERT_PHONE", "+18329379999"),
+                 f"Portal renewal request from {user.get('name') or user['phone']} — check Tasks in the CRM.")
+    except Exception:
+        pass
+    return {"ok": True, "message": "Got it! Our team will call you within 1 business day with your best options."}

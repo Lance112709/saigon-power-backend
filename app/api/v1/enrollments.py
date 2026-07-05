@@ -49,6 +49,7 @@ class PublicEnrollment(BaseModel):
 
     terms_accepted: bool = False
     company_website: Optional[str] = None    # honeypot — must stay empty
+    ref: Optional[str] = None                # referral code (referrer's phone digits)
 
 
 @router.post("/public")
@@ -86,8 +87,9 @@ def submit_public_enrollment(body: PublicEnrollment, request: Request):
     if recent >= 15:
         raise HTTPException(status_code=429, detail="Too many submissions — please call us instead.")
 
+    ref = re.sub(r"\D", "", body.ref or "")[:12]
     record = {
-        "status": "submitted", "source": "web",
+        "status": "submitted", "source": f"web:ref:{ref}" if ref else "web",
         "first_name": body.first_name.strip(), "last_name": body.last_name.strip(),
         "email": (body.email or "").strip() or None, "phone": body.phone.strip(),
         "language": body.language,
