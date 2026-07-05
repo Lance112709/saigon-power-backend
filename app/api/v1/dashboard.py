@@ -78,6 +78,15 @@ def get_overview(billing_month: Optional[str] = Query(None), user: UserContext =
         ],
     }
 
+@router.get("/business-health")
+def business_health(user: UserContext = Depends(require_manager)):
+    """Growth, book value, provider quality, win-back queue, open dollars,
+    agent scoreboard — all from verified payment data. Cached 10 minutes."""
+    from app.services.business_health import build_business_health
+    db = get_client()
+    return build_business_health(db)
+
+
 @router.get("/leads-stats")
 def get_leads_stats(user: UserContext = Depends(get_current_user)):
     db = get_client()
