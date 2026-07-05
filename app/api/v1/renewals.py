@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from typing import Optional
 from datetime import date, datetime, timezone
 from app.db.client import get_client
@@ -45,7 +45,7 @@ def get_renewals(
     q = db.table("lead_deals").select(
         "id, end_date, supplier, plan_name, contract_term, rate, rate_type, "
         "lead_id, sales_agent, status, "
-        "leads(first_name, last_name, phone, sgp_customer_id)"
+        "leads(first_name, last_name, phone, email, sgp_customer_id)"
     ).eq("status", "Active")
 
     if start_date: q = q.gte("end_date", start_date)
@@ -70,6 +70,7 @@ def get_renewals(
             "source":       "crm",
             "full_name":    f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
             "phone":        lead.get("phone"),
+            "email":        lead.get("email"),
             "sgp_id":       lead.get("sgp_customer_id"),
             "provider":     d.get("supplier"),
             "plan_name":    d.get("plan_name"),
@@ -85,7 +86,7 @@ def get_renewals(
     q2 = db.table("crm_deals").select(
         "id, contract_end_date, provider, product_type, contract_term, energy_rate, "
         "customer_id, sales_agent, deal_status, "
-        "crm_customers(full_name, phone)"
+        "crm_customers(full_name, phone, email)"
     ).eq("deal_status", "ACTIVE")
 
     if start_date: q2 = q2.gte("contract_end_date", start_date)
@@ -110,6 +111,7 @@ def get_renewals(
             "source":       "imported",
             "full_name":    cust.get("full_name", ""),
             "phone":        cust.get("phone"),
+            "email":        cust.get("email"),
             "sgp_id":       None,
             "provider":     d.get("provider"),
             "plan_name":    d.get("product_type"),
@@ -123,3 +125,55 @@ def get_renewals(
 
     results.sort(key=lambda x: x["end_date"] or "9999")
     return results
+
+
+@router.post("/email")
+def email_renewal(data: dict = Body(...), user: UserContext = Depends(get_current_user)):
+    """Email a personalized renewal offer for one expiring deal."""
+    from app.services.customer_email import send_email, renewal_email_html
+    from app.services.audit import audit
+    db = get_client()
+    source, deal_id = data.get("source"), data.get("deal_id")
+
+    if source == "crm":
+        d = db.table("lead_deals").select("*, leads(first_name, last_name, email)").eq("id", deal_id).limit(1).execute().data
+        if not d:
+            raise HTTPException(status_code=404, detail="Deal not found")
+        d = d[0]
+        who = d.get("leads") or {}
+        name = f"{who.get('first_name','')} {who.get('last_name','')}".strip()
+        email = (data.get("email") or who.get("email") or "").strip()
+        provider, plan, end = d.get("supplier"), d.get("plan_name") or d.get("rate_type"), d.get("end_date")
+    else:
+        d = db.table("crm_deals").select("*, crm_customers(full_name, email)").eq("id", deal_id).limit(1).execute().data
+        if not d:
+            raise HTTPException(status_code=404, detail="Deal not found")
+        d = d[0]
+        who = d.get("crm_customers") or {}
+        name = who.get("full_name") or ""
+        email = (data.get("email") or who.get("email") or "").strip()
+        provider, plan, end = d.get("provider"), d.get("product_type"), d.get("contract_end_date")
+
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="No email on file for this customer — add one first.")
+
+    end_str = str(end)[:10] if end else None
+    days_left = None
+    try:
+        days_left = (date.fromisoformat(end_str) - datetime.now(timezone.utc).date()).days
+    except Exception:
+        pass
+
+    plans = db.table("landing_plans").select("plan_name, rate, term_months").order("sort_order").limit(3).execute().data or []
+    result = send_email(
+        email,
+        f"{(name or 'Your').split(' ')[0]}, your electricity contract ends "
+        f"{'in ' + str(days_left) + ' days' if days_left is not None else 'soon'} — let's beat your rate",
+        renewal_email_html(name, provider, plan, end_str, days_left, plans),
+    )
+    if not result.get("ok"):
+        raise HTTPException(status_code=503, detail=result.get("error", "Email failed"))
+    audit(db, source or "deal", str(deal_id), "emailed_renewal", None,
+          {"to": email, "days_left": days_left},
+          reason="Renewal offer emailed from CRM", actor=user.email or "staff")
+    return {"ok": True, "to": email}

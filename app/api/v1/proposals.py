@@ -203,6 +203,44 @@ def create_proposal(data: dict = Body(...), user: UserContext = Depends(get_curr
 
 # ── Single proposal ───────────────────────────────────────────────────────────
 
+@router.post("/{proposal_id}/email")
+def email_contract(proposal_id: str, data: dict = Body(default={}), user: UserContext = Depends(get_current_user)):
+    """Email the customer their contract — the signing link, or the signed
+    PDF attached once it's been executed."""
+    from app.services.customer_email import send_email, contract_email_html, fetch_signed_pdf_attachment
+    from app.services.audit import audit
+    db = get_client()
+    res = db.table("proposals").select("*").eq("id", proposal_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    prop = res.data[0]
+
+    to = (data.get("email") or prop.get("customer_email") or "").strip()
+    if not to or "@" not in to:
+        raise HTTPException(status_code=400, detail="No email on file for this customer — add one first.")
+    if data.get("email") and data["email"].strip() != (prop.get("customer_email") or ""):
+        db.table("proposals").update({"customer_email": to, "updated_at": _now()}).eq("id", proposal_id).execute()
+
+    signed = bool(prop.get("signed_contract_url"))
+    attachments = None
+    if signed:
+        att = fetch_signed_pdf_attachment(db, prop["signed_contract_url"])
+        attachments = [att] if att else None
+
+    subject = ("Your signed Saigon Power contract 🎉" if signed
+               else f"Your Saigon Power contract is ready to sign{' — ' + prop['plan_name'] if prop.get('plan_name') else ''}")
+    result = send_email(to, subject, contract_email_html(prop), attachments)
+    if not result.get("ok"):
+        raise HTTPException(status_code=503, detail=result.get("error", "Email failed"))
+
+    if not signed and prop.get("status") in (None, "draft", "created"):
+        db.table("proposals").update({"status": "sent", "updated_at": _now()}).eq("id", proposal_id).execute()
+    audit(db, "proposals", proposal_id, "emailed_contract", None,
+          {"to": to, "signed_pdf_attached": bool(attachments)},
+          reason="Contract emailed from CRM", actor=user.email or "staff")
+    return {"ok": True, "to": to, "attached_signed_pdf": bool(attachments)}
+
+
 @router.get("/{proposal_id}")
 def get_proposal(proposal_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
