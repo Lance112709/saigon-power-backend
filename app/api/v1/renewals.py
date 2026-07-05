@@ -3,6 +3,7 @@ from typing import Optional
 from datetime import date, datetime, timezone
 from app.db.client import get_client
 from app.api.v1.auth import get_current_user, UserContext
+from app.utils.deals import is_month_to_month
 
 router = APIRouter()
 
@@ -55,6 +56,8 @@ def get_renewals(
         q = q.ilike("sales_agent", f"%{agent_filter}%")
 
     for d in q.order("end_date").execute().data:
+        if is_month_to_month(d.get("rate_type"), d.get("plan_name"), d.get("contract_term")):
+            continue  # month-to-month has no contract end to renew
         lead = d.pop("leads", None) or {}
         end = d.get("end_date") or ""
         try:
@@ -93,6 +96,8 @@ def get_renewals(
         q2 = q2.ilike("sales_agent", f"%{agent_filter}%")
 
     for d in q2.order("contract_end_date").execute().data:
+        if is_month_to_month(d.get("product_type"), d.get("contract_term")):
+            continue  # month-to-month has no contract end to renew
         cust = d.pop("crm_customers", None) or {}
         end = (d.get("contract_end_date") or "")[:10]
         try:

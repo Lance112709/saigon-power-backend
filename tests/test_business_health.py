@@ -52,3 +52,16 @@ def test_confirmed_flow_ignores_billing_bounce():
 def test_confirmed_flow_real_loss():
     cf = confirmed_flow(set(), {"a", "b"}, {"a"}, {"a"})
     assert cf["lost"] == 1 and cf["gained"] == 0
+
+
+def test_month_to_month_detection():
+    from app.utils.deals import is_month_to_month
+    assert is_month_to_month("Month-Month")
+    assert is_month_to_month("Month to Month")
+    assert is_month_to_month("Month-to-Month")
+    assert is_month_to_month("Month to month")
+    assert is_month_to_month("IH Month to Month")
+    assert is_month_to_month(None, "", "0")
+    assert not is_month_to_month("Fixed Rate", "36 Months")
+    assert not is_month_to_month("12")
+    assert not is_month_to_month("No Gimmicks 36")

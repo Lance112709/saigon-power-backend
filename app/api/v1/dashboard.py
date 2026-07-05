@@ -112,6 +112,19 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
     if is_agent and not agent_name:
         return EMPTY_STATS
 
+    from app.utils.deals import is_month_to_month
+
+    def _count_expiring_lead(q):
+        rows = q.execute().data or []
+        return sum(1 for r in rows if not is_month_to_month(r.get("rate_type"), r.get("plan_name"), r.get("contract_term")))
+
+    def _count_expiring_crm(q):
+        rows = q.execute().data or []
+        return sum(1 for r in rows if not is_month_to_month(r.get("product_type"), r.get("contract_term")))
+
+    _LEAD_EXP_COLS = "id, rate_type, plan_name, contract_term"
+    _CRM_EXP_COLS = "id, product_type, contract_term"
+
     if is_agent:
         scoped_leads = db.table("leads").select("id").eq("sales_agent", agent_name).execute().data or []
         scoped_ids = [l["id"] for l in scoped_leads]
@@ -120,8 +133,8 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         leads_today     = db.table("leads").select("id", count="exact").eq("sales_agent", agent_name).gte("created_at", today_start).execute()
         leads_week      = db.table("leads").select("id", count="exact").eq("sales_agent", agent_name).gte("created_at", week_start).execute()
         active_deals    = db.table("lead_deals").select("id, est_kwh, adder", count="exact").eq("status", "Active").in_("lead_id", scoped_ids).execute()
-        expiring        = db.table("lead_deals").select("id", count="exact").eq("status", "Active").in_("lead_id", scoped_ids).lte("end_date", thirty_days_out).gte("end_date", today_str).execute()
-        expiring_crm    = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE").ilike("sales_agent", f"%{agent_name}%").lte("contract_end_date", thirty_days_out).gte("contract_end_date", today_str).execute()
+        expiring_n      = _count_expiring_lead(db.table("lead_deals").select(_LEAD_EXP_COLS).eq("status", "Active").in_("lead_id", scoped_ids).lte("end_date", thirty_days_out).gte("end_date", today_str))
+        expiring_crm_n  = _count_expiring_crm(db.table("crm_deals").select(_CRM_EXP_COLS).eq("deal_status", "ACTIVE").ilike("sales_agent", f"%{agent_name}%").lte("contract_end_date", thirty_days_out).gte("contract_end_date", today_str))
         leads_count     = db.table("leads").select("id", count="exact").eq("status", "lead").eq("sales_agent", agent_name).execute()
         converted_count = db.table("leads").select("id", count="exact").eq("status", "converted").eq("sales_agent", agent_name).execute()
         recent_raw      = db.table("leads").select("*, lead_deals(id, status, product_type)").eq("sales_agent", agent_name).order("created_at", desc=True).limit(5).execute()
@@ -129,8 +142,8 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         leads_today     = db.table("leads").select("id", count="exact").gte("created_at", today_start).execute()
         leads_week      = db.table("leads").select("id", count="exact").gte("created_at", week_start).execute()
         active_deals    = db.table("lead_deals").select("id, est_kwh, adder", count="exact").eq("status", "Active").execute()
-        expiring        = db.table("lead_deals").select("id", count="exact").eq("status", "Active").lte("end_date", thirty_days_out).gte("end_date", today_str).execute()
-        expiring_crm    = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE").lte("contract_end_date", thirty_days_out).gte("contract_end_date", today_str).execute()
+        expiring_n      = _count_expiring_lead(db.table("lead_deals").select(_LEAD_EXP_COLS).eq("status", "Active").lte("end_date", thirty_days_out).gte("end_date", today_str))
+        expiring_crm_n  = _count_expiring_crm(db.table("crm_deals").select(_CRM_EXP_COLS).eq("deal_status", "ACTIVE").lte("contract_end_date", thirty_days_out).gte("contract_end_date", today_str))
         leads_count     = db.table("leads").select("id", count="exact").eq("status", "lead").execute()
         converted_count = db.table("leads").select("id", count="exact").eq("status", "converted").execute()
         recent_raw      = db.table("leads").select("*, lead_deals(id, status, product_type)").order("created_at", desc=True).limit(5).execute()
@@ -196,14 +209,14 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         "active_deals_imported": crm_active,
         "deals_added_this_month": deals_added_month,
         "deals_added_this_week": deals_added_week,
-        "expiring_soon":   (expiring.count or 0) + (expiring_crm.count or 0),
+        "expiring_soon":   expiring_n + expiring_crm_n,
         "pipeline":        pipeline,
         "finance":         finance,
         "portfolio": {
             "active_contracts": pipeline_active + crm_active,
             "total_kwh":        round(total_kwh, 2),
             "commission_mo":    round(commission_mo, 2),
-            "at_risk":          (expiring.count or 0) + (expiring_crm.count or 0),
+            "at_risk":          expiring_n + expiring_crm_n,
         },
         "recent_leads": recent_leads,
     }
@@ -225,10 +238,13 @@ def get_expiring_deals(user: UserContext = Depends(get_current_user)):
     results = []
 
     # ── CRM Leads deals ──────────────────────────────────────────────────────────
+    from app.utils.deals import is_month_to_month
     q = db.table("lead_deals").select(
-        "id, end_date, supplier, plan_name, contract_term, lead_id, leads(first_name, last_name, phone, sgp_customer_id, sales_agent)"
+        "id, end_date, supplier, plan_name, rate_type, contract_term, lead_id, leads(first_name, last_name, phone, sgp_customer_id, sales_agent)"
     ).eq("status", "Active").lte("end_date", sixty_out).gte("end_date", today_str).order("end_date")
     for d in q.execute().data:
+        if is_month_to_month(d.get("rate_type"), d.get("plan_name"), d.get("contract_term")):
+            continue
         lead = d.pop("leads", None) or {}
         if agent_name and (lead.get("sales_agent") or "").lower() != agent_name.lower():
             continue
@@ -251,10 +267,12 @@ def get_expiring_deals(user: UserContext = Depends(get_current_user)):
 
     # ── Imported Customers deals ─────────────────────────────────────────────────
     q2 = db.table("crm_deals").select(
-        "id, contract_end_date, provider, contract_term, customer_id, sales_agent, "
+        "id, contract_end_date, provider, product_type, contract_term, customer_id, sales_agent, "
         "crm_customers(full_name, phone)"
     ).eq("deal_status", "ACTIVE").lte("contract_end_date", sixty_out).gte("contract_end_date", today_str).order("contract_end_date")
     for d in q2.execute().data:
+        if is_month_to_month(d.get("product_type"), d.get("contract_term")):
+            continue
         cust = d.pop("crm_customers", None) or {}
         if agent_name and (d.get("sales_agent") or "").lower() != agent_name.lower():
             continue

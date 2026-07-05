@@ -35,8 +35,11 @@ def _run_renewal_sms():
         today = datetime.now(timezone.utc).date()
         for days_out in (60, 30):
             target = (today + timedelta(days=days_out)).isoformat()
-            deals = db.table("lead_deals").select("id, lead_id, end_date, leads(first_name, phone)").eq("status", "Active").eq("end_date", target).execute().data or []
+            deals = db.table("lead_deals").select("id, lead_id, end_date, rate_type, plan_name, contract_term, leads(first_name, phone)").eq("status", "Active").eq("end_date", target).execute().data or []
+            from app.utils.deals import is_month_to_month
             for deal in deals:
+                if is_month_to_month(deal.get("rate_type"), deal.get("plan_name"), deal.get("contract_term")):
+                    continue  # nothing to renew on month-to-month
                 lead = deal.get("leads") or {}
                 phone = lead.get("phone")
                 if not phone:

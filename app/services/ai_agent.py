@@ -77,7 +77,8 @@ def run_full_scan() -> dict:
 
     # 2. Scan lead_deals
     deals = db.table("lead_deals").select(
-        "id, lead_id, supplier, esiid, rate, sales_agent, start_date, end_date, status"
+        "id, lead_id, supplier, esiid, rate, sales_agent, start_date, end_date, status, "
+        "rate_type, plan_name, contract_term"
     ).neq("status", "Inactive").execute().data or []
 
     deal_issues = {"missing_rate": 0, "missing_esiid": 0, "missing_agent": 0,
@@ -131,14 +132,20 @@ def run_full_scan() -> dict:
             _resolve("missing_dates", did)
 
     # 3. Scan renewals (reuse already-fetched deals)
+    from app.utils.deals import is_month_to_month
     renewals = {"30_days": 0, "60_days": 0, "90_days": 0}
     for d in deals:
         if d.get("status") != "Active":
             continue
+        did = d["id"]
+        if is_month_to_month(d.get("rate_type"), d.get("plan_name"), d.get("contract_term")):
+            # month-to-month never expires — clear any stale renewal alerts
+            for t in ("renewal_30", "renewal_60", "renewal_90"):
+                _resolve(t, did)
+            continue
         days = _days_until(d.get("end_date"))
         if days is None:
             continue
-        did = d["id"]
         supplier = d.get("supplier") or "Unknown"
         if days <= 30:
             renewals["30_days"] += 1

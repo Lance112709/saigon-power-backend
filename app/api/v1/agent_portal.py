@@ -86,9 +86,12 @@ def overview(agent: Optional[str] = Query(None), user: UserContext = Depends(get
     deals = _my_deals(db, name)
     active = [d for d in deals if d["active"]]
 
+    from app.utils.deals import is_month_to_month
     today = date.today()
     soon = (today + timedelta(days=60)).isoformat()
-    renewals_60d = sum(1 for d in active if d.get("end") and today.isoformat() <= str(d["end"])[:10] <= soon)
+    renewals_60d = sum(1 for d in active
+                       if d.get("end") and today.isoformat() <= str(d["end"])[:10] <= soon
+                       and not is_month_to_month(d.get("plan_type")))
 
     paid_recent = _recent_paid_esiids(db)
     latest_label = next(iter(paid_recent), None)
