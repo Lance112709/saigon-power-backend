@@ -7,7 +7,7 @@ conversion (Texas ESIIDs are 17-22 digits; float64 only holds ~15 digits).
 
 Supported formats:
   - Discount Power / Cirro / NRG  ("Residuals" sheet)
-  - NRG Business Marketing        (Summary/Commissions/Delinquents statement)
+  - NRG Commercial                (Summary/Commissions/Delinquents statement)
   - Iron Horse                    (3 generations: "Result", report, broker-report)
   - Chariot Energy                ("Commissions" + "Clawback" sheets)
   - Budget Power                  (Affinity report, .xlsx and legacy .xls)
@@ -31,8 +31,8 @@ CHURN_KEYWORDS = ["going final", "final", "cancelled", "canceled", "churn",
                   "terminating", "dropping", "drop", "cancel", "inactive", "closed"]
 
 PROVIDER_SUPPLIERS = {
-    "Discount Power/Cirro": {"code": "NRG", "name": "NRG / Discount Power"},
-    "NRG Business":         {"code": "NRGBIZ", "name": "NRG Business Marketing"},
+    "Discount Power/Cirro": {"code": "NRG", "name": "Discount Power"},
+    "NRG Commercial":       {"code": "NRGBIZ", "name": "NRG Commercial"},
     "Iron Horse":           {"code": "IRONHORSE", "name": "Iron Horse Power"},
     "Chariot":              {"code": "CHARIOT", "name": "Chariot Energy"},
     "Budget Power":         {"code": "BUDGET", "name": "Budget Power"},
@@ -41,7 +41,7 @@ PROVIDER_SUPPLIERS = {
 
 # CRM provider spellings -> provider group (used to select deals to reconcile)
 CRM_PROVIDER_GROUPS = {
-    "nrg": "NRG Business", "nrg energy": "NRG Business",
+    "nrg": "NRG Commercial", "nrg energy": "NRG Commercial",
     "discount power": "Discount Power/Cirro", "cirro energy": "Discount Power/Cirro",
     "value power": "Discount Power/Cirro", "reliant": "Discount Power/Cirro",
     "iron horse": "Iron Horse",
@@ -236,7 +236,7 @@ def _parse_iron_horse(xl, path_label, warnings):
 
 
 def _parse_nrg_business(xl, path_label, warnings):
-    """NRG Business Marketing monthly broker statement: Summary / Info /
+    """NRG Commercial (NRG Business Marketing) monthly broker statement: Summary / Info /
     Commissions / Delinquents sheets. sum(Total) always equals the Summary's
     'Total Paid'; negative rows are corrections and are kept."""
     if "Commissions" not in xl.sheet_names or "Summary" not in xl.sheet_names:
@@ -395,7 +395,7 @@ def _parse_cleansky(xl, path_label, warnings):
 
 _PARSERS = [
     ("Discount Power/Cirro", _parse_dp),
-    ("NRG Business", _parse_nrg_business),  # before Chariot: both have a Commissions sheet
+    ("NRG Commercial", _parse_nrg_business),  # before Chariot: both have a Commissions sheet
     ("Chariot", _parse_chariot),
     ("CleanSky", _parse_cleansky),
     ("Iron Horse", _parse_iron_horse),

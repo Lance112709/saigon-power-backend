@@ -168,7 +168,7 @@ def test_nrg_business_statement_parsed():
         "Delinquents": [],
     })
     res = detect_and_parse(data, "1-3UVANNQ_Saigon Power LLC_US_Monthly_1123_May312026_NRG.xlsx")
-    assert res and res["provider_group"] == "NRG Business"
+    assert res and res["provider_group"] == "NRG Commercial"
     assert res["supplier"]["code"] == "NRGBIZ"
     assert res["statement_label"] == "2026-05"
     comm = [r for r in res["rows"] if r["row_type"] == "commission"]

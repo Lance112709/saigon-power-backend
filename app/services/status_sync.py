@@ -10,7 +10,7 @@ Providers report account status on their statements (Budget Power's
 
 Safety rails:
   * Only trusted sources apply: providers whose status column is a real
-    account status (Budget Power "Cust Status", NRG Business "LDC Status":
+    account status (Budget Power "Cust Status", NRG Commercial "LDC Status":
     Enrolled/New Account -> active, Drop Pending -> going final,
     Dropped/Cancelled -> inactive), or manual imports where the user mapped
     the status column themselves. Discount Power's TRANSACTION_TYPE is a
@@ -25,7 +25,7 @@ from typing import Optional
 
 from app.services.audit import audit
 
-TRUSTED_STATUS_GROUPS = {"Budget Power", "NRG Business"}
+TRUSTED_STATUS_GROUPS = {"Budget Power", "NRG Commercial"}
 
 CHURN_RELIABILITY_THRESHOLD = 0.5
 
@@ -40,7 +40,7 @@ def map_status(raw) -> Optional[str]:
     if any(k in s for k in ("inactive", "cancel", "closed", "churn", "terminat",
                             "move out", "moved out", "drop", "disconnect")):
         return "inactive"
-    # NRG Business LDC statuses: Enrolled / New Account / Enrollment Pending
+    # NRG Commercial LDC statuses: Enrolled / New Account / Enrollment Pending
     if "active" in s or "enroll" in s or "new account" in s:
         return "active"
     return None
