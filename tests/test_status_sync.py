@@ -63,6 +63,13 @@ def test_map_status_variants():
     assert map_status("Inactive Collections") == "inactive"
     assert map_status("Switch Back") is None              # billing code, not a status
     assert map_status("") is None
+    # NRG Business LDC Status values
+    assert map_status("Enrolled") == "active"
+    assert map_status("New Account") == "active"
+    assert map_status("Enrollment Pending") == "active"
+    assert map_status("Dropped") == "inactive"
+    assert map_status("Cancelled") == "inactive"
+    assert map_status("Drop Pending") == "going_final"    # win-back signal, not yet gone
 
 
 def test_inactive_deactivates_deal():
