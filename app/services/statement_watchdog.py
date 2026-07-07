@@ -28,6 +28,14 @@ def last_month_label(today: date = None) -> str:
 
 
 def check_missing_statements(today: date = None) -> list:
+    # Pull any statements sitting in the inbox first, so we never alert about
+    # a "missing" statement that already arrived by email.
+    try:
+        from app.services.email_ingest import poll_inbox
+        poll_inbox(actor="watchdog-precheck")
+    except Exception:
+        pass
+
     db = get_client()
     label = last_month_label(today)
     missing = []
