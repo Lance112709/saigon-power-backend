@@ -58,6 +58,14 @@ def _run_renewal_sms():
     except Exception:
         pass
 
+def _run_email_ingest():
+    """Hourly: pull new commission statements straight from the inbox."""
+    try:
+        from app.services.email_ingest import poll_inbox
+        poll_inbox()
+    except Exception:
+        pass
+
 def _run_statement_watchdog():
     """Providers pay by the 7th. On the 10th, alert if any provider's
     statement for last month has not been uploaded and reconciled."""
@@ -74,6 +82,7 @@ try:
     scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
     scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
     scheduler.add_job(_run_statement_watchdog, "cron", day=10, hour=9, minute=30)
+    scheduler.add_job(_run_email_ingest, "cron", minute=15)  # hourly at :15
     _scheduler_ok = True
 except Exception:
     _scheduler_ok = False

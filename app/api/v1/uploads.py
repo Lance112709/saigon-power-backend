@@ -394,6 +394,13 @@ def get_upload(id: str, user: UserContext = Depends(require_admin)):
     return res.data
 
 
+@router.post("/poll-email")
+def poll_email(user: UserContext = Depends(require_admin)):
+    """Check the inbox for new commission statements right now."""
+    from app.services.email_ingest import poll_inbox
+    return poll_inbox(actor=user.email or "admin")
+
+
 @router.post("/{id}/apply-statuses")
 def apply_statuses(id: str, user: UserContext = Depends(require_admin)):
     """Force-apply the provider-reported status changes from a batch whose
