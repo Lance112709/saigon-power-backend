@@ -147,6 +147,39 @@ def test_chariot_clawback_rows_separated():
     assert res["total_amount"] == 19.02  # clawback rows excluded from total
 
 
+def test_nrg_business_statement_parsed():
+    data = xlsx({
+        "Summary": [{"NRG Commission Statement": "Broker", "Unnamed: 1": "Saigon Power LLC"},
+                    {"NRG Commission Statement": "Total Paid", "Unnamed: 1": "88.51"}],
+        "Info": [{"Source Legend": "x"}],
+        "Commissions": [
+            {"Commission ID": "48519719", "Customer Name": "1 GOLDEN DRAGON LLC",
+             "Commission Type": "Plan", "Calculation Type": "OnFlow",
+             "Current LDC Account #": "1008901022900661710113", "LDC Status": "Enrolled",
+             "Period Start": "4/16/2026", "Period End": "5/17/2026",
+             "Commission Usage": "9073", "UOM": "kWh", "Adder": "0.006997",
+             "Amount": "63.48", "Total": "63.48",
+             "Contract Start Date": "5/1/2024", "Contract End Date": "4/30/2027"},
+            {"Commission ID": "48519720", "Customer Name": "",
+             "Commission Type": "Manual", "Calculation Type": "Other",
+             "Current LDC Account #": "", "Notes": "NRG Winter Incentive",
+             "Amount": "25.03", "Total": "25.03"},
+        ],
+        "Delinquents": [],
+    })
+    res = detect_and_parse(data, "1-3UVANNQ_Saigon Power LLC_US_Monthly_1123_May312026_NRG.xlsx")
+    assert res and res["provider_group"] == "NRG Business"
+    assert res["supplier"]["code"] == "NRGBIZ"
+    assert res["statement_label"] == "2026-05"
+    comm = [r for r in res["rows"] if r["row_type"] == "commission"]
+    bonus = [r for r in res["rows"] if r["row_type"] == "bonus"]
+    assert len(comm) == 1 and len(bonus) == 1
+    assert comm[0]["esiid"] == "1008901022900661710113"
+    assert comm[0]["rate"] == 0.006997 and comm[0]["amount"] == 63.48
+    assert bonus[0]["amount"] == 25.03
+    assert not res["warnings"]  # 63.48 + 25.03 == Total Paid
+
+
 def test_cleansky_month_sheets_get_own_labels():
     row = {"MARKETER_NAME": "TITAN", "CUSTOMER_NAME": "NGUYEN",
            "LDC_ACCOUNT_NUM": "10032789407800704", "USAGE_NUM": "67",

@@ -7,6 +7,7 @@ conversion (Texas ESIIDs are 17-22 digits; float64 only holds ~15 digits).
 
 Supported formats:
   - Discount Power / Cirro / NRG  ("Residuals" sheet)
+  - NRG Business Marketing        (Summary/Commissions/Delinquents statement)
   - Iron Horse                    (3 generations: "Result", report, broker-report)
   - Chariot Energy                ("Commissions" + "Clawback" sheets)
   - Budget Power                  (Affinity report, .xlsx and legacy .xls)
@@ -31,6 +32,7 @@ CHURN_KEYWORDS = ["going final", "final", "cancelled", "canceled", "churn",
 
 PROVIDER_SUPPLIERS = {
     "Discount Power/Cirro": {"code": "NRG", "name": "NRG / Discount Power"},
+    "NRG Business":         {"code": "NRGBIZ", "name": "NRG Business Marketing"},
     "Iron Horse":           {"code": "IRONHORSE", "name": "Iron Horse Power"},
     "Chariot":              {"code": "CHARIOT", "name": "Chariot Energy"},
     "Budget Power":         {"code": "BUDGET", "name": "Budget Power"},
@@ -39,7 +41,7 @@ PROVIDER_SUPPLIERS = {
 
 # CRM provider spellings -> provider group (used to select deals to reconcile)
 CRM_PROVIDER_GROUPS = {
-    "nrg": "Discount Power/Cirro", "nrg energy": "Discount Power/Cirro",
+    "nrg": "NRG Business", "nrg energy": "NRG Business",
     "discount power": "Discount Power/Cirro", "cirro energy": "Discount Power/Cirro",
     "value power": "Discount Power/Cirro", "reliant": "Discount Power/Cirro",
     "iron horse": "Iron Horse",
@@ -233,6 +235,63 @@ def _parse_iron_horse(xl, path_label, warnings):
     return rows if found else None
 
 
+def _parse_nrg_business(xl, path_label, warnings):
+    """NRG Business Marketing monthly broker statement: Summary / Info /
+    Commissions / Delinquents sheets. sum(Total) always equals the Summary's
+    'Total Paid'; negative rows are corrections and are kept."""
+    if "Commissions" not in xl.sheet_names or "Summary" not in xl.sheet_names:
+        return None
+    df = pd.read_excel(xl, sheet_name="Commissions", dtype=str).dropna(how="all")
+    if "Current LDC Account #" not in df.columns or "Commission ID" not in df.columns:
+        return None
+    rows = []
+    for _, r in df.iterrows():
+        es = normalize_esiid(r.get("Current LDC Account #"))
+        amt = _f(r.get("Total"))
+        if amt is None:
+            amt = _f(r.get("Amount"))
+        if amt is None:
+            continue
+        if not es:
+            # broker incentive / manual bonus payments carry no account
+            rows.append(_mk_row(
+                "", customer_name=_s(r.get("Notes")) or "NRG broker incentive",
+                amount=amt, row_type="bonus", raw=_clean_raw(r.to_dict()),
+            ))
+            continue
+        rows.append(_mk_row(
+            es, customer_name=_s(r.get("Customer Name")),
+            usage_kwh=_f(r.get("Commission Usage")), rate=_f(r.get("Adder")), amount=amt,
+            service_start=_d(r.get("Period Start")), service_end=_d(r.get("Period End")),
+            provider_status=_s(r.get("LDC Status")),
+            contract_start=_d(r.get("Contract Start Date")), contract_end=_d(r.get("Contract End Date")),
+            raw=_clean_raw(r.to_dict()),
+        ))
+    if "Delinquents" in xl.sheet_names:
+        dq = pd.read_excel(xl, sheet_name="Delinquents", dtype=str).dropna(how="all")
+        for _, r in dq.iterrows():
+            es = normalize_esiid(r.get("Current LDC Account #"))
+            if not es:
+                continue
+            rows.append(_mk_row(
+                es, customer_name=_s(r.get("Customer Name")),
+                amount=_f(r.get("Total")) or _f(r.get("Amount")),
+                service_start=_d(r.get("Period Start")), service_end=_d(r.get("Period End")),
+                provider_status=_s(r.get("LDC Status")),
+                row_type="delinquent", raw=_clean_raw(r.to_dict()),
+            ))
+    try:
+        s = pd.read_excel(xl, sheet_name="Summary", dtype=str, header=None)
+        kv = {_s(r[0]): r[1] for _, r in s.iterrows() if _s(r[0]) and _s(r[1])}
+        paid = _f(kv.get("Total Paid"))
+        total = round(sum(r["amount"] or 0 for r in rows if r["row_type"] in ("commission", "bonus")), 2)
+        if paid is not None and abs(total - paid) > 0.02:
+            warnings.append(f"NRG summary says Total Paid ${paid:,.2f} but rows sum to ${total:,.2f}")
+    except Exception:
+        pass
+    return rows
+
+
 def _parse_chariot(xl, path_label, warnings):
     if "Commissions" not in xl.sheet_names:
         return None
@@ -326,6 +385,7 @@ def _parse_cleansky(xl, path_label, warnings):
 
 _PARSERS = [
     ("Discount Power/Cirro", _parse_dp),
+    ("NRG Business", _parse_nrg_business),  # before Chariot: both have a Commissions sheet
     ("Chariot", _parse_chariot),
     ("CleanSky", _parse_cleansky),
     ("Iron Horse", _parse_iron_horse),
@@ -370,7 +430,7 @@ def detect_and_parse(file_bytes: bytes, filename: str):
                 r["statement_label"] = file_label or fallback or date.today().strftime("%Y-%m")
         _relabel_far_rows(rows)
 
-        bad = [r for r in rows if not is_valid_esiid(r["esiid"])]
+        bad = [r for r in rows if r["row_type"] != "bonus" and not is_valid_esiid(r["esiid"])]
         if bad:
             warnings.append(f"{len(bad)} rows with malformed ESIIDs kept but flagged")
 
