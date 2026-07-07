@@ -244,6 +244,16 @@ def _parse_nrg_business(xl, path_label, warnings):
     df = pd.read_excel(xl, sheet_name="Commissions", dtype=str).dropna(how="all")
     if "Current LDC Account #" not in df.columns or "Commission ID" not in df.columns:
         return None
+    # statement month comes from the Summary's "Commissions Through" date —
+    # the filename and service periods both point one month off for this REP
+    kv = {}
+    try:
+        s = pd.read_excel(xl, sheet_name="Summary", dtype=str, header=None)
+        kv = {_s(r[0]): r[1] for _, r in s.iterrows() if _s(r[0]) and _s(r[1])}
+    except Exception:
+        pass
+    through = _d(kv.get("Commissions Through"))
+    label = through[:7] if through else ""
     rows = []
     for _, r in df.iterrows():
         es = normalize_esiid(r.get("Current LDC Account #"))
@@ -256,7 +266,8 @@ def _parse_nrg_business(xl, path_label, warnings):
             # broker incentive / manual bonus payments carry no account
             rows.append(_mk_row(
                 "", customer_name=_s(r.get("Notes")) or "NRG broker incentive",
-                amount=amt, row_type="bonus", raw=_clean_raw(r.to_dict()),
+                amount=amt, row_type="bonus", statement_label=label,
+                raw=_clean_raw(r.to_dict()),
             ))
             continue
         rows.append(_mk_row(
@@ -265,7 +276,7 @@ def _parse_nrg_business(xl, path_label, warnings):
             service_start=_d(r.get("Period Start")), service_end=_d(r.get("Period End")),
             provider_status=_s(r.get("LDC Status")),
             contract_start=_d(r.get("Contract Start Date")), contract_end=_d(r.get("Contract End Date")),
-            raw=_clean_raw(r.to_dict()),
+            statement_label=label, raw=_clean_raw(r.to_dict()),
         ))
     if "Delinquents" in xl.sheet_names:
         dq = pd.read_excel(xl, sheet_name="Delinquents", dtype=str).dropna(how="all")
@@ -278,11 +289,10 @@ def _parse_nrg_business(xl, path_label, warnings):
                 amount=_f(r.get("Total")) or _f(r.get("Amount")),
                 service_start=_d(r.get("Period Start")), service_end=_d(r.get("Period End")),
                 provider_status=_s(r.get("LDC Status")),
-                row_type="delinquent", raw=_clean_raw(r.to_dict()),
+                row_type="delinquent", statement_label=label,
+                raw=_clean_raw(r.to_dict()),
             ))
     try:
-        s = pd.read_excel(xl, sheet_name="Summary", dtype=str, header=None)
-        kv = {_s(r[0]): r[1] for _, r in s.iterrows() if _s(r[0]) and _s(r[1])}
         paid = _f(kv.get("Total Paid"))
         total = round(sum(r["amount"] or 0 for r in rows if r["row_type"] in ("commission", "bonus")), 2)
         if paid is not None and abs(total - paid) > 0.02:
