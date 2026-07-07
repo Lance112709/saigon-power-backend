@@ -16,7 +16,7 @@ Runs hourly (scheduled in main.py) and on demand (POST /uploads/poll-email):
 Config (Railway variables):
   GMAIL_USER          the mailbox that receives statements
   GMAIL_APP_PASSWORD  a Google App Password for that account
-  INGEST_LOOKBACK_DAYS (optional, default 14)
+  INGEST_LOOKBACK_DAYS (optional, default 40)
 """
 import email
 import email.utils
@@ -45,7 +45,7 @@ def poll_inbox(actor: str = "email-ingest") -> dict:
         return {"ok": False,
                 "error": "Email ingest isn't configured — set GMAIL_USER and GMAIL_APP_PASSWORD in Railway."}
 
-    lookback = int(os.environ.get("INGEST_LOOKBACK_DAYS", "14"))
+    lookback = int(os.environ.get("INGEST_LOOKBACK_DAYS", "40"))
     since = (datetime.now(timezone.utc) - timedelta(days=lookback)).strftime("%d-%b-%Y")
 
     db = get_client()
