@@ -710,3 +710,116 @@ def ai_chat(data: dict = Body(...), user: UserContext = Depends(require_admin)):
         raise HTTPException(status_code=400, detail="message is required")
     reply = chat_with_context(message, history)
     return {"reply": reply}
+
+
+@router.get("/command-center")
+def command_center(user: UserContext = Depends(require_admin)):
+    """One call for the AI Operation Center: KPIs, provider scorecard,
+    integration health, and a prioritized needs-attention list."""
+    import os
+
+    from app.services.business_health import build_business_health
+
+    db = get_client()
+    bh = build_business_health(db)
+
+    # open reconciliation issues per supplier (excluding matched/unexpected noise)
+    sups = {s["id"]: s for s in (db.table("suppliers").select("id,code,name").execute().data or [])}
+    open_items = []
+    off = 0
+    while True:
+        page = db.table("reconciliation_items") \
+            .select("supplier_id,status,is_resolved,billing_month,expected_amount,actual_amount") \
+            .eq("is_resolved", False).neq("status", "matched") \
+            .order("id").range(off, off + 999).execute().data or []
+        open_items.extend(page)
+        if len(page) < 1000 or len(open_items) >= 6000:
+            break
+        off += 1000
+
+    by_sup: dict = {}
+    for i in open_items:
+        b = by_sup.setdefault(i["supplier_id"], {"disputes": 0, "unknown": 0, "dollars": 0.0})
+        if i["status"] == "unexpected":
+            b["unknown"] += 1
+        else:
+            b["disputes"] += 1
+            b["dollars"] += max(0.0, float(i.get("expected_amount") or 0) - float(i.get("actual_amount") or 0))
+
+    integrations = {
+        "ai": bool(os.environ.get("ANTHROPIC_API_KEY", "").strip()),
+        "email": bool(os.environ.get("RESEND_API_KEY", "").strip()),
+        "sms": bool(os.environ.get("TELNYX_API_KEY", "").strip()),
+        "gmail_ingest": bool(os.environ.get("GMAIL_APP_PASSWORD", "").strip()),
+    }
+
+    # actions, most severe first
+    actions = []
+    total_disputes = sum(b["disputes"] for b in by_sup.values())
+    total_dollars = round(sum(b["dollars"] for b in by_sup.values()), 2)
+    if total_disputes:
+        worst = max(by_sup.items(), key=lambda kv: kv[1]["dollars"])
+        actions.append({
+            "severity": "high", "icon": "💸",
+            "title": f"{total_disputes} open payment dispute{'s' if total_disputes != 1 else ''} worth ${total_dollars:,.0f}",
+            "detail": f"Largest exposure: {sups.get(worst[0], {}).get('name', '?')} (${worst[1]['dollars']:,.0f}). "
+                      "Review root causes and raise them with the provider rep.",
+            "link": "/reconciliation",
+        })
+    unknown_now = sum(b["unknown"] for b in by_sup.values())
+    if unknown_now:
+        actions.append({
+            "severity": "medium", "icon": "❓",
+            "title": f"{unknown_now} payments for accounts not in the CRM",
+            "detail": "Providers are paying ESI IDs the CRM doesn't know. Import or link them so the book stays complete.",
+            "link": "/reconciliation",
+        })
+    stale = [p for p in bh.get("providers", []) if (p.get("months_not_reporting") or 0) >= 2]
+    for p in stale[:3]:
+        actions.append({
+            "severity": "high", "icon": "📭",
+            "title": f"{p['name']}: no statement for {p['months_not_reporting']} months",
+            "detail": "Chase the provider for missing commission statements — this is unverified revenue.",
+            "link": "/uploads",
+        })
+    wb = bh.get("winback") or {}
+    if wb.get("count"):
+        actions.append({
+            "severity": "medium", "icon": "📞",
+            "title": f"{wb['count']} win-back candidates worth ~${wb.get('monthly_value', 0):,.0f}/mo",
+            "detail": "Accounts the provider reports as leaving or gone. Call before the switch is final.",
+            "link": "/crm/dropped",
+        })
+    missing = [k for k, v in integrations.items() if not v]
+    if missing:
+        labels = {"ai": "AI briefings (Anthropic key)", "email": "customer email (Resend)",
+                  "sms": "SMS (Telnyx)", "gmail_ingest": "statement auto-ingest (Gmail)"}
+        actions.append({
+            "severity": "low", "icon": "🔌",
+            "title": f"{len(missing)} integration{'s' if len(missing) != 1 else ''} not configured",
+            "detail": "Waiting on API keys in Railway: " + ", ".join(labels[m] for m in missing) + ".",
+            "link": None,
+        })
+
+    scorecard = []
+    for p in bh.get("providers", []):
+        sid = next((k for k, v in sups.items() if v["name"] == p["name"]), None)
+        issues = by_sup.get(sid, {})
+        scorecard.append({**p, "open_disputes": issues.get("disputes", 0),
+                          "unknown_accounts": issues.get("unknown", 0),
+                          "open_dollars": round(issues.get("dollars", 0.0), 2)})
+
+    return {
+        "kpis": {
+            **(bh.get("book") or {}),
+            "open_dispute_dollars": total_dollars,
+            "open_disputes": total_disputes,
+        },
+        "months": bh.get("months", []),
+        "growth": bh.get("growth", []),
+        "providers": scorecard,
+        "actions": actions,
+        "integrations": integrations,
+        "winback": wb,
+        "computed_at": bh.get("computed_at"),
+    }
