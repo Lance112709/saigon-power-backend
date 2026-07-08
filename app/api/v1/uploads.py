@@ -25,7 +25,7 @@ from app.services.reconciliation_v2 import (
     load_deals, backfill_esiids, run_reconciliation_v2, get_or_create_supplier,
     rows_from_db, replace_prior_runs,
 )
-from app.services.status_sync import sync_statuses, TRUSTED_STATUS_GROUPS
+from app.services.status_sync import TRUSTED_STATUS_GROUPS, ABSENCE_SYNC_GROUPS, absence_sync, sync_statuses
 from app.services.audit import audit
 from app.auth.deps import require_admin, UserContext
 
@@ -83,6 +83,12 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
 
     # Auto-update deal statuses from the provider's status column (trusted sources only)
     status_sync = None
+    if provider_group in ABSENCE_SYNC_GROUPS:
+        absence = absence_sync(db, supplier_id, provider_group, deals, actor,
+                               current_esiids={r["esiid"] for r in rows if r.get("esiid")})
+        if absence.get("deactivated"):
+            warnings.append(f"{absence['deactivated']} deal(s) deactivated — absent from the "
+                            f"last 3 {provider_group} statements.")
     if provider_group and (trust_status or provider_group in TRUSTED_STATUS_GROUPS):
         batch_meta = db.table("upload_batches").select("original_filename").eq("id", batch_id).limit(1).execute().data
         source = f"{provider_group} — {(batch_meta[0]['original_filename'] if batch_meta else batch_id)}"

@@ -404,6 +404,10 @@ def _parse_cleansky(xl, path_label, warnings):
 
 
 
+# Tara reports account status as a single letter
+TARA_STATUS = {"A": "Active", "I": "Inactive"}
+
+
 def _tara_label(text):
     m = re.search(r"Accounts paid\s+(\d{1,2})/(\d{1,2})/(\d{4})", str(text or ""))
     return f"{m.group(3)}-{int(m.group(1)):02d}" if m else ""
@@ -439,7 +443,7 @@ def _parse_tara_xls(xl, path_label, warnings):
             es, customer_name=_s(r.get("Name")), address=_s(r.get("Address")),
             usage_kwh=_f(r.get("KWH")), rate=_f(r.get("Comm Rate")), amount=amt,
             service_start=_d(r.get("Start Date")), service_end=_d(r.get("End Date")),
-            provider_status=_s(r.get("Cust Status")),
+            provider_status=TARA_STATUS.get(_s(r.get("Cust Status")), _s(r.get("Cust Status"))),
             statement_label=label, raw=_clean_raw(r.to_dict()),
         ))
     return rows
@@ -486,7 +490,8 @@ def parse_tara_pdf(file_bytes: bytes, filename: str):
                             cur["esiid"], customer_name=cur["name_addr"][:200],
                             usage_kwh=_f(m.group(8)), rate=_f(m.group(9)), amount=amt,
                             service_start=_d(m.group(3)), service_end=_d(m.group(4)),
-                            provider_status=cur["status"], statement_label=label,
+                            provider_status=TARA_STATUS.get(cur["status"], cur["status"]),
+                            statement_label=label,
                             raw={"bill_no": m.group(2), "paid_date": _d(m.group(7)) or ""},
                         ))
     except Exception:

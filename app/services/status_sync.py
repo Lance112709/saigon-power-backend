@@ -10,7 +10,8 @@ Providers report account status on their statements (Budget Power's
 
 Safety rails:
   * Only trusted sources apply: providers whose status column is a real
-    account status (Budget Power "Cust Status", NRG Commercial "LDC Status":
+    account status (Budget Power "Cust Status", Tara Energy "Cust Status"
+    A/I, NRG Commercial "LDC Status":
     Enrolled/New Account -> active, Drop Pending -> going final,
     Dropped/Cancelled -> inactive), or manual imports where the user mapped
     the status column themselves. Discount Power's TRANSACTION_TYPE is a
@@ -25,7 +26,7 @@ from typing import Optional
 
 from app.services.audit import audit
 
-TRUSTED_STATUS_GROUPS = {"Budget Power", "NRG Commercial"}
+TRUSTED_STATUS_GROUPS = {"Budget Power", "NRG Commercial", "Tara Energy"}
 
 CHURN_RELIABILITY_THRESHOLD = 0.5
 
@@ -137,3 +138,53 @@ def sync_statuses(db, rows: list, deals: dict, source: str, actor: str,
             summary[change] = summary.get(change, 0) + 1
 
     return summary
+
+
+# Providers whose statements carry NO status column: an active deal that has
+# been absent from the last 3 monthly statements is deactivated instead.
+ABSENCE_SYNC_GROUPS = {"Reliant Energy", "APG&E"}
+
+
+def absence_sync(db, supplier_id: str, group: str, deals: dict, actor: str,
+                 current_esiids: set = None) -> dict:
+    """Deactivate active deals of this provider whose ESI IDs have not appeared
+    on any of the supplier's last 3 statement months. Used for providers with
+    no status column; every change is audit-logged and reversible."""
+    months = db.table("actual_commissions").select("billing_month") \
+        .eq("supplier_id", supplier_id).order("billing_month", desc=True).limit(1).execute().data
+    if not months:
+        return {"deactivated": 0}
+    latest = months[0]["billing_month"]
+    y, m = int(latest[:4]), int(latest[5:7]) - 2
+    if m < 1:
+        y, m = y - 1, m + 12
+    floor = f"{y}-{m:02d}-01"
+    seen, off = set(), 0
+    while True:
+        page = db.table("actual_commissions").select("raw_esiid,billing_month") \
+            .eq("supplier_id", supplier_id).gte("billing_month", floor) \
+            .order("id").range(off, off + 999).execute().data
+        if not page:
+            break
+        seen.update((r.get("raw_esiid") or "").strip() for r in page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    labels = {r for r in seen if r} | set(current_esiids or ())
+    n = 0
+    for es, deal in deals["by_esiid"].items():
+        if not deal.get("active") or es in labels:
+            continue
+        col = "status" if deal["source"] == "lead_deals" else "deal_status"
+        val = "Inactive" if deal["source"] == "lead_deals" else "INACTIVE"
+        upd = {col: val, "provider_status": "Inactive",
+               "provider_status_date": latest,
+               "provider_status_source": f"{group} — absent from statements since {floor[:7]}"}
+        db.table(deal["source"]).update(upd).eq("id", deal["id"]).execute()
+        audit(db, deal["source"], deal["id"], "status_deactivated",
+              {col: "ACTIVE"}, upd,
+              reason=f"{group}: no payment on the last 3 monthly statements", actor=actor)
+        deal["active"] = False
+        deal["provider_status"] = "Inactive"
+        n += 1
+    return {"deactivated": n}
