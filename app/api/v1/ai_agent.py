@@ -809,12 +809,26 @@ def command_center(user: UserContext = Depends(require_admin)):
                           "unknown_accounts": issues.get("unknown", 0),
                           "open_dollars": round(issues.get("dollars", 0.0), 2)})
 
+    meters = {
+        "commercial": (db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE")
+                       .ilike("meter_type", "%commercial%").limit(1).execute().count or 0)
+                      + (db.table("lead_deals").select("id", count="exact").eq("status", "Active")
+                         .ilike("product_type", "%commercial%").limit(1).execute().count or 0),
+        "residential": (db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE")
+                        .ilike("meter_type", "%residential%").limit(1).execute().count or 0)
+                       + (db.table("lead_deals").select("id", count="exact").eq("status", "Active")
+                          .ilike("product_type", "%residential%").limit(1).execute().count or 0),
+        "unknown": (db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE")
+                    .is_("meter_type", "null").limit(1).execute().count or 0),
+    }
+
     return {
         "kpis": {
             **(bh.get("book") or {}),
             "open_dispute_dollars": total_dollars,
             "open_disputes": total_disputes,
         },
+        "meters": meters,
         "months": bh.get("months", []),
         "growth": bh.get("growth", []),
         "providers": scorecard,
