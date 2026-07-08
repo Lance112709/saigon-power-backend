@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query, Depends
 from typing import Optional
+import re
 from datetime import date, datetime, timezone, timedelta
 from app.db.client import get_client
 from app.auth.deps import require_manager, get_current_user, UserContext
@@ -316,14 +317,40 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
     today = date.today()
     cutoff = date(today.year + 2, today.month, 1)
 
-    # kWh/month assumptions by meter type (Texas averages)
-    KWH_DEFAULTS = {"Residential": 1100.0, "Commercial": 2500.0}
-    DEFAULT_KWH = 1100.0
+    # Real trailing usage per ESI ID from the last 5 statement months;
+    # flat Texas averages are only the fallback for meters never seen
+    # on a statement.
+    DEFAULT_RES_KWH = 1100.0
+    DEFAULT_COM_KWH = 2500.0
+
+    def _default_kwh(meter_type: str) -> float:
+        return DEFAULT_COM_KWH if "commercial" in (meter_type or "").lower() else DEFAULT_RES_KWH
+
+    usage_floor = (today.replace(day=1) - timedelta(days=155)).isoformat()
+    usage_sum: dict = {}
+    usage_months: dict = {}
+    u_off = 0
+    while True:
+        page = db.table("actual_commissions").select("raw_esiid, raw_kwh, billing_month") \
+            .gte("billing_month", usage_floor).order("id").range(u_off, u_off + 999).execute().data or []
+        for r in page:
+            kwh = float(r.get("raw_kwh") or 0)
+            es = re.sub(r"\D", "", r.get("raw_esiid") or "")
+            if not es or kwh <= 0:
+                continue
+            usage_sum[es] = usage_sum.get(es, 0.0) + kwh
+            usage_months.setdefault(es, set()).add(r["billing_month"][:7])
+        if len(page) < 1000:
+            break
+        u_off += 1000
+    usage_avg = {es: usage_sum[es] / len(m) for es, m in usage_months.items() if m}
 
     monthly: dict = {}
     by_supplier: dict = {}
     contributing = 0
     skipped = 0
+    usage_based = 0
+    not_projected = {"expired_or_month_to_month": 0, "missing_adder": 0, "missing_end_date": 0}
 
     def _next_month(d: date) -> date:
         return (d.replace(day=28) + timedelta(days=4)).replace(day=1)
@@ -341,17 +368,31 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
             by_supplier[supplier] = by_supplier.get(supplier, 0) + commission_mo
             cur = _next_month(cur)
 
-    # ── Source 1: lead_deals (est_kwh * adder) ───────────────────────────────
+    # ── Source 1: lead_deals (real usage, else est_kwh) ─────────────────────
     ld_offset = 0
     while True:
         rows = db.table("lead_deals").select(
-            "est_kwh, adder, end_date, supplier, status"
+            "esiid, est_kwh, adder, end_date, supplier, status"
         ).eq("status", "Active").range(ld_offset, ld_offset + 999).execute().data or []
         for d in rows:
-            kwh   = float(d.get("est_kwh") or 0)
+            es = re.sub(r"\D", "", d.get("esiid") or "")
+            real = usage_avg.get(es)
+            kwh   = real or float(d.get("est_kwh") or 0)
             adder = float(d.get("adder") or 0)
             end_raw = (d.get("end_date") or "")[:10]
-            if not kwh or not adder or not end_raw:
+            if not adder:
+                not_projected["missing_adder"] += 1
+                skipped += 1
+                continue
+            if adder > 0.05 or adder < 0.0005:
+                not_projected["suspect_adder"] = not_projected.get("suspect_adder", 0) + 1
+                skipped += 1
+                continue
+            if not end_raw:
+                not_projected["missing_end_date"] += 1
+                skipped += 1
+                continue
+            if not kwh:
                 skipped += 1
                 continue
             try:
@@ -359,22 +400,36 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
             except Exception:
                 skipped += 1
                 continue
+            if end_d <= today:
+                not_projected["expired_or_month_to_month"] += 1
+                skipped += 1
+                continue
+            if real:
+                usage_based += 1
             _project(kwh, adder, end_d, d.get("supplier") or "Unknown")
         if len(rows) < 1000:
             break
         ld_offset += 1000
 
-    # ── Source 2: crm_deals (assumed kWh by meter_type * adder) ─────────────
+    # ── Source 2: crm_deals (real usage, else meter-type average) ───────────
     cd_offset = 0
     while True:
         rows = db.table("crm_deals").select(
-            "adder, meter_type, contract_end_date, provider, deal_status"
-        ).eq("deal_status", "ACTIVE").not_.is_("adder", "null").not_.is_("contract_end_date", "null").range(cd_offset, cd_offset + 999).execute().data or []
+            "esiid, adder, meter_type, contract_end_date, provider, deal_status"
+        ).eq("deal_status", "ACTIVE").range(cd_offset, cd_offset + 999).execute().data or []
         for d in rows:
             adder = float(d.get("adder") or 0)
-            kwh   = KWH_DEFAULTS.get(d.get("meter_type") or "", DEFAULT_KWH)
+            if not adder:
+                not_projected["missing_adder"] += 1
+                skipped += 1
+                continue
+            if adder > 0.05 or adder < 0.0005:
+                not_projected["suspect_adder"] = not_projected.get("suspect_adder", 0) + 1
+                skipped += 1
+                continue
             end_raw = (d.get("contract_end_date") or "")[:10]
-            if not adder or not end_raw:
+            if not end_raw:
+                not_projected["missing_end_date"] += 1
                 skipped += 1
                 continue
             try:
@@ -382,6 +437,15 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
             except Exception:
                 skipped += 1
                 continue
+            if end_d <= today:
+                not_projected["expired_or_month_to_month"] += 1
+                skipped += 1
+                continue
+            es = re.sub(r"\D", "", d.get("esiid") or "")
+            real = usage_avg.get(es)
+            kwh = real or _default_kwh(d.get("meter_type"))
+            if real:
+                usage_based += 1
             _project(kwh, adder, end_d, d.get("provider") or "Unknown")
         if len(rows) < 1000:
             break
@@ -395,7 +459,9 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
         "total_projected": round(total, 2),
         "avg_monthly": round(total / len(monthly), 2) if monthly else 0,
         "contributing_deals": contributing,
+        "usage_based_deals": usage_based,
         "total_in_report": contributing + skipped,
+        "not_projected": not_projected,
         "months_out": len(sorted_months),
     }
 
