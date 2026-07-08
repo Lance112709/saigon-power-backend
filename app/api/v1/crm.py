@@ -152,6 +152,9 @@ def list_customers(
     provider: Optional[str] = Query(None),
     deal_status: Optional[str] = Query(None),
     meter_type: Optional[str] = Query(None),
+    source: Optional[str] = Query(None, description="exact notes value, or __manual__ for none"),
+    date_from: Optional[str] = Query(None, description="created on/after YYYY-MM-DD"),
+    date_to: Optional[str] = Query(None, description="created on/before YYYY-MM-DD"),
     limit: int = Query(50),
     offset: int = Query(0),
     user: UserContext = Depends(get_current_user),
@@ -159,48 +162,46 @@ def list_customers(
     db = get_client()
     agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
 
-    # When filtering by deal_status or provider, pre-fetch matching customer IDs from crm_deals
-    # so pagination operates on the filtered set, not the full customer list.
-    filter_ids: Optional[list] = None
-    if deal_status or provider or agent_name or meter_type:
-        dq = db.table("crm_deals").select("customer_id")
-        if deal_status:
-            dq = dq.eq("deal_status", deal_status.upper())
-        if provider:
-            dq = dq.ilike("provider", provider)
-        if agent_name:
-            dq = dq.ilike("sales_agent", agent_name)
-        if meter_type:
-            dq = dq.ilike("meter_type", f"%{meter_type}%")
-        filter_ids = list({r["customer_id"] for r in dq.execute().data if r.get("customer_id")})
-        if not filter_ids:
-            return []
-
+    # Deal-level filters use an inner-join embed so PostgREST filters and
+    # paginates server-side (an id pre-fetch breaks past 1000 customers).
+    deal_filtered = bool(deal_status or provider or agent_name or meter_type)
+    embed = "crm_deals!inner" if deal_filtered else "crm_deals"
     q = db.table("crm_customers").select(
         "id, full_name, first_name, last_name, email, phone, city, state, notes, created_at, "
-        "crm_deals(id, deal_status, provider, sales_agent, service_address, business_name)"
+        f"{embed}(id, deal_status, provider, sales_agent, service_address, business_name)"
     )
+    if deal_status:
+        q = q.eq("crm_deals.deal_status", deal_status.upper())
+    if provider:
+        q = q.ilike("crm_deals.provider", provider)
+    if agent_name:
+        q = q.ilike("crm_deals.sales_agent", agent_name)
+    if meter_type:
+        q = q.ilike("crm_deals.meter_type", f"%{meter_type}%")
     if search:
         q = q.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%,phone.ilike.%{search}%")
-    if filter_ids is not None:
-        q = q.in_("id", filter_ids)
+    if source == "__manual__":
+        q = q.is_("notes", "null")
+    elif source:
+        q = q.eq("notes", source)
+    if date_from:
+        q = q.gte("created_at", date_from)
+    if date_to:
+        q = q.lte("created_at", f"{date_to}T23:59:59")
     res = q.order("full_name").range(offset, offset + limit - 1).execute()
 
     results = []
     for c in res.data:
-        deals = c.get("crm_deals", [])
+        deals = c.get("crm_deals", []) or []
         active_count = sum(1 for d in deals if d.get("deal_status") == "ACTIVE")
         active_deals = [d for d in deals if d.get("deal_status") == "ACTIVE"]
-        # For service address: prefer active deal, fall back to any deal
         svc_deals = active_deals or deals
         service_address = svc_deals[0].get("service_address") if svc_deals else None
         business_name = next((d.get("business_name") for d in deals if d.get("business_name")), None)
-        # deal_count reflects the filter context
         visible_deals = deals
         if deal_status:
             visible_deals = [d for d in deals if d.get("deal_status", "").upper() == deal_status.upper()]
-        # REP: prefer active deal's provider, fall back to any deal
-        provider = next((d.get("provider") for d in (active_deals or deals) if d.get("provider")), None)
+        prov = next((d.get("provider") for d in (active_deals or deals) if d.get("provider")), None)
         results.append({
             "id": c["id"],
             "full_name": c["full_name"],
@@ -209,14 +210,51 @@ def list_customers(
             "city": c.get("city"),
             "state": c.get("state"),
             "notes": c.get("notes"),
+            "source": source_label(c.get("notes")),
             "service_address": service_address,
             "business_name": business_name,
-            "provider": provider,
+            "provider": prov,
             "deal_count": len(visible_deals),
             "active_deal_count": active_count,
             "created_at": c.get("created_at"),
         })
     return results
+
+
+def source_label(notes: Optional[str]) -> str:
+    """Short human label for where a customer record came from."""
+    n = (notes or "").strip()
+    if not n:
+        return "Manual"
+    if n == "HubSpot":
+        return "HubSpot"
+    if "transferred to Direct Energy" in n:
+        return "Direct Energy Transfer"
+    if n.endswith("Statement") and len(n) <= 40:
+        return n
+    return n[:28] + ("…" if len(n) > 28 else "")
+
+
+@router.get("/customers/sources")
+def list_customer_sources(user: UserContext = Depends(get_current_user)):
+    """Distinct customer sources with counts, for the list-page filter."""
+    db = get_client()
+    counts: dict = {}
+    off = 0
+    while True:
+        page = db.table("crm_customers").select("notes").order("id") \
+            .range(off, off + 999).execute().data or []
+        for c in page:
+            n = (c.get("notes") or "").strip()
+            counts[n] = counts.get(n, 0) + 1
+        if len(page) < 1000:
+            break
+        off += 1000
+    out = []
+    for n, cnt in sorted(counts.items(), key=lambda kv: -kv[1]):
+        out.append({"value": n if n else "__manual__", "label": source_label(n or None), "count": cnt})
+    return out
+
 
 @router.get("/customers/{id}")
 def get_customer(id: str, user: UserContext = Depends(get_current_user)):
