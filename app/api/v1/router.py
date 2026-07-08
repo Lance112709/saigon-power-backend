@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module
+from app.api.v1 import commission_payments, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -13,6 +13,7 @@ router.include_router(contracts.router, prefix="/contracts", tags=["Contracts"])
 router.include_router(commissions.router, prefix="/commissions", tags=["Commissions"])
 router.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 router.include_router(reconciliation.router, prefix="/reconciliation", tags=["Reconciliation"])
+router.include_router(commission_payments.router, prefix="/commission-payments", tags=["Commission Payments"])
 router.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 router.include_router(crm.router, prefix="/crm", tags=["CRM"])
 router.include_router(leads.router, prefix="/leads", tags=["Leads"])
