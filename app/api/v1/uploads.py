@@ -207,8 +207,8 @@ async def upload_file(
     filename = file.filename or "upload"
     ext = filename.rsplit(".", 1)[-1].lower()
 
-    if ext not in ("csv", "xlsx", "xls"):
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use CSV or Excel.")
+    if ext not in ("csv", "xlsx", "xls", "pdf"):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Use CSV, Excel, or PDF.")
 
     # ── Auto path: recognized provider format ────────────────────────────────
     parsed_auto = detect_and_parse(file_bytes, filename)
@@ -250,6 +250,9 @@ async def upload_file(
         return result
 
     # ── Review path: unknown format → AI column mapping ─────────────────────
+    if ext == "pdf":
+        raise HTTPException(status_code=400,
+                            detail="This PDF isn't a recognized commission statement format.")
     if ext in ("xlsx", "xls"):
         parsed = parse_excel(file_bytes)
     else:

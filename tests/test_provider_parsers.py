@@ -214,3 +214,78 @@ def test_excel_numeric_esiid_not_corrupted():
         df.to_excel(w, sheet_name="Residuals", index=False)
     res = detect_and_parse(buf.getvalue(), "Feb 2026 Saigon Power Statement.xlsx")
     assert res["rows"][0]["esiid"] == "10443720008297350"
+
+
+def _sheet_rows(rows):
+    return pd.DataFrame(rows)
+
+
+def test_tara_xls_statement_parsed():
+    buf = io.BytesIO()
+    rows = [
+        ["Agent Commission"] + [None] * 15,
+        ["Accounts paid 5/1/2025 through 5/31/2025"] + [None] * 15,
+        [None] * 16,
+        ["Rec Type", "Pmt Flag", "Cust ID", "ESI ID", "Cust Status", "Name", "Address",
+         "Bill Date", "Bill No", "Start Date", "End Date", "Due Date", "Posted Date",
+         "KWH", "Comm Rate", "Comm Due"],
+        ["Paid", "+", "2205200361", "1008901001157325183100", "A", "CHAN'S TAILOR",
+         "7818 LOUETTA RD, SPRING, TX 77379", "2025-05-03", "9250516564",
+         "2025-04-01", "2025-05-01", "2025-05-19", "2025-05-03", "566", "0.007", "3.962"],
+        ["Unpaid", "-", "2205200361", "1008901001157325183100", "A", "CHAN'S TAILOR",
+         "7818 LOUETTA RD, SPRING, TX 77379", "2025-06-04", "9250611728",
+         "2025-05-01", "2025-06-02", "2025-06-20", None, "1069", "0.007", "0"],
+    ]
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame(rows).to_excel(w, sheet_name="Agent Commission for Export", index=False, header=False)
+    res = detect_and_parse(buf.getvalue(), "Tara_Saigon Power LLC _20250501-20250531.xlsx")
+    assert res and res["provider_group"] == "Tara Energy"
+    assert res["row_count"] == 1  # Unpaid placeholder rows dropped
+    r = res["rows"][0]
+    assert r["esiid"] == "1008901001157325183100"
+    assert r["amount"] == 3.962 and r["rate"] == 0.007
+    assert r["statement_label"] == "2025-05"
+
+
+def test_reliant_usage_report_parsed():
+    data = xlsx({
+        "Summary": [{"Broker": "Saigon Power LLC", "Payment Month": "2026-05-01",
+                     "Commission Total": "6.33"}],
+        "Sites List": [{"ESID": "1008901020901313930117"}],
+        "Usage Report": [
+            {"Broker": "Saigon Power LLC", "BP: Org. Name 1": "K & K NAILS",
+             "ESID": "1008901020901313930117", "Invoice number": "322001742337",
+             "Strt Bill Per (Cons)": "2026-03-06", "End Bill Per (Cons)": "2026-04-06",
+             "Posting date": "2026-04-08", "Energy Price (Char)": "0.095",
+             "Quant. Energy": "1055", "Broker Fee": "0.006", "Payment": "6.33",
+             "Customer Name": "K & K NAILS", "Start Date": "2022-06-01", "End Date": "2027-05-31"},
+        ],
+    })
+    res = detect_and_parse(data, "Saigon Power LLC_CombMthlyPmts_2026.05.xlsx")
+    assert res and res["provider_group"] == "Reliant Energy"
+    r = res["rows"][0]
+    assert r["amount"] == 6.33 and r["rate"] == 0.006
+    assert r["statement_label"] == "2026-05"
+
+
+def test_apge_residual_parsed():
+    buf = io.BytesIO()
+    rows = [[None] * 13 for _ in range(9)]
+    rows[2][6] = "APG&E Commissions Report"
+    rows[2][10] = "Report Date: May 15, 2026"
+    rows.append(["LDC Account #", "Service Address", "Customer Name", "Period Start",
+                 "Period End", "Payable Date", "State", "Agent Code",
+                 "Commission Rate \n$/MWh", "Energy Usage\nMWh", "Payment", None, None])
+    rows.append(["1008901010187496905100", "11633 Katy Fwy Houston, TX", "OMNLIFE USA",
+                 "2026-02-13", "2026-03-16", "2026-04-09", "TX", "00758",
+                 "6.97", "1.513", "10.55", None, None])
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame(rows).to_excel(w, sheet_name="RESIDUAL", index=False, header=False)
+        pd.DataFrame([[None]]).to_excel(w, sheet_name="SUMMARY", index=False, header=False)
+    res = detect_and_parse(buf.getvalue(), "Saigon Power LLC_2026_05_15.xlsx")
+    assert res and res["provider_group"] == "APG&E"
+    r = res["rows"][0]
+    assert r["amount"] == 10.55
+    assert r["rate"] == 0.00697       # $/MWh converted to $/kWh
+    assert r["usage_kwh"] == 1513.0   # MWh converted to kWh
+    assert r["statement_label"] == "2026-05"

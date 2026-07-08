@@ -81,7 +81,7 @@ def poll_inbox(actor: str = "email-ingest") -> dict:
                     if not fname:
                         continue
                     fname = str(email.header.make_header(email.header.decode_header(fname)))
-                    if not fname.lower().endswith((".xlsx", ".xls")):
+                    if not fname.lower().endswith((".xlsx", ".xls", ".pdf")):
                         continue
                     blob = part.get_payload(decode=True)
                     if not blob or len(blob) > 30_000_000:

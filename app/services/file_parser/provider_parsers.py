@@ -8,6 +8,9 @@ conversion (Texas ESIIDs are 17-22 digits; float64 only holds ~15 digits).
 Supported formats:
   - Discount Power / Cirro / NRG  ("Residuals" sheet)
   - NRG Commercial                (Summary/Commissions/Delinquents statement)
+  - Tara Energy                   (Agent Commission .xls and COMMISSION REPORT .pdf)
+  - Reliant Energy                (CombMthlyPmts / MonthlyPmts workbooks)
+  - APG&E                         (SUMMARY + RESIDUAL workbook, rate in $/MWh)
   - Iron Horse                    (3 generations: "Result", report, broker-report)
   - Chariot Energy                ("Commissions" + "Clawback" sheets)
   - Budget Power                  (Affinity report, .xlsx and legacy .xls)
@@ -33,6 +36,9 @@ CHURN_KEYWORDS = ["going final", "final", "cancelled", "canceled", "churn",
 PROVIDER_SUPPLIERS = {
     "Discount Power/Cirro": {"code": "NRG", "name": "Discount Power"},
     "NRG Commercial":       {"code": "NRGBIZ", "name": "NRG Commercial"},
+    "Tara Energy":          {"code": "TARA", "name": "Tara Energy"},
+    "Reliant Energy":       {"code": "RELIANT", "name": "Reliant Energy"},
+    "APG&E":                {"code": "APGE", "name": "APG&E"},
     "Iron Horse":           {"code": "IRONHORSE", "name": "Iron Horse Power"},
     "Chariot":              {"code": "CHARIOT", "name": "Chariot Energy"},
     "Budget Power":         {"code": "BUDGET", "name": "Budget Power"},
@@ -43,7 +49,10 @@ PROVIDER_SUPPLIERS = {
 CRM_PROVIDER_GROUPS = {
     "nrg": "NRG Commercial", "nrg energy": "NRG Commercial",
     "discount power": "Discount Power/Cirro", "cirro energy": "Discount Power/Cirro",
-    "value power": "Discount Power/Cirro", "reliant": "Discount Power/Cirro",
+    "value power": "Discount Power/Cirro",
+    "reliant": "Reliant Energy", "reliant energy": "Reliant Energy",
+    "tara": "Tara Energy", "tara energy": "Tara Energy",
+    "apg&e": "APG&E", "apge": "APG&E",
     "iron horse": "Iron Horse",
     "chariot": "Chariot", "chariot energy": "Chariot",
     "budget power": "Budget Power",
@@ -393,6 +402,194 @@ def _parse_cleansky(xl, path_label, warnings):
     return rows if found else None
 
 
+
+
+def _tara_label(text):
+    m = re.search(r"Accounts paid\s+(\d{1,2})/(\d{1,2})/(\d{4})", str(text or ""))
+    return f"{m.group(3)}-{int(m.group(1)):02d}" if m else ""
+
+
+def _parse_tara_xls(xl, path_label, warnings):
+    sheet = next((s for s in xl.sheet_names if s.lower().startswith("agent commission")), None)
+    if not sheet:
+        return None
+    df = pd.read_excel(xl, sheet_name=sheet, dtype=str, header=None)
+    label, header_i = "", None
+    for i in range(min(8, len(df))):
+        row0 = _s(df.iloc[i, 0])
+        if row0.startswith("Accounts paid"):
+            label = _tara_label(row0)
+        if row0 == "Rec Type":
+            header_i = i
+            break
+    if header_i is None:
+        return None
+    cols = [_s(c) for c in df.iloc[header_i]]
+    body = df.iloc[header_i + 1:]
+    body.columns = cols + [f"x{i}" for i in range(len(body.columns) - len(cols))]
+    rows = []
+    for _, r in body.iterrows():
+        if _s(r.get("Rec Type")) != "Paid":
+            continue  # Unpaid/Outside rows are $0 placeholders for next month
+        es = normalize_esiid(r.get("ESI ID"))
+        amt = _f(r.get("Comm Due"))
+        if not es or amt is None:
+            continue
+        rows.append(_mk_row(
+            es, customer_name=_s(r.get("Name")), address=_s(r.get("Address")),
+            usage_kwh=_f(r.get("KWH")), rate=_f(r.get("Comm Rate")), amount=amt,
+            service_start=_d(r.get("Start Date")), service_end=_d(r.get("End Date")),
+            provider_status=_s(r.get("Cust Status")),
+            statement_label=label, raw=_clean_raw(r.to_dict()),
+        ))
+    return rows
+
+
+def parse_tara_pdf(file_bytes: bytes, filename: str):
+    """Tara Energy COMMISSION REPORT pdf -> normalized rows (same shape as
+    the Excel parsers). Returns None if the pdf isn't a Tara statement."""
+    try:
+        import pdfplumber
+    except ImportError:
+        return None
+    acct_re = re.compile(r"^(\d{9,11})\s+(\d{17,22})\s+(.+?)\s+([A-Z])$")
+    pay_re = re.compile(
+        r"^([+*o-])\s+(\d+)\s+(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})\s+"
+        r"(\d{1,2}/\d{1,2}/\d{4})\s+(\d{1,2}/\d{1,2}/\d{4})(?:\s+(\d{1,2}/\d{1,2}/\d{4}))?\s+"
+        r"([\d,]+)\s+([\d.]+)\s+\$([\d,.]+)$")
+    rows, label = [], ""
+    cur = None
+    try:
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            if not pdf.pages:
+                return None
+            first = pdf.pages[0].extract_text() or ""
+            if "COMMISSION REPORT" not in first or "Accounts paid" not in first:
+                return None
+            label = _tara_label(first)
+            for page in pdf.pages:
+                for line in (page.extract_text() or "").splitlines():
+                    line = line.strip()
+                    m = acct_re.match(line)
+                    if m:
+                        cur = {"esiid": normalize_esiid(m.group(2)),
+                               "name_addr": m.group(3), "status": m.group(4)}
+                        continue
+                    m = pay_re.match(line)
+                    if m and cur:
+                        if m.group(1) != "+":
+                            continue  # pending/outside rows are $0 placeholders
+                        amt = _f(m.group(10))
+                        if amt is None:
+                            continue
+                        rows.append(_mk_row(
+                            cur["esiid"], customer_name=cur["name_addr"][:200],
+                            usage_kwh=_f(m.group(8)), rate=_f(m.group(9)), amount=amt,
+                            service_start=_d(m.group(3)), service_end=_d(m.group(4)),
+                            provider_status=cur["status"], statement_label=label,
+                            raw={"bill_no": m.group(2), "paid_date": _d(m.group(7)) or ""},
+                        ))
+    except Exception:
+        return None
+    return rows if rows else None
+
+
+def _parse_reliant(xl, path_label, warnings):
+    rows = []
+    if "Usage Report" in xl.sheet_names:  # 2025+ CombMthlyPmts format
+        label = ""
+        if "Summary" in xl.sheet_names:
+            s = pd.read_excel(xl, sheet_name="Summary", dtype=str)
+            pm = next((v for v in s.get("Payment Month", []) if _d(v)), None)
+            label = _d(pm)[:7] if pm else ""
+        df = pd.read_excel(xl, sheet_name="Usage Report", dtype=str).dropna(how="all")
+        if "ESID" not in df.columns or "Broker Fee" not in df.columns:
+            return None
+        amt_col = "Payment" if "Payment" in df.columns else "Total"
+        for _, r in df.iterrows():
+            es = normalize_esiid(r.get("ESID"))
+            amt = _f(r.get(amt_col))
+            if not es or amt is None:
+                continue
+            rows.append(_mk_row(
+                es, customer_name=_s(r.get("Customer Name")) or _s(r.get("BP: Org. Name 1")),
+                usage_kwh=_f(r.get("Quant. Energy")), rate=_f(r.get("Broker Fee")), amount=amt,
+                service_start=_d(r.get("Strt Bill Per (Cons)")), service_end=_d(r.get("End Bill Per (Cons)")),
+                contract_start=_d(r.get("Start Date")), contract_end=_d(r.get("End Date")),
+                statement_label=label, raw=_clean_raw(r.to_dict()),
+            ))
+        return rows
+    if "Report" in xl.sheet_names and "Sites" in xl.sheet_names:  # 2024 MonthlyPmts format
+        df = pd.read_excel(xl, sheet_name="Report", dtype=str, header=None)
+        label, header_i = "", None
+        for i in range(min(6, len(df))):
+            if _s(df.iloc[i, 0]) == "POST DATE":
+                m = re.search(r"(\d{1,2})/\d{1,2}/(\d{4})", _s(df.iloc[i, 1]))
+                if m:
+                    label = f"{m.group(2)}-{int(m.group(1)):02d}"
+            if _s(df.iloc[i, 0]) == "Business Partner":
+                header_i = i
+                break
+        if header_i is None:
+            return None
+        cols = [_s(c) for c in df.iloc[header_i]]
+        body = df.iloc[header_i + 1:]
+        body.columns = cols + [f"x{i}" for i in range(len(body.columns) - len(cols))]
+        for _, r in body.iterrows():
+            es = normalize_esiid(r.get("ESID"))
+            amt = _f(r.get("Total"))
+            if not es or amt is None:
+                continue
+            rows.append(_mk_row(
+                es, customer_name=_s(r.get("Name")) or _s(r.get("BP: Org. Name 1")),
+                usage_kwh=_f(r.get("Quant. Energy")), rate=_f(r.get("Broker Fee")), amount=amt,
+                service_start=_d(r.get("Strt Bill Per (Cons)")), service_end=_d(r.get("End Bill Per (Cons)")),
+                statement_label=label, raw=_clean_raw(r.to_dict()),
+            ))
+        return rows
+    return None
+
+
+def _parse_apge(xl, path_label, warnings):
+    if "RESIDUAL" not in xl.sheet_names:
+        return None
+    df = pd.read_excel(xl, sheet_name="RESIDUAL", dtype=str, header=None)
+    label, header_i = "", None
+    for i in range(min(15, len(df))):
+        vals = [_s(v) for v in df.iloc[i]]
+        for v in vals:
+            m = re.search(r"Report Date:\s*([A-Za-z]+)\s+\d{1,2},\s*(\d{4})", v)
+            if m:
+                mi = MONTHS.get(m.group(1).lower())
+                if mi:
+                    label = f"{m.group(2)}-{mi:02d}"
+        if "LDC Account #" in vals:
+            header_i = i
+            break
+    if header_i is None:
+        return None
+    cols = [re.sub(r"\s+", " ", _s(c)) for c in df.iloc[header_i]]
+    body = df.iloc[header_i + 1:]
+    body.columns = cols + [f"x{i}" for i in range(len(body.columns) - len(cols))]
+    rows = []
+    for _, r in body.iterrows():
+        es = normalize_esiid(r.get("LDC Account #"))
+        amt = _f(r.get("Payment"))
+        if not es or amt is None:
+            continue
+        rate_mwh = _f(r.get("Commission Rate $/MWh"))
+        usage_mwh = _f(r.get("Energy Usage MWh"))
+        rows.append(_mk_row(
+            es, customer_name=_s(r.get("Customer Name")), address=_s(r.get("Service Address")),
+            usage_kwh=round(usage_mwh * 1000, 1) if usage_mwh is not None else None,
+            rate=round(rate_mwh / 1000, 6) if rate_mwh is not None else None,
+            amount=amt,
+            service_start=_d(r.get("Period Start")), service_end=_d(r.get("Period End")),
+            statement_label=label, raw=_clean_raw(r.to_dict()),
+        ))
+    return rows
+
+
 _PARSERS = [
     ("Discount Power/Cirro", _parse_dp),
     ("NRG Commercial", _parse_nrg_business),  # before Chariot: both have a Commissions sheet
@@ -400,6 +597,9 @@ _PARSERS = [
     ("CleanSky", _parse_cleansky),
     ("Iron Horse", _parse_iron_horse),
     ("Budget Power", _parse_budget),  # after Chariot: both use Premise ID columns
+    ("Tara Energy", _parse_tara_xls),
+    ("Reliant Energy", _parse_reliant),
+    ("APG&E", _parse_apge),
 ]
 
 
@@ -410,17 +610,26 @@ def detect_and_parse(file_bytes: bytes, filename: str):
              file_hash, row_count, total_amount, going_final}
     """
     ext = filename.rsplit(".", 1)[-1].lower()
-    if ext not in ("xlsx", "xls"):
+    if ext not in ("xlsx", "xls", "pdf"):
         return None
-    engine = "xlrd" if ext == "xls" else None
     warnings = []
-    try:
-        xl = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
-    except Exception as e:
-        return None
-
     file_label = label_from_filename(filename)
-    for group, parser in _PARSERS:
+
+    if ext == "pdf":
+        pdf_rows = parse_tara_pdf(file_bytes, filename)
+        if pdf_rows is None:
+            return None
+        candidates = [("Tara Energy", lambda *_: pdf_rows)]
+        xl = None
+    else:
+        engine = "xlrd" if ext == "xls" else None
+        try:
+            xl = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
+        except Exception:
+            return None
+        candidates = _PARSERS
+
+    for group, parser in candidates:
         try:
             rows = parser(xl, file_label, warnings)
         except Exception as e:
