@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import commercial_pricing, commission_payments, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre
+from app.api.v1 import commercial_pricing, commission_payments, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -30,4 +30,3 @@ router.include_router(agent_portal.router, prefix="/agent-portal", tags=["Agent 
 router.include_router(enrollments.router, prefix="/enrollments", tags=["Enrollments"])
 router.include_router(customer_portal.router, prefix="/portal", tags=["Customer Portal"])
 router.include_router(search_module.router, prefix="/search", tags=["Search"])
-router.include_router(giadienre.router, prefix="/giadienre", tags=["GiaDienRe"])
