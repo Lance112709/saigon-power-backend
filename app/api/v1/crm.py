@@ -153,6 +153,7 @@ def list_customers(
     deal_status: Optional[str] = Query(None),
     meter_type: Optional[str] = Query(None),
     source: Optional[str] = Query(None, description="exact notes value, or __manual__ for none"),
+    missing_contact: Optional[bool] = Query(None, description="true = no phone and no email on file"),
     date_from: Optional[str] = Query(None, description="created on/after YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="created on/before YYYY-MM-DD"),
     limit: int = Query(50),
@@ -184,6 +185,8 @@ def list_customers(
         q = q.is_("notes", "null")
     elif source:
         q = q.eq("notes", source)
+    if missing_contact:
+        q = q.is_("phone", "null").is_("email", "null")
     if date_from:
         q = q.gte("created_at", date_from)
     if date_to:
