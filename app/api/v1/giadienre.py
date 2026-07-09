@@ -661,7 +661,6 @@ def billing_pay_session(data: dict = Body(...)):
             street=sub.get("service_address"), city=sub.get("city"),
             postal_code=sub.get("zip"),
             customer_code=sub.get("helcim_customer_code"),
-            invoice_number=f"GDR-{str(sub['id'])[:8].upper()}",
         )
     except helcim.HelcimError as e:
         audit(db, "giadienre_subscriptions", sub["id"], "helcim_error", None,

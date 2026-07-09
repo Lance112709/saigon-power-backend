@@ -56,8 +56,10 @@ def _headers() -> dict:
     token = os.environ.get("HELCIM_API_TOKEN", "").strip()
     if not token:
         raise HelcimNotConfigured()
-    return {"api-token": token, "accept": "application/json",
-            "content-type": "application/json"}
+    # Helcim tokens can contain non-latin-1 characters; httpx only sends
+    # them if the header value is passed as raw UTF-8 bytes (as curl does).
+    return {b"api-token": token.encode("utf-8"), b"accept": b"application/json",
+            b"content-type": b"application/json"}
 
 
 def _post(path: str, body: dict, extra_headers: Optional[dict] = None) -> dict:
@@ -99,18 +101,17 @@ def initialize_purchase(amount: float, contact_name: str,
         body["invoiceNumber"] = invoice_number[:32]
     if customer_code:
         body["customerCode"] = customer_code
-    else:
-        billing = {"name": contact_name}
-        if street:
-            billing["street1"] = street[:100]
+    elif street and postal_code:
+        # Helcim requires street1 + postalCode when customerRequest is sent;
+        # without a full address we omit it — Helcim still auto-creates the
+        # customer from the card payment and returns its customerCode.
+        billing = {"name": contact_name, "street1": street[:100],
+                   "postalCode": postal_code[:10],
+                   "country": "USA", "province": "TX"}
         if city:
             billing["city"] = city[:60]
-        if postal_code:
-            billing["postalCode"] = postal_code[:10]
         if email:
             billing["email"] = email[:200]
-        billing["country"] = "USA"
-        billing["province"] = "TX"
         req = {"contactName": contact_name[:100], "billingAddress": billing}
         if phone:
             req["cellPhone"] = phone[:30]
@@ -134,13 +135,8 @@ def initialize_verify(customer_code: Optional[str] = None,
     }
     if customer_code:
         body["customerCode"] = customer_code
-    elif contact_name:
-        req: dict = {"contactName": contact_name[:100],
-                     "billingAddress": {"name": contact_name[:100], "country": "USA",
-                                        **({"email": email[:200]} if email else {})}}
-        if phone:
-            req["cellPhone"] = phone[:30]
-        body["customerRequest"] = req
+    # without an existing customerCode, Helcim auto-creates the customer from
+    # the card verify and returns its customerCode in the transaction event
     return _post("/helcim-pay/initialize", body)
 
 
