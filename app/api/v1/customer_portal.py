@@ -47,6 +47,12 @@ def _find_customer(db, p10: str) -> Optional[dict]:
     for c in _fetch(db, "crm_customers", "id, full_name, phone"):
         if phone10(c.get("phone")) == p10:
             return {"kind": "customer", "id": c["id"], "name": c.get("full_name") or ""}
+    try:
+        for s in _fetch(db, "giadienre_subscriptions", "id, full_name, phone_digits"):
+            if phone10(s.get("phone_digits")) == p10:
+                return {"kind": "giadienre", "id": s["id"], "name": s.get("full_name") or ""}
+    except Exception:
+        pass
     return None
 
 
@@ -184,9 +190,34 @@ def me(user: dict = Depends(portal_user)):
     referrals = [e for e in _fetch(db, "enrollments", "id, status, source, created_at")
                  if f"ref:{ref_code}" in (e.get("source") or "")]
 
+    # GiaDienRe membership (website subscription), matched by phone
+    membership = None
+    try:
+        rows = db.table("giadienre_subscriptions").select("*") \
+            .or_(f"phone_digits.eq.{p10},phone_digits.eq.1{p10}") \
+            .order("created_at", desc=True).limit(1).execute().data
+        if rows:
+            s = rows[0]
+            membership = {
+                "id": s["id"],
+                "plan_id": s.get("plan_id"),
+                "plan_name": s.get("plan_name"),
+                "billing_cycle": s.get("billing_cycle"),
+                "status": s.get("status"),
+                "subscribed_at": s.get("subscribed_at"),
+                "card_last4": s.get("card_last4"),
+                "card_brand": s.get("card_brand"),
+                "card_expiry": s.get("card_expiry"),
+                "last_payment_at": s.get("last_payment_at"),
+                "next_billing_date": s.get("next_billing_date"),
+            }
+    except Exception:
+        pass  # membership table may predate this feature
+
     return {
         "name": user.get("name") or "",
         "phone_tail": p10[-4:],
+        "membership": membership,
         "plans": plans,
         "enrollments": [{k: v for k, v in e.items() if k != "phone"} for e in enrollments[:10]],
         "referral": {

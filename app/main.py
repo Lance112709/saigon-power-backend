@@ -136,4 +136,4 @@ app.include_router(router)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "Saigon Power API", "version": "giadienre-v2"}
+    return {"status": "ok", "service": "Saigon Power API", "version": "giadienre-v5"}
