@@ -102,6 +102,8 @@ def update_provider(provider_id: str, payload: dict, user: UserContext = Depends
         upd["active"] = bool(payload["active"])
     if "name" in payload and str(payload["name"]).strip():
         upd["name"] = str(payload["name"]).strip()
+    if "auto_publish" in payload:
+        upd["auto_publish"] = bool(payload["auto_publish"])
     row = db.table("pricing_providers").update(upd).eq("id", provider_id).execute().data[0]
     audit(db, "pricing_providers", provider_id, "update", old[0], upd,
           reason="Pricing provider settings changed", actor=user.email or "admin")
@@ -182,16 +184,15 @@ def preview_upload(upload_id: str, user: UserContext = Depends(require_admin)):
     return {"upload": u[0], "preview": _preview_payload(db, u[0], prov)}
 
 
-@router.post("/uploads/{upload_id}/publish")
-def publish_upload(upload_id: str, user: UserContext = Depends(require_admin)):
-    db = get_client()
+def publish_upload_internal(db, upload_id: str, actor: str) -> dict:
+    """Publish a version and archive the provider's previous published one.
+    Shared by the admin endpoint and the Phase 2 email ingest."""
     u = db.table("pricing_uploads").select("*").eq("id", upload_id).limit(1).execute().data
     if not u:
         raise HTTPException(status_code=404, detail="Upload not found")
     u = u[0]
     if u["status"] == "published":
         return u
-    # archive the currently published version for this provider (history kept)
     db.table("pricing_uploads").update({"status": "archived"}) \
         .eq("provider_id", u["provider_id"]).eq("status", "published").execute()
     row = db.table("pricing_uploads").update({
@@ -199,8 +200,20 @@ def publish_upload(upload_id: str, user: UserContext = Depends(require_admin)):
     }).eq("id", upload_id).execute().data[0]
     audit(db, "pricing_uploads", upload_id, "publish", {"status": u["status"]},
           {"status": "published", "version": u["version"]},
-          reason="Pricing published to sales agents", actor=user.email or "admin")
+          reason="Pricing published to sales agents", actor=actor)
     return row
+
+
+@router.post("/uploads/{upload_id}/publish")
+def publish_upload(upload_id: str, user: UserContext = Depends(require_admin)):
+    return publish_upload_internal(get_client(), upload_id, user.email or "admin")
+
+
+@router.post("/poll-email")
+def poll_email(user: UserContext = Depends(require_admin)):
+    """Manual trigger for the Phase 2 inbox check (also runs on a schedule)."""
+    from app.services.pricing_email_ingest import poll_pricing_inbox
+    return poll_pricing_inbox(actor=user.email or "admin")
 
 
 @router.post("/uploads/{upload_id}/archive")

@@ -66,6 +66,14 @@ def _run_email_ingest():
     except Exception:
         pass
 
+def _run_pricing_ingest():
+    try:
+        from app.services.pricing_email_ingest import poll_pricing_inbox
+        poll_pricing_inbox()
+    except Exception:
+        pass
+
+
 def _run_statement_watchdog():
     """Providers pay by the 7th. On the 10th, alert if any provider's
     statement for last month has not been uploaded and reconciled."""
@@ -83,6 +91,9 @@ try:
     scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
     scheduler.add_job(_run_statement_watchdog, "cron", day=10, hour=9, minute=30)
     scheduler.add_job(_run_email_ingest, "cron", day="last", hour=9, minute=0)  # end of month ("30th"; Feb-safe)
+    # Phase 2 pricing automation: NRG emails the matrix each business morning;
+    # poll weekday mornings so agents have fresh rates by the time they log in.
+    scheduler.add_job(_run_pricing_ingest, "cron", day_of_week="mon-fri", hour="6-12", minute="*/20")
     _scheduler_ok = True
 except Exception:
     _scheduler_ok = False
@@ -125,4 +136,4 @@ app.include_router(router)
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "service": "Saigon Power API"}
+    return {"status": "ok", "service": "Saigon Power API", "version": "giadienre-v2"}
