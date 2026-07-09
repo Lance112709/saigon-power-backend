@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import commission_payments, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module
+from app.api.v1 import commercial_pricing, commission_payments, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -14,6 +14,7 @@ router.include_router(commissions.router, prefix="/commissions", tags=["Commissi
 router.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 router.include_router(reconciliation.router, prefix="/reconciliation", tags=["Reconciliation"])
 router.include_router(commission_payments.router, prefix="/commission-payments", tags=["Commission Payments"])
+router.include_router(commercial_pricing.router, prefix="/commercial-pricing", tags=["Commercial Pricing"])
 router.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 router.include_router(crm.router, prefix="/crm", tags=["CRM"])
 router.include_router(leads.router, prefix="/leads", tags=["Leads"])
@@ -29,3 +30,4 @@ router.include_router(agent_portal.router, prefix="/agent-portal", tags=["Agent 
 router.include_router(enrollments.router, prefix="/enrollments", tags=["Enrollments"])
 router.include_router(customer_portal.router, prefix="/portal", tags=["Customer Portal"])
 router.include_router(search_module.router, prefix="/search", tags=["Search"])
+router.include_router(giadienre.router, prefix="/giadienre", tags=["GiaDienRe"])
