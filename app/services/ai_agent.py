@@ -860,6 +860,71 @@ def _full_deal_book(db) -> list:
     return book
 
 
+_MONTH_NAMES = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+                "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+
+
+def _provider_match(names, q: str):
+    """Best provider-name match in the question: full name, or its first
+    distinctive word ('chariot' -> 'Chariot Energy'). Longest match wins."""
+    best = None
+    for name in names:
+        n = (name or "").strip()
+        if len(n) < 3:
+            continue
+        first = n.split()[0].lower()
+        if n.lower() in q or (len(first) >= 3 and first in q.split()) or (len(first) >= 4 and first in q):
+            if best is None or len(n) > len(best):
+                best = n
+    return best
+
+
+def _detect_month(q: str):
+    """'may 2026' / '2026-05' / 'last month' -> 'YYYY-MM' (or None)."""
+    import re as _re
+    q = q.lower()
+    m = _re.search(r"\b(20\d{2})-(\d{2})\b", q)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+    m = _re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?,?\s+(20\d{2})\b", q)
+    if m:
+        return f"{m.group(2)}-{_MONTH_NAMES[m.group(1)]:02d}"
+    today = _now().date()
+    if "last month" in q:
+        y, mo = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+        return f"{y}-{mo:02d}"
+    if "this month" in q:
+        return f"{today.year}-{today.month:02d}"
+    return None
+
+
+def _extract_esiid(q: str):
+    import re as _re
+    m = _re.search(r"\b(\d{15,22})\b", q)
+    return m.group(1) if m else None
+
+
+_SEARCH_TRIGGERS = ("find ", "look up ", "lookup ", "search for ", "search ",
+                    "phone number for ", "phone for ", "email for ")
+_SEARCH_STOPWORDS = {"customer", "customers", "client", "account", "the", "a", "an",
+                     "for", "named", "name", "called", "info", "details", "please",
+                     "number", "phone", "email", "of", "me", "up"}
+
+
+def _extract_search_term(message: str):
+    """'find customer Julie Vu' -> 'Julie Vu' (or None when not a lookup)."""
+    low = message.lower()
+    for t in _SEARCH_TRIGGERS:
+        idx = low.find(t)
+        if idx >= 0:
+            rest = message[idx + len(t):]
+            words = [w.strip("?.,!\"'") for w in rest.split()]
+            keep = [w for w in words if w.lower() not in _SEARCH_STOPWORDS and w]
+            term = " ".join(keep[:4]).strip()
+            return term if len(term) >= 3 else None
+    return None
+
+
 def _keyword_chat(message: str, history: list) -> str:
     db = get_client()
     q = message.lower()
@@ -869,6 +934,119 @@ def _keyword_chat(message: str, history: list) -> str:
         return any(k in q for k in keywords)
 
     parts = []
+
+    # ── Account lookup by ESI ID (a long digit string in the question) ──
+    esiid = _extract_esiid(q)
+    if esiid:
+        lines = []
+        deal = None
+        ld = db.table("lead_deals").select(
+            "status,supplier,adder,est_kwh,end_date,sales_agent,leads(first_name,last_name,phone)") \
+            .eq("esiid", esiid).limit(1).execute().data or []
+        if ld:
+            d, lead = ld[0], (ld[0].get("leads") or {})
+            deal = (f"{lead.get('first_name','')} {lead.get('last_name','')}".strip() or "Unknown",
+                    d.get("supplier"), d.get("status"), d.get("adder"), d.get("end_date"),
+                    d.get("sales_agent"), lead.get("phone"))
+        else:
+            cd = db.table("crm_deals").select(
+                "deal_status,provider,adder,contract_end_date,sales_agent,crm_customers(full_name,phone)") \
+                .eq("esiid", esiid).limit(1).execute().data or []
+            if cd:
+                d, cust = cd[0], (cd[0].get("crm_customers") or {})
+                deal = (cust.get("full_name") or "Unknown", d.get("provider"), d.get("deal_status"),
+                        d.get("adder"), d.get("contract_end_date"), d.get("sales_agent"),
+                        cust.get("phone"))
+        if deal:
+            name, prov, status, adder, end, agent, phone = deal
+            lines.append(f"Customer: {name}" + (f" · {phone}" if phone else ""))
+            lines.append(f"Provider: {prov or '—'} · Status: {status or '—'} · "
+                         f"Adder: {adder if adder is not None else '—'} $/kWh")
+            lines.append(f"Contract ends: {str(end)[:10] if end else 'open'} · Agent: {agent or '—'}")
+        else:
+            lines.append("Not linked to any deal in the CRM.")
+
+        pays = db.table("actual_commissions").select("billing_month,raw_amount,raw_rate") \
+            .eq("raw_esiid", esiid).order("billing_month", desc=True).limit(400).execute().data or []
+        if pays:
+            by_m: dict = {}
+            rate_by_m: dict = {}
+            for p in pays:
+                m = str(p.get("billing_month") or "")[:7]
+                by_m[m] = by_m.get(m, 0.0) + float(p.get("raw_amount") or 0)
+                if p.get("raw_rate") is not None:
+                    rate_by_m.setdefault(m, p["raw_rate"])
+            lines.append("")
+            lines.append(f"Payments: {_fmt_money(sum(by_m.values()))} lifetime across {len(by_m)} months. Recent:")
+            for m in sorted(by_m, reverse=True)[:6]:
+                rate = rate_by_m.get(m)
+                lines.append(f"  {m}: {_fmt_money(by_m[m])}" + (f" @ {rate:g} $/kWh" if rate else ""))
+        else:
+            lines.append("No commission payments recorded for this ESI ID.")
+
+        try:
+            cases = db.table("exception_cases").select("issue_type,workflow_status,estimated_loss,billing_month") \
+                .eq("esiid", esiid).in_("workflow_status", ["open", "investigating", "waiting_on_provider"]) \
+                .limit(10).execute().data or []
+            if cases:
+                lines.append("")
+                lines.append("Open audit cases:")
+                for c in cases:
+                    lines.append(f"  {str(c['billing_month'])[:7]}: {c['issue_type'].replace('_', ' ')} — "
+                                 f"est. {_fmt_money(c.get('estimated_loss') or 0)} ({c['workflow_status'].replace('_', ' ')})")
+        except Exception:
+            pass
+        return _section(f"Account {esiid}", lines)
+
+    # ── Customer / lead lookup by name: "find Julie Vu" ──
+    term = _extract_search_term(message)
+    if term:
+        words = term.split()
+        hits = []
+
+        # customers: every word must appear somewhere in full_name
+        cq = db.table("crm_customers").select("id,full_name,phone,email,city")
+        for w in words:
+            cq = cq.ilike("full_name", f"%{w}%")
+        for c in (cq.limit(6).execute().data or []):
+            hits.append(("Customer", c.get("full_name"), c.get("phone"), c.get("email"),
+                         c.get("city"), c.get("id")))
+
+        # leads: try first+last split, then each word on either column
+        lead_queries = []
+        if len(words) >= 2:
+            lead_queries.append(db.table("leads").select("id,first_name,last_name,status,phone,email")
+                                .ilike("first_name", f"%{words[0]}%")
+                                .ilike("last_name", f"%{words[-1]}%"))
+        for col in ("first_name", "last_name"):
+            lead_queries.append(db.table("leads").select("id,first_name,last_name,status,phone,email")
+                                .ilike(col, f"%{term}%"))
+        seen_ids = set()
+        for lq in lead_queries:
+            for l in (lq.limit(6).execute().data or []):
+                if l.get("id") in seen_ids:
+                    continue
+                seen_ids.add(l.get("id"))
+                nm = f"{l.get('first_name','')} {l.get('last_name','')}".strip()
+                hits.append((f"Lead ({(l.get('status') or '').title()})", nm, l.get("phone"),
+                             l.get("email"), None, l.get("id")))
+        if hits:
+            lines = []
+            cust_ids = [h[5] for h in hits if h[0] == "Customer"]
+            deals_by_cust: dict = {}
+            if cust_ids:
+                for d in (db.table("crm_deals").select("customer_id,provider,deal_status")
+                          .in_("customer_id", cust_ids[:20]).limit(60).execute().data or []):
+                    deals_by_cust.setdefault(d["customer_id"], []).append(
+                        f"{d.get('provider') or '?'} ({(d.get('deal_status') or '').title()})")
+            for kind, nm, phone, email, city, _id in hits[:8]:
+                bits = [b for b in (phone, email, city) if b]
+                line = f"{nm} — {kind}" + (f" · {' · '.join(bits)}" if bits else "")
+                if _id in deals_by_cust:
+                    line += f" · Deals: {', '.join(deals_by_cust[_id][:3])}"
+                lines.append(line)
+            return _section(f"Search results for \"{term}\" — {len(hits)} match(es)", lines)
+        # no matches — fall through so other branches can still answer
 
     # ── Commission audit: "how much does NRG owe us?", disputes, shortfalls ──
     if _want("owe", "owed", "owes", "dispute", "disputes", "shortfall", "underpaid",
@@ -928,13 +1106,14 @@ def _keyword_chat(message: str, history: list) -> str:
         ]
         parts.append(_section("Deals", deal_lines))
 
-        # Commissions
-        comms = db.table("actual_commissions").select("billing_month, raw_amount").order("billing_month", desc=True).limit(500).execute().data or []
+        # Commissions (from reconciliation-run totals — full months, not a row sample)
+        runs = db.table("reconciliation_runs").select("billing_month,total_actual") \
+            .like("notes", '%"engine": "v2"%').order("billing_month", desc=True) \
+            .limit(1000).execute().data or []
         by_month: dict = {}
-        for c in comms:
-            m = (c.get("billing_month") or "")[:7]
-            if m:
-                by_month[m] = by_month.get(m, 0.0) + (c.get("raw_amount") or 0.0)
+        for r in runs:
+            m = str(r.get("billing_month"))[:7]
+            by_month[m] = by_month.get(m, 0.0) + (r.get("total_actual") or 0)
         comm_lines = [f"{m}: {_fmt_money(amt)}" for m, amt in sorted(by_month.items(), reverse=True)[:4]]
         parts.append(_section("Commission Payments", comm_lines or ["No payments recorded yet."]))
 
@@ -950,35 +1129,36 @@ def _keyword_chat(message: str, history: list) -> str:
 
     # ── Agents / sales team (must come before generic "deals" check) ──
     if _want("agent", "agents", "sales", "rep", "team", "staff", "top agent", "performing", "leaderboard", "who is", "who's"):
-        agents = db.table("users").select("id, first_name, last_name, role").eq("role", "sales_agent").execute().data or []
-        deals = db.table("lead_deals").select("sales_agent, status, est_kwh, adder").execute().data or []
-
+        book = _full_deal_book(db)
         agent_map: dict = {}
-        for d in deals:
-            name = d.get("sales_agent") or "Unassigned"
-            if name not in agent_map:
-                agent_map[name] = {"active": 0, "total": 0, "est": 0.0}
-            agent_map[name]["total"] += 1
-            if (d.get("status") or "").lower() == "active":
-                agent_map[name]["active"] += 1
-                agent_map[name]["est"] += float(d.get("est_kwh") or 0) * float(d.get("adder") or 0)
+        for d in book:
+            name = d["agent"].strip() or "Unassigned"
+            key = name.upper()
+            if key not in agent_map:
+                agent_map[key] = {"name": name, "active": 0, "total": 0, "est": 0.0}
+            agent_map[key]["total"] += 1
+            if d["active"]:
+                agent_map[key]["active"] += 1
+                agent_map[key]["est"] += d["est_kwh"] * d["adder"]
 
-        ranked = sorted(agent_map.items(), key=lambda x: -x[1]["active"])
+        ranked = sorted(agent_map.values(), key=lambda x: -x["active"])
         lines = []
-        for i, (name, stats) in enumerate(ranked, 1):
-            lines.append(f"#{i} {name}: {stats['active']} active, {stats['total']} total deals, est. {_fmt_money(stats['est'])}/mo")
-        return _section(f"Sales Team Performance — {len(agents)} agent(s)", lines or ["No agent data found."])
+        for i, stats in enumerate(ranked[:15], 1):
+            lines.append(f"#{i} {stats['name']}: {stats['active']} active, {stats['total']} total deals, "
+                         f"est. {_fmt_money(stats['est'])}/mo")
+        return _section(f"Sales Team Performance — whole book ({len(book)} deals)",
+                        lines or ["No agent data found."])
 
     # ── Expiring / renewals (must come before generic "deals" check) ──
     if _want("expir", "renew", "renewal", "ending", "expire", "soon"):
-        deals = db.table("lead_deals").select("id, supplier, sales_agent, end_date, status").eq("status", "Active").execute().data or []
+        deals = [d for d in _full_deal_book(db) if d["active"]]
         buckets = {"30 days": [], "60 days": [], "90 days": []}
         for d in deals:
             days = _days_until(d.get("end_date"))
             if days is None:
                 continue
-            sup = d.get("supplier") or "Unknown"
-            agent = d.get("sales_agent") or "Unassigned"
+            sup = d["supplier"] or "Unknown"
+            agent = d["agent"].strip() or "Unassigned"
             label = f"{sup} (agent: {agent}) — expires {_days_until_str(d.get('end_date'))}"
             if days <= 30:
                 buckets["30 days"].append(label)
@@ -1011,6 +1191,12 @@ def _keyword_chat(message: str, history: list) -> str:
     # ── Deals / active / pipeline (BOTH deal tables) ──
     if _want("deal", "deals", "active", "pipeline", "contract", "accounts"):
         book = _full_deal_book(db)
+        # provider scoping: "how many active deals with direct energy?"
+        matched = _provider_match({d["supplier"].strip() for d in book if d["supplier"]}, q)
+        scoped_to = matched.upper() if matched else None
+        if scoped_to:
+            first_word = scoped_to.split()[0]
+            book = [d for d in book if first_word in d["supplier"].strip().upper()]
         active = [d for d in book if d["active"]]
         future = [d for d in book if d["future"]]
         est_rev = sum(d["est_kwh"] * d["adder"] for d in active)
@@ -1028,28 +1214,52 @@ def _keyword_chat(message: str, history: list) -> str:
             f"Active deals: {len(active)}",
             f"Future/Pending: {len(future)}",
             f"Est. monthly commission from active: {_fmt_money(est_rev)}",
-            "",
-            "Active deals by provider:",
-        ] + sup_lines
-        return _section(f"Deals — {len(book)} total across the whole book", lines)
+        ]
+        if not scoped_to:
+            lines += ["", "Active deals by provider:"] + sup_lines
+        title = (f"{display.get(scoped_to, scoped_to.title())} deals — {len(book)} total"
+                 if scoped_to else f"Deals — {len(book)} total across the whole book")
+        return _section(title, lines)
 
-    # ── Commissions / money / revenue / finances ──
-    if _want("commission", "commissions", "money", "revenue", "payment", "paid", "earn", "financ", "income"):
-        comms = db.table("actual_commissions").select("billing_month, raw_amount, supplier_id").order("billing_month", desc=True).limit(1000).execute().data or []
-        by_month: dict = {}
-        for c in comms:
-            m = (c.get("billing_month") or "")[:7]
-            if m:
-                by_month[m] = by_month.get(m, 0.0) + (c.get("raw_amount") or 0.0)
-        total = sum(by_month.values())
-        lines = [f"{m}: {_fmt_money(amt)}" for m, amt in sorted(by_month.items(), reverse=True)[:6]]
-        lines.append(f"")
-        lines.append(f"Total recorded: {_fmt_money(total)} across {len(by_month)} months")
+    # ── Commissions / money / revenue — provider- and month-aware ──
+    if _want("commission", "commissions", "money", "revenue", "payment", "paid", "earn", "financ", "income", "received", "receive"):
+        runs = db.table("reconciliation_runs").select(
+            "billing_month,total_actual,supplier_id,suppliers(name)") \
+            .like("notes", '%"engine": "v2"%').order("billing_month", desc=True) \
+            .limit(1000).execute().data or []
 
-        # Also show estimated from active deals (both deal tables)
-        est = sum(d["est_kwh"] * d["adder"] for d in _full_deal_book(db) if d["active"])
-        lines.append(f"Est. monthly commission (active deals): {_fmt_money(est)}")
-        return _section("Commission & Revenue", lines or ["No commission data recorded yet."])
+        month = _detect_month(q)
+        provider = _provider_match(
+            {(r.get("suppliers") or {}).get("name") or "" for r in runs}, q)
+        scoped = [r for r in runs
+                  if (not provider or (r.get("suppliers") or {}).get("name") == provider)
+                  and (not month or str(r.get("billing_month"))[:7] == month)]
+
+        title_bits = [b for b in (provider, month) if b]
+        title = "Commission Received" + (f" — {' · '.join(title_bits)}" if title_bits else "")
+        lines = []
+        if month:
+            total = sum(r.get("total_actual") or 0 for r in scoped)
+            lines.append(f"Received in {month}: {_fmt_money(total)}")
+            for r in sorted(scoped, key=lambda r: -(r.get("total_actual") or 0)):
+                lines.append(f"  {(r.get('suppliers') or {}).get('name', '?')}: "
+                             f"{_fmt_money(r.get('total_actual') or 0)}")
+        else:
+            by_month: dict = {}
+            for r in scoped:
+                m = str(r.get("billing_month"))[:7]
+                by_month[m] = by_month.get(m, 0.0) + (r.get("total_actual") or 0)
+            for m in sorted(by_month, reverse=True)[:8]:
+                lines.append(f"{m}: {_fmt_money(by_month[m])}")
+            lines.append("")
+            lines.append(f"All-time verified received{' from ' + provider if provider else ''}: "
+                         f"{_fmt_money(sum(by_month.values()))} across {len(by_month)} months")
+        if not provider:
+            est = sum(d["est_kwh"] * d["adder"] for d in _full_deal_book(db) if d["active"])
+            lines.append(f"Est. monthly commission (active deals): {_fmt_money(est)}")
+        return _section(title, lines if scoped else
+                        [f"No statements found{' for ' + provider if provider else ''}"
+                         f"{' in ' + month if month else ''}."])
 
 
     # ── Alerts / issues / urgent ──
@@ -1079,11 +1289,12 @@ def _keyword_chat(message: str, history: list) -> str:
     return (
         "I can answer questions about your business. Try asking:\n\n"
         "  • **Summary** — full company overview\n"
-        "  • **Leads** — lead counts and recent prospects\n"
-        "  • **Deals** / **Active deals** — deal pipeline\n"
+        "  • **Active deals** — whole-book counts, or scoped: \"active deals with Direct Energy\"\n"
+        "  • **Commissions** — \"commission received in May 2026\", \"revenue from Chariot\"\n"
+        "  • **Who owes us** — \"how much does Discount Power owe us?\", disputes, shortfalls\n"
+        "  • **Find someone** — \"find Julie Vu\" (customers & leads by name)\n"
+        "  • **An ESI ID** — paste it to see the account, payment history, and open cases\n"
         "  • **Expiring deals** — what's up for renewal\n"
-        "  • **Commissions** / **Revenue** — payment history\n"
-        "  • **Agents** — sales team performance\n"
-        "  • **Alerts** — open issues and warnings\n"
-        "  • **Uploads** — recent commission statements"
+        "  • **Agents** — sales team performance across the whole book\n"
+        "  • **Alerts** / **Uploads** — open issues, recent statements"
     )
