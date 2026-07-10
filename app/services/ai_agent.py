@@ -749,17 +749,50 @@ def _section(title: str, lines: list) -> str:
     return f"**{title}**\n{body}"
 
 
+CHAT_MODEL = "claude-opus-4-8"
+MAX_TOOL_TURNS = 8
+
+
+def _chat_system(ctx_json: str) -> str:
+    from app.services.ai_tools import schema_for_prompt
+    return (EXEC_SYSTEM + """
+
+You have READ-ONLY database tools (query_crm, aggregate_crm) over the CRM. Use them
+to answer with real, current numbers instead of guessing — call aggregate_crm for
+every count/total question and query_crm for record lookups.
+
+Critical domain facts:
+- The deal book lives in TWO tables. lead_deals (status = 'Active') AND crm_deals
+  (deal_status = 'ACTIVE'). Any question about deals, active accounts, or customers
+  must check BOTH and combine the results.
+- adder is the commission rate in $/kWh (0.008 = 8 mils). Estimated monthly
+  commission for a deal = adder x est_kwh.
+- actual_commissions is verified money received; everything else is an estimate.
+- exception_cases / audit_findings / disputes are the commission audit system —
+  money the providers owe us and how we're chasing it.
+- billing_month columns are dates like 2026-05-01 (filter with gte/lt for ranges).
+
+Queryable tables:
+""" + schema_for_prompt() + """
+
+Business context snapshot (may be minutes old — prefer fresh tool queries for numbers):
+""" + ctx_json)
+
+
 def chat_with_context(message: str, history: list) -> str:
-    """CEO-advisor chat over the full business context. Falls back to the
-    keyword engine when no API key is configured or the API errors."""
+    """Agentic CRM chat: Claude answers with live database queries via
+    read-only tools. Falls back to the keyword engine when no API key is
+    configured or the API errors."""
     import json as _json
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if api_key:
         try:
+            from app.services.ai_tools import TOOL_DEFINITIONS, execute_tool
             db = get_client()
             ctx = executive_context(db)
             import anthropic
             client = anthropic.Anthropic(api_key=api_key)
+
             msgs = []
             for h in (history or [])[-10:]:
                 role = h.get("role")
@@ -767,16 +800,64 @@ def chat_with_context(message: str, history: list) -> str:
                 if role in ("user", "assistant") and content:
                     msgs.append({"role": role, "content": content})
             msgs.append({"role": "user", "content": message[:4000]})
-            msg = client.messages.create(
-                model="claude-sonnet-5",
-                max_tokens=1000,
-                system=EXEC_SYSTEM + "\n\nCurrent business context JSON:\n" + _json.dumps(ctx),
-                messages=msgs,
-            )
-            return msg.content[0].text.strip()
+
+            system = _chat_system(_json.dumps(ctx))
+
+            # Manual tool-use loop: run queries until Claude stops asking.
+            response = None
+            for _ in range(MAX_TOOL_TURNS):
+                response = client.messages.create(
+                    model=CHAT_MODEL,
+                    max_tokens=8000,
+                    system=system,
+                    tools=TOOL_DEFINITIONS,
+                    messages=msgs,
+                )
+                if response.stop_reason != "tool_use":
+                    break
+                msgs.append({"role": "assistant", "content": response.content})
+                results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": execute_tool(db, block.name, block.input),
+                        })
+                msgs.append({"role": "user", "content": results})
+
+            if response is not None:
+                text = "\n\n".join(b.text for b in response.content
+                                   if b.type == "text").strip()
+                if text:
+                    return text
         except Exception:
             pass
     return _keyword_chat(message, history)
+
+
+def _full_deal_book(db) -> list:
+    """BOTH deal tables normalized to one shape — lead_deals is only a fraction
+    of the book; crm_deals holds most of it. Every deal count must use this."""
+    from app.services.reconciliation_v2 import fetch_all
+    book = []
+    for d in fetch_all(db, "lead_deals", "status,supplier,sales_agent,est_kwh,adder,end_date"):
+        book.append({"active": (d.get("status") or "").lower() == "active",
+                     "future": (d.get("status") or "").lower() == "future",
+                     "supplier": d.get("supplier") or "Unknown",
+                     "agent": d.get("sales_agent") or "",
+                     "est_kwh": float(d.get("est_kwh") or 0),
+                     "adder": float(d.get("adder") or 0),
+                     "end_date": d.get("end_date")})
+    for d in fetch_all(db, "crm_deals", "deal_status,provider,sales_agent,meter_type,adder,contract_end_date"):
+        book.append({"active": (d.get("deal_status") or "").upper() == "ACTIVE",
+                     "future": (d.get("deal_status") or "").upper() in ("FUTURE", "PENDING"),
+                     "supplier": d.get("provider") or "Unknown",
+                     "agent": d.get("sales_agent") or "",
+                     "est_kwh": 2500.0 if d.get("meter_type") == "Commercial" else 1100.0,
+                     "adder": float(d.get("adder") or 0),
+                     "end_date": d.get("contract_end_date")})
+    return book
 
 
 def _keyword_chat(message: str, history: list) -> str:
@@ -833,11 +914,11 @@ def _keyword_chat(message: str, history: list) -> str:
         lead_lines = [f"{s}: {c}" for s, c in sorted(by_status.items(), key=lambda x: -x[1])]
         parts.append(_section(f"Leads — {len(leads)} total", lead_lines))
 
-        # Deals
-        deals = db.table("lead_deals").select("id, status, supplier, sales_agent, est_kwh, adder, end_date").execute().data or []
-        active = [d for d in deals if (d.get("status") or "").lower() == "active"]
-        future = [d for d in deals if (d.get("status") or "").lower() == "future"]
-        est_rev = sum(float(d.get("est_kwh") or 0) * float(d.get("adder") or 0) for d in active)
+        # Deals (both deal tables — lead_deals + crm_deals)
+        book = _full_deal_book(db)
+        active = [d for d in book if d["active"]]
+        future = [d for d in book if d["future"]]
+        est_rev = sum(d["est_kwh"] * d["adder"] for d in active)
         expiring_30 = [d for d in active if (_days_until(d.get("end_date")) or 999) <= 30]
         deal_lines = [
             f"Active: {len(active)}",
@@ -927,27 +1008,30 @@ def _keyword_chat(message: str, history: list) -> str:
             lines.append(f"{name} — {(l.get('status') or '').title()}")
         return _section(f"Leads — {len(leads)} total", lines)
 
-    # ── Deals / active / pipeline ──
+    # ── Deals / active / pipeline (BOTH deal tables) ──
     if _want("deal", "deals", "active", "pipeline", "contract", "accounts"):
-        deals = db.table("lead_deals").select("id, status, supplier, sales_agent, est_kwh, adder, start_date, end_date").execute().data or []
-        active = [d for d in deals if (d.get("status") or "").lower() == "active"]
-        future = [d for d in deals if (d.get("status") or "").lower() == "future"]
-        est_rev = sum(float(d.get("est_kwh") or 0) * float(d.get("adder") or 0) for d in active)
+        book = _full_deal_book(db)
+        active = [d for d in book if d["active"]]
+        future = [d for d in book if d["future"]]
+        est_rev = sum(d["est_kwh"] * d["adder"] for d in active)
 
         by_supplier: dict = {}
+        display: dict = {}
         for d in active:
-            s = d.get("supplier") or "Unknown"
-            by_supplier[s] = by_supplier.get(s, 0) + 1
-        sup_lines = [f"{s}: {c} deals" for s, c in sorted(by_supplier.items(), key=lambda x: -x[1])[:6]]
+            key = d["supplier"].strip().upper()
+            display.setdefault(key, d["supplier"].strip())
+            by_supplier[key] = by_supplier.get(key, 0) + 1
+        sup_lines = [f"{display[s]}: {c} deals"
+                     for s, c in sorted(by_supplier.items(), key=lambda x: -x[1])[:8]]
 
         lines = [
             f"Active deals: {len(active)}",
             f"Future/Pending: {len(future)}",
             f"Est. monthly commission from active: {_fmt_money(est_rev)}",
             "",
-            "Active deals by supplier:",
+            "Active deals by provider:",
         ] + sup_lines
-        return _section(f"Deals — {len(deals)} total", lines)
+        return _section(f"Deals — {len(book)} total across the whole book", lines)
 
     # ── Commissions / money / revenue / finances ──
     if _want("commission", "commissions", "money", "revenue", "payment", "paid", "earn", "financ", "income"):
@@ -962,9 +1046,8 @@ def _keyword_chat(message: str, history: list) -> str:
         lines.append(f"")
         lines.append(f"Total recorded: {_fmt_money(total)} across {len(by_month)} months")
 
-        # Also show estimated from active deals
-        deals = db.table("lead_deals").select("est_kwh, adder").eq("status", "Active").execute().data or []
-        est = sum(float(d.get("est_kwh") or 0) * float(d.get("adder") or 0) for d in deals)
+        # Also show estimated from active deals (both deal tables)
+        est = sum(d["est_kwh"] * d["adder"] for d in _full_deal_book(db) if d["active"])
         lines.append(f"Est. monthly commission (active deals): {_fmt_money(est)}")
         return _section("Commission & Revenue", lines or ["No commission data recorded yet."])
 

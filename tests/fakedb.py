@@ -110,6 +110,7 @@ class FakeQuery:
             res.data = gone
         else:
             rows = self._matching(table)
+            matched = len(rows)  # like PostgREST count=exact: pre-limit total
             for col, desc in reversed(self.order_by):
                 rows = sorted(rows, key=lambda r: (r.get(col) is None, r.get(col)),
                               reverse=desc)
@@ -119,6 +120,8 @@ class FakeQuery:
             elif self._limit is not None:
                 rows = rows[:self._limit]
             res.data = [dict(r) for r in rows]
+            res.count = matched
+            return res
         res.count = len(res.data or [])
         return res
 
