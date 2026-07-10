@@ -23,18 +23,28 @@ import httpx
 
 API_BASE = "https://api.helcim.com/v2"
 
-# GiaDienRe membership pricing (matches lib/plans.ts on the website)
+# Membership pricing per website (must match each site's plan catalog)
 PLAN_PRICES = {
+    # giadienre.com (lib/plans.ts)
     ("managed", "monthly"): 12.99,
     ("managed", "annual"): 140.29,
     ("managed-plus", "monthly"): 19.99,
     ("managed-plus", "annual"): 215.89,
+    # saigonllc.com (packages/shared PLAN_CATALOG)
+    ("MONTHLY", "monthly"): 12.99,
+    ("ANNUAL", "annual"): 129.99,
+    ("FAMILY_MONTHLY", "monthly"): 24.99,
+    ("BUSINESS_MONTHLY", "monthly"): 49.99,
 }
 PLAN_LABELS = {
     ("managed", "monthly"): "GiaDienRe Managed — Monthly",
     ("managed", "annual"): "GiaDienRe Managed — Annual",
     ("managed-plus", "monthly"): "GiaDienRe Managed Plus — Monthly",
     ("managed-plus", "annual"): "GiaDienRe Managed Plus — Annual",
+    ("MONTHLY", "monthly"): "Saigon Membership — Monthly",
+    ("ANNUAL", "annual"): "Saigon Membership — Annual",
+    ("FAMILY_MONTHLY", "monthly"): "Saigon Membership Family — Monthly",
+    ("BUSINESS_MONTHLY", "monthly"): "Saigon Membership Business — Monthly",
 }
 
 _plan_id_cache: dict = {}

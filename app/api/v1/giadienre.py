@@ -27,9 +27,26 @@ router = APIRouter()
 
 STATUSES = ["NEW", "CONTACTED", "ACTIVE", "CANCELLED"]
 FORM_TYPES = ["signup", "bill_analysis"]
-PLAN_NAMES = {"managed": "Saigon Power Managed",
-              "managed-plus": "Saigon Power Managed Plus"}
-LEAD_SOURCE = "GiaDienRe Website"
+PLAN_NAMES = {
+    # giadienre.com
+    "managed": "Saigon Power Managed",
+    "managed-plus": "Saigon Power Managed Plus",
+    # saigonllc.com (keys match packages/shared PLAN_CATALOG)
+    "MONTHLY": "Saigon Membership",
+    "ANNUAL": "Saigon Membership (Annual)",
+    "FAMILY_MONTHLY": "Saigon Family Membership",
+    "BUSINESS_MONTHLY": "Saigon Business Membership",
+}
+LEAD_SOURCE = "GiaDienRe Website"            # default (giadienre.com)
+
+# Each member website tags its subscribers with a lead_source so the CRM can
+# show them in separate tabs (GiaDienRe Subscription vs SAIGON Subscription).
+SITES = {
+    "GiaDienRe Website": {"label": "GiaDienRe", "domain": "giadienre.com",
+                          "tab": "GiaDienRe Subscription"},
+    "SaigonLLC Website": {"label": "SAIGON", "domain": "saigonllc.com",
+                          "tab": "SAIGON Subscription"},
+}
 
 
 def _digits(s: Optional[str]) -> str:
@@ -58,6 +75,7 @@ class PublicSubscription(BaseModel):
     plan_id: Optional[str] = None            # managed | managed-plus
     billing_cycle: Optional[str] = None      # monthly | annual
     form_type: str = "signup"                # signup | bill_analysis
+    lead_source: Optional[str] = None        # which website (see SITES)
     extra: Optional[dict] = None             # any additional website fields
 
     company_website: Optional[str] = None    # honeypot — must stay empty
@@ -86,7 +104,7 @@ def _find_crm_customer(db, email: str, phone_digits: str) -> Optional[dict]:
 
 
 def _upsert_crm_customer(db, body: PublicSubscription, email: str,
-                         phone_digits: str) -> Optional[str]:
+                         phone_digits: str, source_label: str = "GiaDienRe") -> Optional[str]:
     """Create the CRM customer if missing, else fill blanks on the existing
     record. Returns the crm_customers id (None only if the write fails)."""
     existing = _find_crm_customer(db, email, phone_digits)
@@ -121,7 +139,7 @@ def _upsert_crm_customer(db, body: PublicSubscription, email: str,
         "city": (body.city or "").strip() or None,
         "state": (body.state or "TX").strip()[:2].upper(),
         "postal_code": _digits(body.zip)[:10] or None,
-        "notes": "GiaDienRe",   # source label shown as a badge in the CRM
+        "notes": source_label,   # source label shown as a badge in the CRM
     }
     res = db.table("crm_customers").insert(new_cust).execute()
     return res.data[0]["id"] if res.data else None
@@ -143,6 +161,9 @@ def submit_subscription(body: PublicSubscription, request: Request):
         raise HTTPException(status_code=400, detail="Invalid plan.")
     if body.billing_cycle and body.billing_cycle not in ("monthly", "annual"):
         raise HTTPException(status_code=400, detail="Invalid billing cycle.")
+
+    lead_source = body.lead_source if body.lead_source in SITES else LEAD_SOURCE
+    site = SITES[lead_source]
 
     contract_end = None
     if body.contract_end_date:
@@ -229,7 +250,7 @@ def submit_subscription(body: PublicSubscription, request: Request):
             "plan_name": PLAN_NAMES.get(body.plan_id or ""),
             "billing_cycle": body.billing_cycle,
             "status": "NEW",
-            "lead_source": LEAD_SOURCE,
+            "lead_source": lead_source,
             "subscribed_at": now,
             "last_submission_at": now,
         })
@@ -242,7 +263,8 @@ def submit_subscription(body: PublicSubscription, request: Request):
     # the subscription stands alone even if this hiccups)
     try:
         if not crm_customer_id:
-            crm_customer_id = _upsert_crm_customer(db, body, email, phone_digits)
+            crm_customer_id = _upsert_crm_customer(db, body, email, phone_digits,
+                                                   source_label=site["label"])
             if crm_customer_id:
                 db.table("giadienre_subscriptions").update(
                     {"crm_customer_id": crm_customer_id}).eq("id", sub_id).execute()
@@ -250,7 +272,7 @@ def submit_subscription(body: PublicSubscription, request: Request):
             audit(db, "crm_customers", crm_customer_id, f"giadienre_{action}",
                   None, {"subscription_id": sub_id, "form_type": body.form_type,
                          "plan": body.plan_id, "at": now},
-                  reason=f"Customer {action} via {LEAD_SOURCE}", actor="giadienre-web")
+                  reason=f"Customer {action} via {lead_source}", actor="giadienre-web")
     except Exception:
         pass
 
@@ -266,9 +288,10 @@ def submit_subscription(body: PublicSubscription, request: Request):
         db.table("ai_alerts").insert({
             "type": "giadienre_subscription", "entity_type": "giadienre_subscription",
             "entity_id": str(sub_id), "status": "open", "severity": "medium",
-            "message": f"New GiaDienRe {kind}: {body.full_name.strip()}"
+            "message": f"New {site['label']} {kind}: {body.full_name.strip()}"
                        f"{' — ' + PLAN_NAMES[body.plan_id] if body.plan_id in PLAN_NAMES else ''}",
             "metadata": {"form_type": body.form_type, "plan": body.plan_id,
+                         "lead_source": lead_source,
                          "crm_customer_id": crm_customer_id},
         }).execute()
     except Exception:
@@ -288,12 +311,12 @@ def submit_subscription(body: PublicSubscription, request: Request):
             resend.Emails.send({
                 "from": os.environ.get("REMINDER_FROM_EMAIL", "reminders@saigonpower.com"),
                 "to": [os.environ.get("ADMIN_ALERT_EMAIL", "lance112709@gmail.com")],
-                "subject": f"🔌 New GiaDienRe {kind}: {body.full_name.strip()}",
+                "subject": f"🔌 New {site['label']} {kind}: {body.full_name.strip()}",
                 "html": f"<p><b>{body.full_name.strip()}</b> ({body.phone or body.email}) "
-                        f"submitted a {kind} on giadienre.com.</p>"
+                        f"submitted a {kind} on {site['domain']}.</p>"
                         f"<p>{body.service_address or ''} {body.city or ''} {body.zip or ''}<br>"
                         f"{plan_line}</p>"
-                        f"<p>Open the CRM → GiaDienRe Subscription to review.</p>",
+                        f"<p>Open the CRM → {site['tab']} to review.</p>",
             })
     except Exception:
         pass
@@ -304,7 +327,10 @@ def submit_subscription(body: PublicSubscription, request: Request):
 # ── Authed: CRM module ────────────────────────────────────────────────────────
 # NOTE: static paths must be registered BEFORE /{id} routes.
 
-def _apply_filters(q, status, form_type, plan, agent, date_from, date_to):
+def _apply_filters(q, status, form_type, plan, agent, date_from, date_to,
+                   lead_source=None):
+    if lead_source:
+        q = q.eq("lead_source", lead_source)
     if status:
         q = q.eq("status", status.upper())
     if form_type:
@@ -343,6 +369,7 @@ def list_subscriptions(
     assigned_agent: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    lead_source: Optional[str] = Query(None),
     sort_by: str = Query("created_at"),
     sort_dir: str = Query("desc"),
     limit: int = Query(50, le=200),
@@ -352,7 +379,8 @@ def list_subscriptions(
     db = get_client()
     sort_col = sort_by if sort_by in SORTABLE else "created_at"
     q = db.table("giadienre_subscriptions").select("*", count="exact")
-    q = _apply_filters(q, status, form_type, plan, assigned_agent, date_from, date_to)
+    q = _apply_filters(q, status, form_type, plan, assigned_agent, date_from, date_to,
+                       lead_source)
     q = q.order(sort_col, desc=(sort_dir != "asc"))
 
     if search:
@@ -372,12 +400,15 @@ def list_subscriptions(
 
 
 @router.get("/subscriptions/stats")
-def subscription_stats(user: UserContext = Depends(get_current_user)):
+def subscription_stats(lead_source: Optional[str] = Query(None),
+                       user: UserContext = Depends(get_current_user)):
     db = get_client()
     t = db.table("giadienre_subscriptions")
 
     def _count(**eqs):
         q = t.select("id", count="exact")
+        if lead_source:
+            q = q.eq("lead_source", lead_source)
         for k, v in eqs.items():
             q = q.eq(k, v) if not k.startswith("gte_") else q.gte(k[4:], v)
         return q.limit(1).execute().count or 0
@@ -416,8 +447,10 @@ def subscription_stats(user: UserContext = Depends(get_current_user)):
     floor = min(months.keys())
     off = 0
     while True:
-        page = t.select("created_at").gte("created_at", f"{floor}-01") \
-            .range(off, off + 999).execute().data or []
+        q = t.select("created_at").gte("created_at", f"{floor}-01")
+        if lead_source:
+            q = q.eq("lead_source", lead_source)
+        page = q.range(off, off + 999).execute().data or []
         for r in page:
             key = (r.get("created_at") or "")[:7]
             if key in months:
@@ -431,12 +464,16 @@ def subscription_stats(user: UserContext = Depends(get_current_user)):
 
 @router.get("/subscriptions/new-count")
 def new_subscriptions_count(since: Optional[str] = Query(None),
+                            lead_source: Optional[str] = Query(None),
                             user: UserContext = Depends(get_current_user)):
     """Sidebar badge: subscriptions created after `since` (defaults to 7 days)."""
     db = get_client()
     cutoff = since or (_now() - timedelta(days=7)).isoformat()
-    count = db.table("giadienre_subscriptions").select("id", count="exact") \
-        .gte("created_at", cutoff).limit(1).execute().count or 0
+    q = db.table("giadienre_subscriptions").select("id", count="exact") \
+        .gte("created_at", cutoff)
+    if lead_source:
+        q = q.eq("lead_source", lead_source)
+    count = q.limit(1).execute().count or 0
     return {"count": count}
 
 
@@ -448,13 +485,15 @@ def export_subscriptions(
     assigned_agent: Optional[str] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    lead_source: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
     rows, off = [], 0
     while True:
         q = db.table("giadienre_subscriptions").select("*")
-        q = _apply_filters(q, status, form_type, plan, assigned_agent, date_from, date_to)
+        q = _apply_filters(q, status, form_type, plan, assigned_agent, date_from, date_to,
+                           lead_source)
         page = q.order("created_at", desc=True).range(off, off + 999).execute().data or []
         rows.extend(page)
         if len(page) < 1000:
