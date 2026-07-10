@@ -45,6 +45,11 @@ PROVIDER_SUPPLIERS = {
     "CleanSky":             {"code": "CLEANSKY", "name": "CleanSky Energy"},
 }
 
+# Providers whose statements restate the FULL payment history every time —
+# each new file supersedes earlier imports for every month it covers, so the
+# upload pipeline replaces (not merges) prior rows for those months.
+CUMULATIVE_GROUPS = {"CleanSky"}
+
 # CRM provider spellings -> provider group (used to select deals to reconcile)
 CRM_PROVIDER_GROUPS = {
     "nrg": "NRG Commercial", "nrg energy": "NRG Commercial",

@@ -20,6 +20,7 @@ from app.services.file_parser.excel_parser import parse_excel, parse_csv
 from app.services.file_parser.ai_normalizer import normalize_columns
 from app.services.file_parser.provider_parsers import (
     detect_and_parse, normalize_esiid, PROVIDER_SUPPLIERS, label_from_filename,
+    CUMULATIVE_GROUPS,
 )
 from app.services.reconciliation_v2 import (
     load_deals, backfill_esiids, run_reconciliation_v2, get_or_create_supplier,
@@ -128,6 +129,24 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
             "is_matched": deal is not None,
             "matched_at": datetime.now(timezone.utc).isoformat() if deal else None,
         })
+    # Cumulative providers restate the whole history in every statement —
+    # drop earlier uploads' rows for the covered months so the ledger never
+    # double-counts (the new file is the complete truth for those months).
+    if provider_group in CUMULATIVE_GROUPS:
+        months = sorted({f"{r['statement_label']}-01" for r in rows if r.get("statement_label")})
+        replaced = 0
+        while months:
+            stale = db.table("actual_commissions").select("id").eq("supplier_id", supplier_id) \
+                .in_("billing_month", months).neq("upload_batch_id", batch_id) \
+                .order("id").limit(500).execute().data
+            if not stale:
+                break
+            db.table("actual_commissions").delete().in_("id", [s["id"] for s in stale]).execute()
+            replaced += len(stale)
+        if replaced:
+            warnings.append(f"{provider_group} statements restate the full history — "
+                            f"{replaced} rows from earlier uploads replaced for the same months.")
+
     for i in range(0, len(records), 200):
         db.table("actual_commissions").insert(records[i:i + 200]).execute()
 
