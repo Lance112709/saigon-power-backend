@@ -96,6 +96,8 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["Content-Security-Policy"] = (
             "default-src 'none'; frame-ancestors 'none'; base-uri 'none'"
         )
-        response.headers.pop("Server", None)
-        response.headers.pop("X-Powered-By", None)
+        # Starlette's MutableHeaders has no .pop(); delete via guarded __delitem__.
+        for _h in ("server", "x-powered-by"):
+            if _h in response.headers:
+                del response.headers[_h]
         return response

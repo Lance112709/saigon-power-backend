@@ -11,9 +11,35 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from fastapi import FastAPI
+from starlette.testclient import TestClient
+
 from app.auth.core import hash_password, verify_password, needs_rehash
-from app.core.security import sanitize_search, RateLimiter
+from app.core.security import sanitize_search, RateLimiter, SecurityHeadersMiddleware
 from app.auth.ownership import _agent_name
+
+
+# ── security headers middleware (exercises the real ASGI path) ────────────────
+
+def _client_with_headers():
+    app = FastAPI()
+    app.add_middleware(SecurityHeadersMiddleware)
+
+    @app.get("/ping")
+    def ping():
+        return {"ok": True}
+
+    return TestClient(app)
+
+
+def test_security_headers_middleware_does_not_500():
+    # Regression: MutableHeaders has no .pop(); the middleware must not crash.
+    r = _client_with_headers().get("/ping")
+    assert r.status_code == 200
+    assert r.headers["content-security-policy"]
+    assert r.headers["strict-transport-security"]
+    assert r.headers["x-frame-options"] == "DENY"
+    assert r.headers["x-content-type-options"] == "nosniff"
 
 
 # ── password hashing ──────────────────────────────────────────────────────────
