@@ -20,11 +20,25 @@ def _is_month_to_month(deal: dict) -> bool:
     """Month-to-month plans have no renewal date to chase — keep them off the
     call list. The marker varies by import: rate_type 'Month-Month',
     contract_term 'Month to Month', or a plan name containing it."""
-    for field in ("rate_type", "contract_term", "plan_name"):
+    for field in ("rate_type", "contract_term", "plan_name", "product_type"):
         v = str(deal.get(field) or "").lower().replace("-", " ").replace("_", " ")
         if "month to month" in v or "month month" in v:
             return True
     return False
+
+
+def _fetch_all(db, table: str, cols: str, filters: list) -> list:
+    out, off = [], 0
+    while True:
+        q = db.table(table).select(cols)
+        for fn, args in filters:
+            q = getattr(q, fn)(*args)
+        page = q.range(off, off + 999).execute().data or []
+        out.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    return out
 
 
 def _score_customer(lead: dict, deals: list) -> tuple[int, list[str], str]:
@@ -40,7 +54,12 @@ def _score_customer(lead: dict, deals: list) -> tuple[int, list[str], str]:
         days = _days_until(deal.get("end_date"))
 
         if days is not None:
-            if days <= 7:
+            if days < 0:
+                score += 100
+                reasons.append(f"Contract EXPIRED {-days} day{'s' if days != -1 else ''} ago — "
+                               f"customer is on holdover pricing")
+                action = "Call now — contract already expired"
+            elif days <= 7:
                 score += 100
                 reasons.append(f"Contract expires in {days} day{'s' if days != 1 else ''} — URGENT")
                 action = "Renew NOW — contract expiring"
@@ -134,6 +153,63 @@ def get_call_list(
             "action":          action,
             "lead_id":         lead_id,
             "entity_url":      f"/crm/leads/{lead_id}",
+        })
+
+    # ── CRM book (crm_deals — most of the business, ~5k active deals) ──
+    crm_deals = _fetch_all(
+        db, "crm_deals",
+        "id, customer_id, deal_status, provider, deal_name, product_type, contract_term, "
+        "meter_type, contract_end_date, sales_agent, business_name, "
+        "crm_customers(full_name, phone)",
+        filters=[("eq", ("deal_status", "ACTIVE"))])
+
+    by_customer: dict = {}
+    for d in crm_deals:
+        if _is_month_to_month(d):
+            continue
+        if agent_name and (d.get("sales_agent") or "").lower() != agent_name.lower():
+            continue
+        # normalize to the shape _score_customer expects
+        norm = {
+            "status": "Active",
+            "end_date": d.get("contract_end_date"),
+            # meter_type carries Commercial/Residential for the scoring boost
+            "product_type": d.get("meter_type"),
+            "supplier": d.get("provider"),
+            "plan_name": d.get("deal_name") or d.get("product_type"),
+            "sales_agent": d.get("sales_agent"),
+            "customer": d.get("crm_customers") or {},
+            "business_name": d.get("business_name"),
+            "customer_id": d.get("customer_id"),
+        }
+        key = d.get("customer_id") or f"deal:{d['id']}"
+        by_customer.setdefault(key, []).append(norm)
+
+    for key, deals in by_customer.items():
+        score, reasons, action = _score_customer({}, deals)
+        if score == 0:
+            continue
+        deals.sort(key=lambda d: (_days_until(d.get("end_date")) or 9999))
+        top = deals[0]
+        cust = top.get("customer") or {}
+        name = (cust.get("full_name") or top.get("business_name")
+                or top.get("plan_name") or "Unknown")
+        customer_id = top.get("customer_id")
+        results.append({
+            "name":            name,
+            "type":            "Customer",
+            "phone":           cust.get("phone") or "—",
+            "sgp_customer_id": None,
+            "sales_agent":     top.get("sales_agent"),
+            "supplier":        top.get("supplier"),
+            "plan_name":       top.get("plan_name"),
+            "end_date":        top.get("end_date"),
+            "days_left":       _days_until(top.get("end_date")),
+            "priority_score":  score,
+            "reason":          " · ".join(reasons),
+            "action":          action,
+            "lead_id":         None,
+            "entity_url":      f"/crm/customers/{customer_id}" if customer_id else "/crm/deals",
         })
 
     results.sort(key=lambda x: x["priority_score"], reverse=True)
