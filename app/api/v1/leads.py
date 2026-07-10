@@ -1,9 +1,11 @@
-from fastapi import APIRouter, HTTPException, Query, Body, Depends, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, Body, Depends, UploadFile, File, Request
 from typing import Optional
 from datetime import datetime, timezone, date
 import re
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
+from app.auth.ownership import assert_lead_access
+from app.core.security import sanitize_search, rate_limit
 from app.api.v1.tasks import create_lead_tasks
 
 router = APIRouter()
@@ -436,12 +438,14 @@ def list_leads(
     db = get_client()
     q = db.table("leads").select("*, lead_deals(id, status, start_date)")
     if search:
-        q = q.or_(
-            f"first_name.ilike.%{search}%,"
-            f"last_name.ilike.%{search}%,"
-            f"phone.ilike.%{search}%,"
-            f"address.ilike.%{search}%"
-        )
+        s = sanitize_search(search)
+        if s:
+            q = q.or_(
+                f"first_name.ilike.%{s}%,"
+                f"last_name.ilike.%{s}%,"
+                f"phone.ilike.%{s}%,"
+                f"address.ilike.%{s}%"
+            )
     if status:
         q = q.eq("status", status)
     if created_after:
@@ -457,7 +461,13 @@ def list_leads(
     return [_shape_lead(lead, db) for lead in res.data]
 
 @router.post("")
-def create_lead(data: dict = Body(...)):
+def create_lead(data: dict = Body(...), request: Request = None):
+    # Public intake — throttle per IP and honeypot bots (this endpoint fires an
+    # outbound SMS to the supplied number, so it's an abuse/cost target).
+    if request is not None:
+        rate_limit(request, "create_lead", limit=10, window_seconds=600)
+    if str(data.get("company_website") or "").strip():  # honeypot — must stay empty
+        return {"ok": True}  # silently accept & drop bot submissions
     db = get_client()
     required = ["first_name", "last_name", "address", "city", "state", "zip", "phone"]
     for field in required:
@@ -527,6 +537,7 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
 @router.patch("/{id}")
 def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     allowed = {"first_name", "last_name", "address", "city", "state", "zip", "phone", "email", "business_name", "phone2", "email2", "referral_by", "sales_agent", "anxh", "dob", "dl_number", "account_flag"}
     # Empty optional fields should clear the column (None), not write "".
     nullable = {"business_name", "phone2", "email", "email2", "referral_by", "sales_agent", "anxh", "dob", "dl_number", "account_flag"}
@@ -567,9 +578,7 @@ def delete_lead(id: str, user: UserContext = Depends(require_manager)):
 @router.post("/{id}/deals")
 def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
-    lead = db.table("leads").select("id").eq("id", id).limit(1).execute()
-    if not lead.data:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    assert_lead_access(db, user, id)
 
     if not str(data.get("status") or "").strip():
         raise HTTPException(status_code=400, detail="'status' is required")
@@ -600,18 +609,21 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
 @router.delete("/{id}/deals/{deal_id}")
 def delete_lead_deal(id: str, deal_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     db.table("lead_deals").delete().eq("id", deal_id).eq("lead_id", id).execute()
     return {"ok": True}
 
 @router.get("/{id}/notes")
 def get_lead_notes(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     res = db.table("lead_notes").select("*").eq("lead_id", id).order("created_at", desc=True).execute()
     return res.data
 
 @router.post("/{id}/notes")
 def create_lead_note(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     content = str(data.get("content") or "").strip()
     author  = str(data.get("author_name") or "").strip()
     if not content:
@@ -624,6 +636,7 @@ def create_lead_note(id: str, data: dict = Body(...), user: UserContext = Depend
 @router.patch("/{id}/notes/{note_id}")
 def update_lead_note(id: str, note_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     note = db.table("lead_notes").select("author_name").eq("id", note_id).eq("lead_id", id).limit(1).execute()
     if not note.data:
         raise HTTPException(status_code=404, detail="Note not found")
@@ -652,15 +665,14 @@ MAX_LEAD_ATTACH_BYTES = 25 * 1024 * 1024  # 25 MB
 @router.get("/{id}/attachments")
 def list_lead_attachments(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     res = db.table("lead_attachments").select("*").eq("lead_id", id).order("created_at", desc=True).execute()
     return res.data or []
 
 @router.post("/{id}/attachments")
 async def upload_lead_attachment(id: str, file: UploadFile = File(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
-    lead = db.table("leads").select("id").eq("id", id).limit(1).execute()
-    if not lead.data:
-        raise HTTPException(status_code=404, detail="Lead not found")
+    assert_lead_access(db, user, id)
 
     file_bytes = await file.read()
     if not file_bytes:
@@ -693,6 +705,7 @@ async def upload_lead_attachment(id: str, file: UploadFile = File(...), user: Us
 @router.get("/{id}/attachments/{attachment_id}/url")
 def get_lead_attachment_url(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     res = db.table("lead_attachments").select("storage_path").eq("id", attachment_id).eq("lead_id", id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Attachment not found")
@@ -712,6 +725,7 @@ def get_lead_attachment_url(id: str, attachment_id: str, user: UserContext = Dep
 @router.delete("/{id}/attachments/{attachment_id}")
 def delete_lead_attachment(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     res = db.table("lead_attachments").select("storage_path").eq("id", attachment_id).eq("lead_id", id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Attachment not found")
@@ -726,6 +740,7 @@ def delete_lead_attachment(id: str, attachment_id: str, user: UserContext = Depe
 @router.patch("/{id}/deals/{deal_id}")
 def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_lead_access(db, user, id)
     allowed = {
         "flag_tos", "flag_toao", "flag_deposit", "flag_special_deal", "flag_promo_10", "flag_delinked",
         "status", "supplier", "plan_name", "product_type", "rate_type", "contract_term",

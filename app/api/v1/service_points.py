@@ -1,7 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import Optional
 from app.db.client import get_client
+from app.auth.deps import get_current_user, UserContext
 
 router = APIRouter()
 
@@ -20,13 +21,13 @@ class ServicePointUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 @router.post("")
-def create_service_point(body: ServicePointCreate):
+def create_service_point(body: ServicePointCreate, user: UserContext = Depends(get_current_user)):
     db = get_client()
     res = db.table("service_points").insert(body.model_dump()).execute()
     return res.data[0]
 
 @router.get("/lookup/{esiid}")
-def lookup_by_esiid(esiid: str):
+def lookup_by_esiid(esiid: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
     res = db.table("service_points").select("*, customers(business_name)").eq("esiid", esiid).execute()
     if not res.data:
@@ -34,7 +35,7 @@ def lookup_by_esiid(esiid: str):
     return res.data[0]
 
 @router.get("/{id}")
-def get_service_point(id: str):
+def get_service_point(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
     res = db.table("service_points").select("*, customers(business_name)").eq("id", id).single().execute()
     if not res.data:
@@ -42,7 +43,7 @@ def get_service_point(id: str):
     return res.data
 
 @router.patch("/{id}")
-def update_service_point(id: str, body: ServicePointUpdate):
+def update_service_point(id: str, body: ServicePointUpdate, user: UserContext = Depends(get_current_user)):
     db = get_client()
     updates = {k: v for k, v in body.model_dump().items() if v is not None}
     res = db.table("service_points").update(updates).eq("id", id).execute()

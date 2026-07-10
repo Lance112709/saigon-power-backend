@@ -33,6 +33,7 @@ from app.auth.deps import require_admin, UserContext
 router = APIRouter()
 
 STATEMENTS_BUCKET = "statements"
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB — statements are small; caps zip-bomb risk
 
 
 def _storage_put(db, path: str, blob: bytes, content_type: str):
@@ -234,6 +235,10 @@ async def upload_file(
 
     if ext not in ("csv", "xlsx", "xls", "pdf"):
         raise HTTPException(status_code=400, detail="Unsupported file type. Use CSV, Excel, or PDF.")
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 25 MB).")
 
     # ── Auto path: recognized provider format ────────────────────────────────
     parsed_auto = detect_and_parse(file_bytes, filename)

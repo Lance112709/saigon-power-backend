@@ -1,5 +1,6 @@
-from fastapi import APIRouter, HTTPException, Query, Depends, UploadFile, File
+from fastapi import APIRouter, HTTPException, Query, Depends, UploadFile, File, Request
 from app.auth.deps import get_current_user, require_admin, UserContext
+from app.core.security import rate_limit
 from pydantic import BaseModel
 from typing import Optional
 from datetime import date
@@ -50,14 +51,27 @@ def update_contract_template(body: ContractTemplateUpdate, user: UserContext = D
         res = db.table("contract_templates").insert({"html_content": body.html_content}).execute()
     return res.data[0]
 
+MAX_CONTRACT_PDF_BYTES = 10 * 1024 * 1024  # 10 MB
+
 @router.post("/store/{token}")
-async def store_signed_contract(token: str, file: UploadFile = File(...)):
+async def store_signed_contract(token: str, file: UploadFile = File(...), request: Request = None):
+    # Public by design: the signer's browser posts the executed PDF using the
+    # unguessable proposal token as its capability. Throttle + validate so the
+    # endpoint can't be abused to dump arbitrary/oversized blobs into storage.
+    if request is not None:
+        rate_limit(request, "store_contract", limit=20, window_seconds=600)
     db = get_client()
     proposal = db.table("proposals").select("id, status").eq("token", token).limit(1).execute()
     if not proposal.data:
         raise HTTPException(status_code=404, detail="Proposal not found")
 
     pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Empty file.")
+    if len(pdf_bytes) > MAX_CONTRACT_PDF_BYTES:
+        raise HTTPException(status_code=400, detail="File too large (max 10 MB).")
+    if not pdf_bytes.startswith(b"%PDF-"):
+        raise HTTPException(status_code=400, detail="Only PDF files are accepted.")
     path = f"{token}.pdf"
 
     try:

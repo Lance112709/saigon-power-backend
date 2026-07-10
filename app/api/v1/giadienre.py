@@ -530,6 +530,13 @@ def get_subscription(id: str, user: UserContext = Depends(get_current_user)):
     if not rows:
         raise HTTPException(status_code=404, detail="Subscription not found")
     sub = rows[0]
+    # Never expose payment secrets to the client. Card vault tokens / customer
+    # codes and in-flight checkout secrets stay server-side; the UI only needs
+    # the masked card display fields (card_last4 / card_brand / card_expiry).
+    for _secret in ("helcim_card_token", "helcim_customer_code"):
+        sub.pop(_secret, None)
+    if isinstance(sub.get("extra"), dict):
+        sub["extra"] = {k: v for k, v in sub["extra"].items() if k != "pending_checkout"}
     customer = None
     if sub.get("crm_customer_id"):
         c = db.table("crm_customers").select("*").eq("id", sub["crm_customer_id"]) \

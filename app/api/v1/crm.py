@@ -6,6 +6,8 @@ import io
 from datetime import datetime as dt
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
+from app.auth.ownership import assert_customer_access, assert_crm_deal_access
+from app.core.security import sanitize_search
 
 router = APIRouter()
 
@@ -133,7 +135,7 @@ def _enrich_deals(db, deals: list) -> None:
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
-def get_crm_stats():
+def get_crm_stats(user: UserContext = Depends(get_current_user)):
     db = get_client()
     customers = db.table("crm_customers").select("id", count="exact").execute()
     active = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE").execute()
@@ -180,7 +182,9 @@ def list_customers(
     if meter_type:
         q = q.ilike("crm_deals.meter_type", f"%{meter_type}%")
     if search:
-        q = q.or_(f"full_name.ilike.%{search}%,email.ilike.%{search}%,phone.ilike.%{search}%")
+        s = sanitize_search(search)
+        if s:
+            q = q.or_(f"full_name.ilike.%{s}%,email.ilike.%{s}%,phone.ilike.%{s}%")
     if source == "__manual__":
         q = q.is_("notes", "null")
     elif source:
@@ -279,6 +283,7 @@ def get_customer(id: str, user: UserContext = Depends(get_current_user)):
 @router.get("/customers/{id}/notes")
 def get_customer_notes(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_customer_access(db, user, id)
     res = db.table("crm_customer_notes").select("*").eq("crm_customer_id", id).order("created_at", desc=True).execute()
     return res.data or []
 
@@ -289,6 +294,7 @@ def create_customer_note(id: str, data: dict = Body(...), user: UserContext = De
         raise HTTPException(status_code=400, detail="Content required")
     author = str(data.get("author_name") or "").strip() or None
     db = get_client()
+    assert_customer_access(db, user, id)
     res = db.table("crm_customer_notes").insert({"crm_customer_id": id, "content": content, "author_name": author}).execute()
     return res.data[0]
 
@@ -306,15 +312,14 @@ MAX_ATTACH_BYTES = 25 * 1024 * 1024  # 25 MB
 @router.get("/customers/{id}/attachments")
 def list_customer_attachments(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_customer_access(db, user, id)
     res = db.table("crm_customer_attachments").select("*").eq("crm_customer_id", id).order("created_at", desc=True).execute()
     return res.data or []
 
 @router.post("/customers/{id}/attachments")
 async def upload_customer_attachment(id: str, file: UploadFile = File(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
-    customer = db.table("crm_customers").select("id").eq("id", id).limit(1).execute()
-    if not customer.data:
-        raise HTTPException(status_code=404, detail="Customer not found")
+    assert_customer_access(db, user, id)
 
     file_bytes = await file.read()
     if not file_bytes:
@@ -347,6 +352,7 @@ async def upload_customer_attachment(id: str, file: UploadFile = File(...), user
 @router.get("/customers/{id}/attachments/{attachment_id}/url")
 def get_customer_attachment_url(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_customer_access(db, user, id)
     res = db.table("crm_customer_attachments").select("storage_path").eq("id", attachment_id).eq("crm_customer_id", id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Attachment not found")
@@ -366,6 +372,7 @@ def get_customer_attachment_url(id: str, attachment_id: str, user: UserContext =
 @router.delete("/customers/{id}/attachments/{attachment_id}")
 def delete_customer_attachment(id: str, attachment_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_customer_access(db, user, id)
     res = db.table("crm_customer_attachments").select("storage_path").eq("id", attachment_id).eq("crm_customer_id", id).limit(1).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Attachment not found")
@@ -380,6 +387,7 @@ def delete_customer_attachment(id: str, attachment_id: str, user: UserContext = 
 @router.patch("/customers/{id}")
 def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_customer_access(db, user, id)
     allowed = {"full_name", "first_name", "last_name", "email", "phone", "dob",
                "mailing_address", "city", "state", "postal_code", "notes"}
     payload = {k: v for k, v in data.items() if k in allowed}
@@ -481,7 +489,9 @@ def list_deals(
     if sales_agent:
         q = q.ilike("sales_agent", f"%{sales_agent}%")
     if search:
-        q = q.or_(f"deal_name.ilike.%{search}%,esiid.ilike.%{search}%,service_address.ilike.%{search}%")
+        s = sanitize_search(search)
+        if s:
+            q = q.or_(f"deal_name.ilike.%{s}%,esiid.ilike.%{s}%,service_address.ilike.%{s}%")
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     deals = res.data or []
     _enrich_deals(db, deals)
@@ -586,6 +596,7 @@ def get_deal(id: str, user: UserContext = Depends(get_current_user)):
 @router.get("/deals/{id}/notes")
 def get_deal_notes(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_crm_deal_access(db, user, id)
     res = db.table("crm_deal_notes").select("*").eq("crm_deal_id", id).order("created_at", desc=True).execute()
     return res.data or []
 
@@ -596,16 +607,14 @@ def create_deal_note(id: str, data: dict = Body(...), user: UserContext = Depend
         raise HTTPException(status_code=400, detail="Content required")
     author = str(data.get("author_name") or "").strip() or None
     db = get_client()
+    assert_crm_deal_access(db, user, id)
     res = db.table("crm_deal_notes").insert({"crm_deal_id": id, "content": content, "author_name": author}).execute()
     return res.data[0]
 
 @router.post("/deals/{id}/renew")
 def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
-    orig_res = db.table("crm_deals").select("*").eq("id", id).limit(1).execute()
-    if not orig_res.data:
-        raise HTTPException(status_code=404, detail="Deal not found")
-    orig = orig_res.data[0]
+    orig = assert_crm_deal_access(db, user, id)
 
     # Mark original deal as RENEWED
     db.table("crm_deals").update({"deal_status": "RENEWED"}).eq("id", id).execute()
@@ -650,6 +659,7 @@ def delete_deal_note(id: str, note_id: str, user: UserContext = Depends(require_
 @router.patch("/deals/{id}")
 def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
+    assert_crm_deal_access(db, user, id)
     allowed = {"deal_status", "deal_name", "provider", "adder", "energy_rate", "deal_owner",
                "sales_agent", "contract_start_date", "contract_end_date", "contract_signed_date",
                "contract_term", "notes", "service_address", "meter_type", "deal_type",

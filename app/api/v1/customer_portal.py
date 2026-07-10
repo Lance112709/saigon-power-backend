@@ -14,11 +14,12 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, Header, HTTPException
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Request
 from jose import jwt, JWTError
 
 from app.db.client import get_client
 from app.auth.core import SECRET_KEY, ALGORITHM
+from app.core.security import rate_limit
 from app.services.audit import audit
 from app.services.sms import send_sms
 from app.utils.deals import is_month_to_month
@@ -70,10 +71,15 @@ def _fetch(db, table, cols):
 # ── OTP login ─────────────────────────────────────────────────────────────────
 
 @router.post("/request-code")
-def request_code(data: dict = Body(...)):
+def request_code(data: dict = Body(...), request: Request = None):
     p10 = phone10(data.get("phone"))
     if len(p10) != 10:
         raise HTTPException(status_code=400, detail="Enter a valid 10-digit phone number.")
+
+    # Throttle code requests: per IP and per phone (SMS cost + enumeration).
+    if request is not None:
+        rate_limit(request, "otp_request", limit=5, window_seconds=600)
+        rate_limit(request, f"otp_request_phone:{p10}", limit=5, window_seconds=3600)
 
     db = get_client()
     cust = _find_customer(db, p10)
@@ -100,8 +106,12 @@ def request_code(data: dict = Body(...)):
 
 
 @router.post("/verify-code")
-def verify_code(data: dict = Body(...)):
+def verify_code(data: dict = Body(...), request: Request = None):
     p10 = phone10(data.get("phone"))
+    # Stop online brute force of the 6-digit code (1M space, 10-min window).
+    if request is not None:
+        rate_limit(request, "otp_verify", limit=8, window_seconds=600)
+        rate_limit(request, f"otp_verify_phone:{p10}", limit=8, window_seconds=600)
     code = re.sub(r"\D", "", str(data.get("code") or ""))
     try:
         payload = jwt.decode(str(data.get("challenge") or ""), SECRET_KEY, algorithms=[ALGORITHM])

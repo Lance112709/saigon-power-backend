@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Query, Depends
 from app.auth.deps import get_current_user, UserContext
+from app.core.security import sanitize_search
 from app.db.client import get_client
 
 router = APIRouter()
@@ -11,14 +12,20 @@ def global_search(
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
-    q = q.strip()
+    q = sanitize_search(q)
+    if not q:
+        return []
+    # Sales agents may only search within their own book.
+    agent = user.sales_agent_name.lower() if (user.is_sales_agent and user.sales_agent_name) else None
+    if user.is_sales_agent and not agent:
+        return []
     results = []
     seen_lead_ids: set = set()
     seen_cust_ids: set = set()
 
     # ── 1. Pipeline leads (name, email, phone, address) ────────────────────────
-    leads = db.table("leads").select(
-        "id, first_name, last_name, email, phone, address, city, state, status"
+    _leads_q = db.table("leads").select(
+        "id, first_name, last_name, email, phone, address, city, state, status, sales_agent"
     ).or_(
         f"first_name.ilike.%{q}%,"
         f"last_name.ilike.%{q}%,"
@@ -26,7 +33,10 @@ def global_search(
         f"phone.ilike.%{q}%,"
         f"address.ilike.%{q}%,"
         f"city.ilike.%{q}%"
-    ).limit(8).execute().data or []
+    )
+    if agent:
+        _leads_q = _leads_q.eq("sales_agent", user.sales_agent_name)
+    leads = _leads_q.limit(8).execute().data or []
 
     for l in leads:
         seen_lead_ids.add(l["id"])
@@ -42,16 +52,18 @@ def global_search(
 
     # ── 2. Pipeline lead_deals (esiid, service_address → parent lead) ──────────
     ld_rows = db.table("lead_deals").select(
-        "id, esiid, service_address, supplier, leads(id, first_name, last_name, phone, status)"
+        "id, esiid, service_address, supplier, leads(id, first_name, last_name, phone, status, sales_agent)"
     ).or_(
         f"esiid.ilike.%{q}%,"
         f"service_address.ilike.%{q}%"
-    ).limit(8).execute().data or []
+    ).limit(16).execute().data or []
 
     for d in ld_rows:
         lead = d.get("leads") or {}
         lid = lead.get("id")
         if not lid or lid in seen_lead_ids:
+            continue
+        if agent and (lead.get("sales_agent") or "").lower() != agent:
             continue
         seen_lead_ids.add(lid)
         results.append({
@@ -65,7 +77,10 @@ def global_search(
         })
 
     # ── 3. Imported customers (name, email, phone, address) ────────────────────
-    customers = db.table("crm_customers").select(
+    # Sales agents have no direct ownership column on crm_customers; they reach
+    # their customers through their own deals in block 4, so skip the broad
+    # customer name/phone scan for them.
+    customers = [] if agent else (db.table("crm_customers").select(
         "id, full_name, first_name, last_name, email, phone, mailing_address, city, state"
     ).or_(
         f"full_name.ilike.%{q}%,"
@@ -75,7 +90,7 @@ def global_search(
         f"phone.ilike.%{q}%,"
         f"mailing_address.ilike.%{q}%,"
         f"city.ilike.%{q}%"
-    ).limit(8).execute().data or []
+    ).limit(8).execute().data or [])
 
     for c in customers:
         seen_cust_ids.add(c["id"])
@@ -91,13 +106,16 @@ def global_search(
         })
 
     # ── 4. Imported crm_deals (esiid, service_address, business_name → customer) ─
-    crm_deals = db.table("crm_deals").select(
-        "id, esiid, service_address, business_name, deal_status, crm_customers(id, full_name, phone)"
+    _crm_deals_q = db.table("crm_deals").select(
+        "id, esiid, service_address, business_name, deal_status, sales_agent, crm_customers(id, full_name, phone)"
     ).or_(
         f"esiid.ilike.%{q}%,"
         f"service_address.ilike.%{q}%,"
         f"business_name.ilike.%{q}%"
-    ).limit(8).execute().data or []
+    )
+    if agent:
+        _crm_deals_q = _crm_deals_q.eq("sales_agent", user.sales_agent_name)
+    crm_deals = _crm_deals_q.limit(8).execute().data or []
 
     for d in crm_deals:
         cust = d.get("crm_customers") or {}

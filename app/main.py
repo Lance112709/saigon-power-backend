@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
 from app.api.v1.router import router
 from app.config import settings
+from app.core.security import SecurityHeadersMiddleware
 
 def _run_reminders():
     try:
@@ -128,9 +129,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+    max_age=600,
 )
+app.add_middleware(SecurityHeadersMiddleware)
 
 app.include_router(router)
 

@@ -9,6 +9,18 @@ router = APIRouter()
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _assert_proposal_access(db, user: UserContext, prop: dict) -> None:
+    """Sales agents may only touch proposals tied to their own leads."""
+    if not user.is_sales_agent:
+        return
+    agent_name = (user.sales_agent_name or "").strip().lower()
+    lead_id = prop.get("lead_id")
+    if not agent_name or not lead_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+    lead = db.table("leads").select("sales_agent").eq("id", lead_id).limit(1).execute()
+    if not lead.data or (lead.data[0].get("sales_agent") or "").lower() != agent_name:
+        raise HTTPException(status_code=403, detail="Access denied")
+
 # ── Declared BEFORE /{id} routes to avoid path conflicts ──────────────────────
 
 @router.get("/view/{token}")
@@ -214,6 +226,7 @@ def email_contract(proposal_id: str, data: dict = Body(default={}), user: UserCo
     if not res.data:
         raise HTTPException(status_code=404, detail="Proposal not found")
     prop = res.data[0]
+    _assert_proposal_access(db, user, prop)
 
     to = (data.get("email") or prop.get("customer_email") or "").strip()
     if not to or "@" not in to:
@@ -261,6 +274,10 @@ def get_proposal(proposal_id: str, user: UserContext = Depends(get_current_user)
 @router.patch("/{proposal_id}")
 def update_proposal(proposal_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
+    existing = db.table("proposals").select("lead_id").eq("id", proposal_id).limit(1).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    _assert_proposal_access(db, user, existing.data[0])
     allowed = {"status", "rep_name", "plan_name", "rate", "term_months",
                "est_monthly_bill", "early_termination_fee", "notes"}
     payload = {k: v for k, v in data.items() if k in allowed}

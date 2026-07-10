@@ -1,10 +1,30 @@
-from fastapi import APIRouter, HTTPException, Body, Depends
+from fastapi import APIRouter, HTTPException, Body, Depends, Request
 from app.db.client import get_client
-from app.auth.core import hash_password, verify_password, create_access_token
+from app.auth.core import hash_password, verify_password, needs_rehash, create_access_token
 from app.auth.deps import get_current_user, UserContext
+from app.core.security import rate_limit
 from datetime import datetime, timezone
 
 router = APIRouter()
+
+# Password policy: enforced on every place a password is set.
+MIN_PASSWORD_LEN = 10
+
+
+def _validate_password_strength(pw: str):
+    if len(pw) < MIN_PASSWORD_LEN:
+        raise HTTPException(status_code=400,
+                            detail=f"Password must be at least {MIN_PASSWORD_LEN} characters.")
+    classes = sum([
+        any(c.islower() for c in pw),
+        any(c.isupper() for c in pw),
+        any(c.isdigit() for c in pw),
+        any(not c.isalnum() for c in pw),
+    ])
+    if classes < 3:
+        raise HTTPException(
+            status_code=400,
+            detail="Password must include at least 3 of: lowercase, uppercase, number, symbol.")
 
 @router.post("/setup")
 def setup_admin(data: dict = Body(...)):
@@ -21,8 +41,7 @@ def setup_admin(data: dict = Body(...)):
 
     if not email or not password or not first_name or not last_name:
         raise HTTPException(status_code=400, detail="first_name, last_name, email, and password are required")
-    if len(password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    _validate_password_strength(password)
 
     res = db.table("users").insert({
         "first_name": first_name,
@@ -38,11 +57,16 @@ def setup_admin(data: dict = Body(...)):
     return {"message": "Admin account created", "access_token": token, "role": "admin"}
 
 @router.post("/login")
-def login(data: dict = Body(...)):
+def login(data: dict = Body(...), request: Request = None):
     email = str(data.get("email") or "").strip().lower()
     password = str(data.get("password") or "").strip()
     if not email or not password:
         raise HTTPException(status_code=400, detail="Email and password required")
+
+    # Brute-force protection: throttle per IP and per targeted email.
+    if request is not None:
+        rate_limit(request, "login", limit=10, window_seconds=300)
+        rate_limit(request, f"login_email:{email}", limit=10, window_seconds=900)
 
     db = get_client()
     res = db.table("users").select("*").eq("email", email).eq("status", "active").execute()
@@ -52,6 +76,13 @@ def login(data: dict = Body(...)):
     user = res.data[0]
     if not verify_password(password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    # Transparently upgrade legacy bcrypt hashes to Argon2id on successful login.
+    if needs_rehash(user["password_hash"]):
+        try:
+            db.table("users").update({"password_hash": hash_password(password)}).eq("id", user["id"]).execute()
+        except Exception:
+            pass
 
     name = f"{user['first_name']} {user['last_name']}"
     token = create_access_token(
@@ -73,10 +104,23 @@ def login(data: dict = Body(...)):
 @router.post("/change-password")
 def change_password(data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     new_password = str(data.get("new_password") or "").strip()
-    if len(new_password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    current_password = str(data.get("current_password") or "")
+    _validate_password_strength(new_password)
 
     db = get_client()
+    res = db.table("users").select("password_hash, must_reset_password").eq("id", user.user_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="User not found")
+    row = res.data[0]
+
+    # Verify the current password — except on a forced first-login reset, where
+    # the user only holds an admin-issued temp password they're replacing.
+    if not row.get("must_reset_password"):
+        if not current_password or not verify_password(current_password, row["password_hash"]):
+            raise HTTPException(status_code=403, detail="Current password is incorrect.")
+    if verify_password(new_password, row["password_hash"]):
+        raise HTTPException(status_code=400, detail="New password must be different from the current one.")
+
     db.table("users").update({
         "password_hash": hash_password(new_password),
         "must_reset_password": False,

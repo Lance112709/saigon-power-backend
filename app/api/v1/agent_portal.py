@@ -28,6 +28,9 @@ def _resolve_agent(user: UserContext, agent_param: Optional[str]) -> str:
             raise HTTPException(status_code=400,
                                 detail="Your login is not linked to a sales agent yet — ask the admin to set it.")
         return name
+    # Previewing another agent's book is a manager/admin-only capability.
+    if not user.is_manager:
+        raise HTTPException(status_code=403, detail="Access denied")
     if agent_param:
         return agent_param
     raise HTTPException(status_code=400, detail="Pass ?agent=<name> to preview an agent's portal.")
