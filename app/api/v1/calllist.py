@@ -16,6 +16,17 @@ def _days_until(date_str: Optional[str]) -> Optional[int]:
         return None
 
 
+def _is_month_to_month(deal: dict) -> bool:
+    """Month-to-month plans have no renewal date to chase — keep them off the
+    call list. The marker varies by import: rate_type 'Month-Month',
+    contract_term 'Month to Month', or a plan name containing it."""
+    for field in ("rate_type", "contract_term", "plan_name"):
+        v = str(deal.get(field) or "").lower().replace("-", " ").replace("_", " ")
+        if "month to month" in v or "month month" in v:
+            return True
+    return False
+
+
 def _score_customer(lead: dict, deals: list) -> tuple[int, list[str], str]:
     score = 0
     reasons = []
@@ -72,10 +83,14 @@ def get_call_list(
 
     lead_ids = [c["lead_id"] for c in customers if c.get("lead_id")]
 
-    # Batch fetch all active deals
+    # Batch fetch all active deals; month-to-month plans are excluded — there
+    # is no contract end date to call about, and customers whose only plan is
+    # month-to-month drop off the list entirely (they score 0 below).
     all_deals = db.table("lead_deals").select(
-        "id, lead_id, status, end_date, supplier, plan_name, product_type, est_kwh, adder"
+        "id, lead_id, status, end_date, supplier, plan_name, product_type, est_kwh, adder, "
+        "rate_type, contract_term"
     ).in_("lead_id", lead_ids).eq("status", "Active").execute().data or []
+    all_deals = [d for d in all_deals if not _is_month_to_month(d)]
 
     deals_by_lead: dict = {}
     for d in all_deals:
