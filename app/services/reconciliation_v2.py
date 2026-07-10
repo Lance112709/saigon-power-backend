@@ -264,8 +264,16 @@ def replace_prior_runs(db, supplier_id: str, label: str) -> dict:
 
 def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
                           rows: list, batch_id: str = None, deals: dict = None,
-                          actor: str = "system", carry_resolved: dict = None) -> dict:
-    """Reconcile one statement month of parsed rows. Returns run summary."""
+                          actor: str = "system", carry_resolved: dict = None,
+                          rule: dict = None) -> dict:
+    """Reconcile one statement month of parsed rows. Returns run summary.
+
+    `rule` is the versioned commission rule in force for this supplier+month
+    (see services/commission_rules.py). With no rule the expected rate is the
+    deal's contracted adder — identical to historical behavior."""
+    from app.services.commission_rules import evaluate_rule, rule_rate
+    from app.services.commission_snapshots import persist_snapshots
+
     if deals is None:
         deals = load_deals(db, provider_group)
     carry_resolved = carry_resolved or {}
@@ -284,6 +292,7 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
     status_reliable = not comm or (churn_rows / len(comm)) <= 0.5
 
     items = []
+    snaps = []  # permanent per-account calculation history (expected_commission_snapshots)
     totals = {"expected": 0.0, "actual": 0.0, "matched": 0, "short_paid": 0,
               "over_paid": 0, "missing": 0, "unexpected": 0}
 
@@ -304,14 +313,20 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
             sig_count[sig] = sig_count.get(sig, 0) + 1
         dup_extra = sum((c - 1) * (sig[2] or 0) for sig, c in sig_count.items() if c > 1)
 
-        # rate check
+        # rate check — the rule's rate governs when one exists, else the adder
         rate_loss, bad_rates = 0.0, set()
-        if deal and deal.get("adder") is not None:
+        exp_rate = deal["adder"] if deal else None
+        if deal and rule:
+            rr = rule_rate(rule, sum(r.get("usage_kwh") or 0 for r in group) or None,
+                           deal.get("adder"))
+            if rr is not None:
+                exp_rate = rr
+        if deal and exp_rate is not None:
             for r in group:
-                if r.get("rate") is not None and abs(r["rate"] - deal["adder"]) > RATE_TOLERANCE:
+                if r.get("rate") is not None and abs(r["rate"] - exp_rate) > RATE_TOLERANCE:
                     bad_rates.add(f"{r['rate']:g}")
-                    if r["rate"] < deal["adder"] and r.get("usage_kwh"):
-                        rate_loss += (deal["adder"] - r["rate"]) * r["usage_kwh"]
+                    if r["rate"] < exp_rate and r.get("usage_kwh"):
+                        rate_loss += (exp_rate - r["rate"]) * r["usage_kwh"]
 
         # churn status conflict (only when the status column is trustworthy)
         churn_status = ""
@@ -347,7 +362,7 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
             pct = (rate_loss / expected * 100) if expected else 100
             items.append({**base, "status": "short_paid", "severity": _sev(pct),
                           "resolution_notes": f"ROOT CAUSE: wrong commission rate — contract adder is "
-                                              f"{deal['adder']:g} but statement paid {', '.join(sorted(bad_rates))}. "
+                                              f"{exp_rate:g} but statement paid {', '.join(sorted(bad_rates))}. "
                                               f"Underpaid ${rate_loss:.2f} this month. Customer: {name}. "
                                               f"Verify contract; request true-up from provider."})
         elif churn_status:
@@ -360,6 +375,24 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
             totals["matched"] += 1
             items.append({**base, "status": "matched", "severity": "low", "resolution_notes": "",
                           "is_resolved": True})
+
+        kwh = sum(r.get("usage_kwh") or 0 for r in group) or None
+        snaps.append({
+            "supplier_id": supplier_id, "billing_month": f"{label}-01", "esiid": es,
+            "deal_source": deal["source"] if deal else None,
+            "deal_id": deal["id"] if deal else None,
+            "rule_id": rule["id"] if rule and rule.get("id") else None,
+            "rule_version": rule.get("version") if rule else None,
+            "expected_amount": round(expected, 4), "actual_amount": round(actual, 4),
+            "variance_amount": round(actual - expected, 4),
+            "kwh": kwh, "rate_expected": exp_rate,
+            "rate_paid": next((r["rate"] for r in group if r.get("rate") is not None), None),
+            "calc_method": "rule" if (rule and exp_rate != (deal or {}).get("adder")) else
+                           ("adder" if deal and deal.get("adder") is not None else "actual_plus_loss"),
+            "calc_detail": {"rows": len(group), "rate_loss": round(rate_loss, 4),
+                            "duplicate_extra": round(dup_extra, 4)},
+            "status": items[-1]["status"],
+        })
 
     # completeness: in-window active deals absent from this statement
     missing_deals = [d for es, d in by_esiid.items()
@@ -376,6 +409,11 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
 
     for d in missing_deals:
         est = round((d["adder"] or 0) * (d["est_kwh"] or 0), 2) or None
+        est_method = "adder"
+        if rule:
+            ev = evaluate_rule(rule, d.get("est_kwh"), d.get("adder"))
+            if ev is not None and ev[0]:
+                est, est_method = round(ev[0], 2), "rule"
         was_paid = d["esiid"] in prev_paid
         totals["missing"] += 1
         if est:
@@ -390,6 +428,18 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
                                  + ("Paid in a recent month then stopped — likely churned or provider dropped it; "
                                     "check with provider." if was_paid else
                                     "Never seen on any statement — verify enrollment with provider.")),
+        })
+        snaps.append({
+            "supplier_id": supplier_id, "billing_month": f"{label}-01", "esiid": d["esiid"],
+            "deal_source": d["source"], "deal_id": d["id"],
+            "rule_id": rule["id"] if rule and rule.get("id") else None,
+            "rule_version": rule.get("version") if rule else None,
+            "expected_amount": est, "actual_amount": None,
+            "variance_amount": -(est or 0), "kwh": d.get("est_kwh"),
+            "rate_expected": d.get("adder"), "rate_paid": None,
+            "calc_method": "estimate" if est_method == "adder" else "rule",
+            "calc_detail": {"previously_paid": was_paid},
+            "status": "missing",
         })
 
     run = db.table("reconciliation_runs").insert({
@@ -422,6 +472,10 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
                 it["resolution_notes"] = prior_note
     for i in range(0, len(items), 200):
         db.table("reconciliation_items").insert(items[i:i + 200]).execute()
+
+    for s in snaps:
+        s["reconciliation_run_id"] = run["id"]
+    persist_snapshots(db, snaps)
 
     return {
         "run_id": run["id"], "billing_month": label, "provider_group": provider_group,

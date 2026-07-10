@@ -176,3 +176,53 @@ def test_minority_churn_status_still_flagged():
                  [row(E1, 8.0, status="Inactive"),
                   row(E2, 8.0), row(E3, 8.0)])
     assert out["unexpected"] == 1
+
+
+# ── expected-commission snapshots (permanent calc history) ──
+
+def test_snapshots_written_for_every_account():
+    out, db = run([deal(E1), deal(E2)], [row(E1, 8.0)])  # E2 missing
+    snaps = db.tables["expected_commission_snapshots"]
+    assert len(snaps) == 2
+    by_es = {s["esiid"]: s for s in snaps}
+    assert by_es[E1]["status"] == "matched"
+    assert by_es[E1]["rate_expected"] == 0.008
+    assert by_es[E2]["status"] == "missing"
+    assert by_es[E2]["actual_amount"] is None
+    assert all(s["reconciliation_run_id"] for s in snaps)
+
+
+def test_second_run_appends_snapshots_never_overwrites():
+    db = FakeDB()
+    deals = {"by_esiid": {deal(E1)["esiid"]: deal(E1)}, "no_esiid": [], "addr_index": {}}
+    run_reconciliation_v2(db, SUP, "Budget Power", "2026-05", [row(E1, 8.0)], deals=deals)
+    first = len(db.tables["expected_commission_snapshots"])
+    run_reconciliation_v2(db, SUP, "Budget Power", "2026-05", [row(E1, 8.0)], deals=deals)
+    assert len(db.tables["expected_commission_snapshots"]) == first * 2
+
+
+# ── versioned rule overrides the adder ──
+
+def test_rule_fixed_rate_overrides_deal_adder():
+    # deal says 5 mills but the provider contract (rule) says 8 mills
+    db = FakeDB()
+    d = deal(E1, adder=0.005)
+    deals = {"by_esiid": {E1: d}, "no_esiid": [], "addr_index": {}}
+    rule = {"id": "rule-1", "version": 1, "rule_type": "rate_per_kwh",
+            "config": {"rate": 0.008, "rate_source": "fixed"}}
+    out = run_reconciliation_v2(db, SUP, "Budget Power", "2026-05",
+                                [row(E1, 5.0, rate=0.005)], deals=deals, rule=rule)
+    assert out["short_paid"] == 1
+    item = next(i for i in db.tables["reconciliation_items"] if i["status"] == "short_paid")
+    assert abs(item["expected_amount"] - 8.0) < 0.01
+    snap = db.tables["expected_commission_snapshots"][0]
+    assert snap["rule_id"] == "rule-1" and snap["calc_method"] == "rule"
+
+
+def test_no_rule_behavior_unchanged():
+    # identical to test_wrong_rate_detected_with_dollars_lost — guard rail that
+    # zero configured rules keeps the engine byte-identical to before
+    out, db = run([deal(E1, adder=0.008)], [row(E1, 5.0, rate=0.005)])
+    assert out["short_paid"] == 1
+    snap = db.tables["expected_commission_snapshots"][0]
+    assert snap["rule_id"] is None and snap["calc_method"] == "adder"

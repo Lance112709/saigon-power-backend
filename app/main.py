@@ -91,7 +91,10 @@ try:
     scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
     scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
     scheduler.add_job(_run_statement_watchdog, "cron", day=10, hour=9, minute=30)
-    scheduler.add_job(_run_email_ingest, "cron", day="last", hour=9, minute=0)  # end of month ("30th"; Feb-safe)
+    # Daily: providers pay through the month — pull statement emails, import,
+    # audit, and alert every morning (poll_inbox is hash-idempotent, so a
+    # statement is never processed twice).
+    scheduler.add_job(_run_email_ingest, "cron", hour=9, minute=15)
     # Phase 2 pricing automation: NRG emails the matrix each business morning;
     # poll weekday mornings so agents have fresh rates by the time they log in.
     scheduler.add_job(_run_pricing_ingest, "cron", day_of_week="mon-fri", hour="6-12", minute="*/20")

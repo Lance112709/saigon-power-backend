@@ -484,3 +484,118 @@ def supplier_breakdown(billing_month: Optional[str] = Query(None), user: UserCon
             "wrong_rate": r["short_paid_count"] or 0,
         })
     return result
+
+
+@router.get("/commission-intelligence")
+def commission_intelligence(billing_month: Optional[str] = Query(None),
+                            user: UserContext = Depends(require_manager)):
+    """Executive commission-audit numbers: expected vs received, money at
+    risk (open exception cases), disputes, recovery rate."""
+    from app.services.reconciliation_v2 import fetch_all
+    from app.services.exception_cases import OPEN_STATUSES
+    db = get_client()
+    runs = _latest_v2_runs(db, billing_month)
+    total_expected = round(sum(r["total_expected"] or 0 for r in runs), 2)
+    total_received = round(sum(r["total_actual"] or 0 for r in runs), 2)
+
+    def _safe(table, cols, filters=None):
+        try:
+            return fetch_all(db, table, cols, filters=filters)
+        except Exception:
+            return []  # migration 008 not applied yet
+
+    cases = _safe("exception_cases",
+                  "supplier_id,workflow_status,estimated_loss,recovered_amount,billing_month")
+    open_cases = [c for c in cases if c.get("workflow_status") in OPEN_STATUSES]
+    money_at_risk = round(sum(float(c.get("estimated_loss") or 0) for c in open_cases), 2)
+    recovered_total = round(sum(float(c.get("recovered_amount") or 0) for c in cases), 2)
+    this_month = datetime.now(timezone.utc).strftime("%Y-%m")
+    recovered_this_month = round(sum(
+        float(c.get("recovered_amount") or 0) for c in cases
+        if c.get("workflow_status") == "recovered"
+        and str(c.get("billing_month"))[:7] == this_month), 2)
+    denom = recovered_total + money_at_risk
+    recovery_rate = round(recovered_total / denom * 100, 1) if denom else None
+
+    disputes = _safe("disputes", "status,total_claimed,total_recovered")
+    pending = [d for d in disputes if d.get("status") in ("draft", "sent", "provider_responded")]
+    findings = _safe("audit_findings",
+                     "id,title,finding_type,estimated_impact,affected_count,status,billing_month,supplier_id")
+    open_findings = sorted([f for f in findings if f.get("status") in ("open", "investigating", "disputed")],
+                           key=lambda f: -(float(f.get("estimated_impact") or 0)))
+
+    sups = {s["id"]: s for s in db.table("suppliers").select("id,name,code").limit(500).execute().data or []}
+    accuracy = []
+    for r in runs:
+        total_items = sum((r.get(k) or 0) for k in
+                          ("matched_count", "short_paid_count", "over_paid_count",
+                           "missing_count", "unexpected_count"))
+        open_loss = round(sum(float(c.get("estimated_loss") or 0) for c in open_cases
+                              if c["supplier_id"] == r["supplier_id"]), 2)
+        accuracy.append({
+            "supplier_id": r["supplier_id"],
+            "supplier_name": (r.get("suppliers") or {}).get("name")
+                             or sups.get(r["supplier_id"], {}).get("name", ""),
+            "billing_month": str(r["billing_month"])[:7],
+            "accuracy_pct": round((r.get("matched_count") or 0) / total_items * 100, 1)
+                            if total_items else None,
+            "open_loss": open_loss,
+        })
+    accuracy.sort(key=lambda a: (a["accuracy_pct"] if a["accuracy_pct"] is not None else 101))
+
+    return {
+        "total_expected": total_expected,
+        "total_received": total_received,
+        "total_missing": round(max(0.0, total_expected - total_received), 2),
+        "money_at_risk": money_at_risk,
+        "open_cases": len(open_cases),
+        "recovered_total": recovered_total,
+        "recovered_this_month": recovered_this_month,
+        "recovery_rate": recovery_rate,
+        "pending_disputes": {"count": len(pending),
+                             "claimed": round(sum(float(d.get("total_claimed") or 0)
+                                                  for d in pending), 2)},
+        "recovered_via_disputes": round(sum(float(d.get("total_recovered") or 0)
+                                            for d in disputes), 2),
+        "open_findings": [{**f, "supplier_name": sups.get(f.get("supplier_id"), {}).get("name", "")}
+                          for f in open_findings[:8]],
+        "provider_accuracy": accuracy,
+    }
+
+
+@router.get("/provider-scorecards")
+def provider_scorecards(months: int = Query(6), user: UserContext = Depends(require_manager)):
+    """Per-provider monthly accuracy/discrepancy history for the scorecard chart."""
+    db = get_client()
+    runs = db.table("reconciliation_runs").select(
+        "billing_month,supplier_id,total_expected,total_actual,total_discrepancy,"
+        "matched_count,short_paid_count,over_paid_count,missing_count,unexpected_count,"
+        "suppliers(name,code)"
+    ).like("notes", '%"engine": "v2"%').order("billing_month", desc=True) \
+        .limit(1000).execute().data or []
+
+    seen_months = sorted({str(r["billing_month"])[:7] for r in runs}, reverse=True)[:months]
+    out = {}
+    for r in runs:
+        m = str(r["billing_month"])[:7]
+        if m not in seen_months:
+            continue
+        key = r["supplier_id"]
+        entry = out.setdefault(key, {
+            "supplier_id": key,
+            "supplier_name": (r.get("suppliers") or {}).get("name", ""),
+            "months": {},
+        })
+        total_items = sum((r.get(k) or 0) for k in
+                          ("matched_count", "short_paid_count", "over_paid_count",
+                           "missing_count", "unexpected_count"))
+        if m not in entry["months"]:
+            entry["months"][m] = {
+                "expected": round(r.get("total_expected") or 0, 2),
+                "received": round(r.get("total_actual") or 0, 2),
+                "discrepancy": round(r.get("total_discrepancy") or 0, 2),
+                "accuracy_pct": round((r.get("matched_count") or 0) / total_items * 100, 1)
+                                if total_items else None,
+                "issues": total_items - (r.get("matched_count") or 0),
+            }
+    return {"months": sorted(seen_months), "providers": list(out.values())}

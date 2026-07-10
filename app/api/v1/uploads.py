@@ -28,6 +28,10 @@ from app.services.reconciliation_v2 import (
 )
 from app.services.status_sync import TRUSTED_STATUS_GROUPS, ABSENCE_SYNC_GROUPS, absence_sync, sync_statuses
 from app.services.audit import audit
+from app.services.audit_detections import run_extended_audit
+from app.services.audit_notifications import notify_big_findings
+from app.services.commission_rules import get_rule_for_month
+from app.services.exception_cases import upsert_cases_from_run
 from app.auth.deps import require_admin, UserContext
 
 router = APIRouter()
@@ -157,6 +161,7 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
         batch_counts = {}
         for r in rows:
             batch_counts[r["statement_label"]] = batch_counts.get(r["statement_label"], 0) + 1
+        all_findings = []
         for label in labels:
             # Reconcile ALL imported rows for this supplier+month (merges
             # supplemental statements, catches cross-upload duplicates) and
@@ -166,9 +171,34 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
             if len(merged) > batch_counts.get(label, 0):
                 warnings.append(f"{label}: merged with {len(merged) - batch_counts[label]} rows "
                                 f"from earlier uploads for the same month")
-            runs.append(run_reconciliation_v2(
+            rule = None
+            try:
+                rule = get_rule_for_month(db, supplier_id, label)
+            except Exception:
+                pass  # rules table not created yet — plain adder math applies
+            summary = run_reconciliation_v2(
                 db, supplier_id, provider_group, label, merged,
-                batch_id=batch_id, deals=deals, actor=actor, carry_resolved=carry))
+                batch_id=batch_id, deals=deals, actor=actor, carry_resolved=carry,
+                rule=rule)
+            # Extended audit + durable cases are best-effort: an import must
+            # never fail because of them (POST /reconciliation/run repairs).
+            try:
+                findings = run_extended_audit(db, supplier_id, provider_group, label,
+                                              merged, deals, run_id=summary["run_id"],
+                                              actor=actor)
+                all_findings.extend(findings)
+                if findings:
+                    warnings.append(f"{label}: {len(findings)} audit finding(s) — "
+                                    + "; ".join(f["title"] for f in findings[:3]))
+            except Exception:
+                pass
+            summary["cases"] = upsert_cases_from_run(db, summary["run_id"], supplier_id,
+                                                     label, deals=deals, actor=actor)
+            runs.append(summary)
+        try:
+            notify_big_findings(db, provider_group or "", runs, all_findings)
+        except Exception:
+            pass
 
     total = round(sum(rec["raw_amount"] for rec in records), 2)
     difference = round(total - amount_received, 2) if amount_received is not None else None

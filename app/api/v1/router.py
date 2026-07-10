@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import commercial_pricing, commission_payments, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, email as email_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre
+from app.api.v1 import commercial_pricing, commission_payments, commission_rules, disputes as disputes_module, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, email as email_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -14,6 +14,8 @@ router.include_router(commissions.router, prefix="/commissions", tags=["Commissi
 router.include_router(uploads.router, prefix="/uploads", tags=["Uploads"])
 router.include_router(reconciliation.router, prefix="/reconciliation", tags=["Reconciliation"])
 router.include_router(commission_payments.router, prefix="/commission-payments", tags=["Commission Payments"])
+router.include_router(commission_rules.router, prefix="/commission-rules", tags=["Commission Rules"])
+router.include_router(disputes_module.router, prefix="/disputes", tags=["Disputes"])
 router.include_router(commercial_pricing.router, prefix="/commercial-pricing", tags=["Commercial Pricing"])
 router.include_router(dashboard.router, prefix="/dashboard", tags=["Dashboard"])
 router.include_router(crm.router, prefix="/crm", tags=["CRM"])

@@ -415,8 +415,64 @@ def executive_context(db) -> dict:
         "renewals_open": metrics.get("renewals"),
         "data_quality": metrics.get("data_quality"),
     }
+
+    # Commission audit intelligence (Phase 1 engine): what each provider owes
+    # us right now, the biggest systemic findings, and dispute recovery status.
+    try:
+        ctx["commission_audit"] = _commission_audit_context(db)
+    except Exception:
+        pass  # migration 008 not applied yet
+
     # keep the prompt lean
     return _json.loads(_json.dumps(ctx, default=str))
+
+
+def _commission_audit_context(db) -> dict:
+    """Bounded summary of exception cases, findings, and disputes for the AI."""
+    from app.services.reconciliation_v2 import fetch_all
+    from app.services.exception_cases import OPEN_STATUSES
+
+    sups = {s["id"]: s["name"] for s in
+            db.table("suppliers").select("id,name").limit(500).execute().data or []}
+
+    per_provider: dict = {}
+    cases = fetch_all(db, "exception_cases",
+                      "supplier_id,workflow_status,estimated_loss,recovered_amount,issue_type")
+    for c in cases:
+        name = sups.get(c["supplier_id"], "Unknown")
+        p = per_provider.setdefault(name, {"open_cases": 0, "estimated_owed": 0.0,
+                                           "recovered": 0.0})
+        if c.get("workflow_status") in OPEN_STATUSES:
+            p["open_cases"] += 1
+            p["estimated_owed"] += float(c.get("estimated_loss") or 0)
+        p["recovered"] += float(c.get("recovered_amount") or 0)
+    for p in per_provider.values():
+        p["estimated_owed"] = round(p["estimated_owed"], 2)
+        p["recovered"] = round(p["recovered"], 2)
+
+    findings = db.table("audit_findings").select(
+        "title,explanation,finding_type,estimated_impact,affected_count,status,billing_month,supplier_id") \
+        .in_("status", ["open", "investigating", "disputed"]) \
+        .order("estimated_impact", desc=True).limit(5).execute().data or []
+    for f in findings:
+        f["provider"] = sups.get(f.pop("supplier_id", None), "")
+        f["explanation"] = (f.get("explanation") or "")[:280]
+
+    disputes = db.table("disputes").select("status,total_claimed,total_recovered") \
+        .limit(500).execute().data or []
+    return {
+        "providers_owing_us": {k: v for k, v in per_provider.items()
+                               if v["open_cases"] or v["recovered"]},
+        "top_open_findings": findings,
+        "disputes": {
+            "draft": sum(1 for d in disputes if d["status"] == "draft"),
+            "sent_awaiting_response": sum(1 for d in disputes if d["status"] == "sent"),
+            "total_claimed": round(sum(float(d.get("total_claimed") or 0)
+                                       for d in disputes), 2),
+            "total_recovered": round(sum(float(d.get("total_recovered") or 0)
+                                         for d in disputes), 2),
+        },
+    }
 
 
 EXEC_SYSTEM = """You are the AI Chief of Staff for Saigon Power LLC — part CEO advisor, part CFO, part operations manager.
@@ -732,6 +788,39 @@ def _keyword_chat(message: str, history: list) -> str:
         return any(k in q for k in keywords)
 
     parts = []
+
+    # ── Commission audit: "how much does NRG owe us?", disputes, shortfalls ──
+    if _want("owe", "owed", "owes", "dispute", "disputes", "shortfall", "underpaid",
+             "under paid", "wrong mil", "wrong rate", "missing commission", "clawback"):
+        try:
+            audit_ctx = _commission_audit_context(db)
+            owing = audit_ctx.get("providers_owing_us") or {}
+            named = [n for n in owing if n.lower() in q]  # e.g. "how much does NRG owe us"
+            show = named or list(owing)
+            lines = []
+            for name in sorted(show, key=lambda n: -owing[n]["estimated_owed"]):
+                p = owing[name]
+                lines.append(f"{name}: {_fmt_money(p['estimated_owed'])} across "
+                             f"{p['open_cases']} open case(s)"
+                             + (f" · {_fmt_money(p['recovered'])} recovered" if p["recovered"] else ""))
+            total = sum(owing[n]["estimated_owed"] for n in show)
+            parts.append(_section(f"Estimated owed to Saigon — {_fmt_money(total)} total",
+                                  lines or ["No open exception cases. All statements reconcile clean."]))
+            fs = audit_ctx.get("top_open_findings") or []
+            if fs:
+                parts.append(_section("Biggest open findings", [
+                    f"{f['title']} — est. {_fmt_money(f.get('estimated_impact') or 0)} ({f.get('status')})"
+                    for f in fs[:5]]))
+            d = audit_ctx.get("disputes") or {}
+            parts.append(_section("Disputes", [
+                f"Drafts awaiting your review: {d.get('draft', 0)}",
+                f"Sent, awaiting provider: {d.get('sent_awaiting_response', 0)}",
+                f"Claimed {_fmt_money(d.get('total_claimed') or 0)} · Recovered {_fmt_money(d.get('total_recovered') or 0)}",
+            ]))
+            parts.append("Manage these on the Reconciliation and Disputes pages.")
+            return "\n\n".join(parts)
+        except Exception:
+            pass  # audit tables not available — fall through to generic answers
 
     # ── Full summary / overview / status ──
     if _want("summary", "overview", "status", "everything", "update", "report", "whats going on", "what's going on", "tell me about", "how are we", "how is"):
