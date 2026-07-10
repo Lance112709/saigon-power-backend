@@ -23,7 +23,7 @@ def send_manual_sms(data: dict = Body(...), user: UserContext = Depends(get_curr
     result = send_sms(
         to=to,
         body=body,
-        user_id=user.id,
+        user_id=user.user_id,
         lead_id=data.get("lead_id") or None,
         customer_id=data.get("customer_id") or None,
         deal_id=data.get("deal_id") or None,

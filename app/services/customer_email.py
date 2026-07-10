@@ -130,6 +130,36 @@ def renewal_email_html(name: str, provider: str, plan: str, end_date: str,
     return _shell(inner)
 
 
+def render_email_body(body: str, variables: dict) -> str:
+    """Merge {{tags}} into a template/composed body (same tag syntax as SMS)."""
+    for k, v in (variables or {}).items():
+        body = body.replace(f"{{{{{k}}}}}", str(v or ""))
+    return body.strip()
+
+
+def _escape(text: str) -> str:
+    return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def compose_email_html(body: str) -> str:
+    """Wrap a staff-written plain-text message in the branded shell.
+
+    The body is treated as plain text (HTML-escaped) with newlines preserved,
+    so operators can't inject markup and the email still renders on-brand.
+    """
+    safe = _escape(body).replace("\r\n", "\n").strip()
+    paragraphs = [p.strip() for p in safe.split("\n\n") if p.strip()]
+    html_parts = [
+        f'<p style="color:#334155;font-size:15px;line-height:1.7;margin:0 0 14px;">'
+        f'{p.replace(chr(10), "<br>")}</p>'
+        for p in paragraphs
+    ]
+    inner = "\n".join(html_parts) or '<p style="color:#334155;">&nbsp;</p>'
+    inner += (f'<p style="color:#94a3b8;font-size:12px;margin:18px 0 0;">'
+              f'Reply to this email or call {PHONE_DISPLAY} — we speak English &amp; Tiếng Việt.</p>')
+    return _shell(inner)
+
+
 def fetch_signed_pdf_attachment(db, storage_path: str) -> dict:
     """Download the signed contract from storage and shape it as a Resend attachment."""
     try:
