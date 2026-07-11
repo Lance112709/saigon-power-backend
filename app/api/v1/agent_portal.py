@@ -119,6 +119,58 @@ def overview(agent: Optional[str] = Query(None), user: UserContext = Depends(get
         "last_commission": last_comm,
         "plan_components": components,
         "has_plan": bool(components),
+        "sgp": _sgp_payload(db, name),
+    }
+
+
+def _sgp_payload(db, agent_name: str):
+    """SGP tier standing for the agent's own dashboard. None unless the agent
+    is classified SGP_AGENT (referral partners and others see nothing)."""
+    try:
+        from app.services.sgp_tiers import is_eligible, load_tiers
+        agents = fetch_all(db, "sales_agents",
+                           "id,name,classification,agreement_status,sgp_suspended,"
+                           "agreement_terminated_at,agreement_effective_at,current_tier,tier_effective_from")
+    except Exception:
+        return None
+    me = next((a for a in agents if norm_name(a.get("name")) == norm_name(agent_name)), None)
+    if not me or (me.get("classification") or "") != "SGP_AGENT":
+        return None
+    eligible, reason = is_eligible(me)
+    tiers = load_tiers(db)
+    by_order = {t["tier_order"]: t for t in tiers}
+    cur = me.get("current_tier")
+    progress_rows = fetch_all(db, "sgp_tier_progress", "tier_order,qualifying_month,eligible_gp",
+                              filters=[("eq", ("agent_id", me["id"]))])
+    by_tier: dict = {}
+    for p in progress_rows:
+        by_tier.setdefault(p["tier_order"], []).append(
+            {"month": str(p["qualifying_month"])[:7], "gp": float(p["eligible_gp"])})
+    for months in by_tier.values():
+        months.sort(key=lambda m: m["month"])
+
+    remaining = [t for t in tiers if t["tier_order"] > (cur or 0)]
+    progress = [{"tier": t["tier_order"], "name": t["name"], "split": float(t["agent_split"]),
+                 "threshold": float(t["monthly_gp_threshold"]),
+                 "months": by_tier.get(t["tier_order"], []),
+                 "have": len(by_tier.get(t["tier_order"], [])),
+                 "needed": int(t["required_qualifying_months"])} for t in remaining]
+    nxt = progress[0] if progress else None
+    cur_tier = by_order.get(cur) if cur else None
+    return {
+        "eligible": eligible,
+        "eligibility_reason": None if eligible else reason,
+        "agreement_status": me.get("agreement_status"),
+        "tier": cur,
+        "tier_name": cur_tier["name"] if cur_tier else None,
+        "split": float(cur_tier["agent_split"]) if cur_tier else None,
+        "company_split": float(cur_tier["company_split"]) if cur_tier else None,
+        "permanent": True,
+        "at_max": bool(cur_tier and cur_tier.get("is_max")),
+        "max_split": max(float(t["agent_split"]) for t in tiers) if tiers else 70.0,
+        "tier_effective_from": str(me.get("tier_effective_from") or "")[:10] or None,
+        "progress": progress,
+        "next_target": nxt,
     }
 
 

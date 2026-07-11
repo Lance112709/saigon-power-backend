@@ -84,6 +84,16 @@ def _run_statement_watchdog():
     except Exception:
         pass
 
+
+def _run_sgp_evaluation():
+    """Fold last month's provider-paid GP into SGP tier progress and apply
+    any permanently earned promotions (idempotent)."""
+    try:
+        from app.services.sgp_tiers import run_monthly_evaluation
+        run_monthly_evaluation()
+    except Exception:
+        pass
+
 try:
     scheduler = BackgroundScheduler(timezone="America/Chicago")
     scheduler.add_job(_run_reminders, "cron", hour=8, minute=0)
@@ -91,6 +101,9 @@ try:
     scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
     scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
     scheduler.add_job(_run_statement_watchdog, "cron", day=10, hour=9, minute=30)
+    # Day 10, after the watchdog: fold last month's provider-paid GP into SGP
+    # tier progress and apply any permanently earned promotions.
+    scheduler.add_job(_run_sgp_evaluation, "cron", day=10, hour=10, minute=0)
     # Daily: providers pay through the month — pull statement emails, import,
     # audit, and alert every morning (poll_inbox is hash-idempotent, so a
     # statement is never processed twice).

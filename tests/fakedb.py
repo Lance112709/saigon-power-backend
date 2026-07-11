@@ -43,6 +43,10 @@ class FakeQuery:
         self.filters.append(lambda r: r.get(col) is not None and r.get(col) >= val)
         return self
 
+    def lt(self, col, val):
+        self.filters.append(lambda r: r.get(col) is not None and r.get(col) < val)
+        return self
+
     def lte(self, col, val):
         self.filters.append(lambda r: r.get(col) is not None and r.get(col) <= val)
         return self

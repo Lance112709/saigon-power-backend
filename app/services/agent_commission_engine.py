@@ -84,12 +84,39 @@ def _excluded(plan_type: str, rules: dict) -> bool:
     return bool(pt) and any(norm_name(x) == pt for x in (rules or {}).get("exclude_plan_types") or [])
 
 
-def load_agent_plans(db) -> dict:
+def load_agent_plans(db, payout_label: str = None) -> dict:
+    """All agent plans keyed by normalized name.
+
+    With `payout_label` (YYYY-MM), eligible SGP Agents' plans are replaced by
+    their permanent tier split for that month (see services/sgp_tiers.py).
+    Agents not classified SGP_AGENT are byte-identical to the plain call —
+    the tier program is strictly opt-in."""
     agents = fetch_all(db, "sales_agents", "id,name,commission_rules")
-    return {norm_name(a["name"]): {"id": a["id"], "name": a["name"],
-                                   "rules": a.get("commission_rules") or {},
-                                   "components": plan_components(a.get("commission_rules"))}
-            for a in agents if a.get("name")}
+    plans = {norm_name(a["name"]): {"id": a["id"], "name": a["name"],
+                                    "rules": a.get("commission_rules") or {},
+                                    "components": plan_components(a.get("commission_rules"))}
+             for a in agents if a.get("name")}
+    if payout_label:
+        try:
+            from app.services.sgp_tiers import apply_sgp_overrides
+            plans = apply_sgp_overrides(db, plans, payout_label)
+        except Exception:
+            pass  # SGP tables not migrated yet — legacy behavior
+    return plans
+
+
+def _sgp_pct_for_deal(plan: dict, deal_start) -> float:
+    """NEXT_DEAL promotion rule: a deal keeps the split that was current when
+    it started; deals started after a promotion get the new split."""
+    history = plan.get("sgp_history") or []
+    if not history or not deal_start:
+        return float(plan.get("sgp_split") or 0)
+    start = str(deal_start)[:10]
+    pct = float(plan.get("sgp_base_split") or history[0]["split"])
+    for h in history:
+        if h["effective_from"] <= start:
+            pct = float(h["split"])
+    return pct
 
 
 def load_deal_book(db) -> dict:
@@ -106,11 +133,11 @@ def load_deal_book(db) -> dict:
 
     for d in fetch_all(db, "lead_deals",
                        "id,status,supplier,esiid,adder,rate_type,plan_name,contract_term,sales_agent,"
-                       "provider_status,leads(first_name,last_name)"):
+                       "provider_status,start_date,leads(first_name,last_name)"):
         lead = d.get("leads") or {}
         put(d.get("esiid"), {
             "source": "lead_deals", "id": d["id"], "active": d.get("status") == "Active",
-            "provider_status": d.get("provider_status"),
+            "provider_status": d.get("provider_status"), "start": d.get("start_date"),
             "agent": (d.get("sales_agent") or "").strip(),
             "supplier": (d.get("supplier") or "").strip(),
             "plan_type": (d.get("rate_type") or d.get("plan_name") or d.get("contract_term") or "").strip(),
@@ -119,11 +146,11 @@ def load_deal_book(db) -> dict:
         })
     for d in fetch_all(db, "crm_deals",
                        "id,deal_status,provider,esiid,adder,product_type,contract_term,sales_agent,business_name,"
-                       "provider_status,crm_customers(full_name)"):
+                       "provider_status,contract_start_date,crm_customers(full_name)"):
         cust = d.get("crm_customers") or {}
         put(d.get("esiid"), {
             "source": "crm_deals", "id": d["id"], "active": d.get("deal_status") == "ACTIVE",
-            "provider_status": d.get("provider_status"),
+            "provider_status": d.get("provider_status"), "start": d.get("contract_start_date"),
             "agent": (d.get("sales_agent") or "").strip(),
             "supplier": (d.get("provider") or "").strip(),
             "plan_type": (d.get("product_type") or d.get("contract_term") or "").strip(),
@@ -162,7 +189,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
     Returns {agents: {display_name: {...}}, unassigned: {...}, warnings: [...]}.
     """
     label = _month_label(year, month)
-    plans = plans if plans is not None else load_agent_plans(db)
+    plans = plans if plans is not None else load_agent_plans(db, payout_label=label)
     book = book if book is not None else load_deal_book(db)
 
     rows = _paid_rows(db, label)
@@ -238,11 +265,19 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
                         b["residual"] += amt
                         applied.append(f"{c.get('rate'):g}/kWh × {kwh:g} = ${amt:.2f}")
                 elif ctype == "percent_of_commission":
-                    amt = float(c.get("percent") or 0) / 100.0 * gross
+                    pct = float(c.get("percent") or 0)
+                    if plan.get("sgp_history"):
+                        pct = _sgp_pct_for_deal(plan, deal.get("start"))
+                    amt = pct / 100.0 * gross
                     if amt:
                         payout += amt
                         b["residual"] += amt
-                        applied.append(f"{c.get('percent'):g}% of ${gross:.2f} = ${amt:.2f}")
+                        if plan.get("sgp_tier"):
+                            label_txt = (f"SGP Tier {plan['sgp_tier']}" if pct == plan.get("sgp_split")
+                                         else "SGP")
+                            applied.append(f"{label_txt} ({pct:g}%) of ${gross:.2f} = ${amt:.2f}")
+                        else:
+                            applied.append(f"{pct:g}% of ${gross:.2f} = ${amt:.2f}")
                 elif ctype == "flat_per_deal":
                     if esiid in first_payment_esiids:
                         amt = float(c.get("amount") or 0)
@@ -274,6 +309,10 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
                 b["total"] += amt
 
     warnings = []
+    # SGP eligibility notes (e.g. classified SGP but agreement not approved)
+    for plan in plans.values():
+        if isinstance(plan, dict) and plan.get("sgp_warning") and plan.get("name") in agents:
+            warnings.append(plan["sgp_warning"])
     for nm, cnt in sorted(unknown_agent_names.items()):
         warnings.append(f"Deals credit agent '{nm}' ({cnt} paid accounts) but no such agent is registered — "
                         f"add them (or fix the name on the deals) and recalculate.")
