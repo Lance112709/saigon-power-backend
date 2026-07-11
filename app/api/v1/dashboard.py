@@ -3,7 +3,7 @@ from typing import Optional
 import re
 from datetime import date, datetime, timezone, timedelta
 from app.db.client import get_client
-from app.auth.deps import require_manager, get_current_user, UserContext
+from app.auth.deps import require_manager, require_admin, get_current_user, UserContext
 
 router = APIRouter()
 
@@ -564,7 +564,7 @@ def commission_intelligence(billing_month: Optional[str] = Query(None),
 
 
 @router.get("/provider-scorecards")
-def provider_scorecards(months: int = Query(6), user: UserContext = Depends(require_manager)):
+def provider_scorecards(months: int = Query(6), user: UserContext = Depends(require_admin)):
     """Per-provider monthly accuracy/discrepancy history for the scorecard chart."""
     db = get_client()
     runs = db.table("reconciliation_runs").select(
