@@ -378,6 +378,21 @@ def _search_match(r: dict, s: str) -> bool:
             or s in (r.get("city") or "").lower())
 
 
+def _sanitize_sub(row: dict) -> dict:
+    """Strip payment tokens and the portal password hash before the staff UI.
+
+    The masked display fields (card_last4/brand/expiry) are all the UI needs;
+    vault tokens, in-flight checkout secrets, and portal_auth stay server-side.
+    """
+    row = dict(row)
+    for secret in ("helcim_card_token", "helcim_customer_code"):
+        row.pop(secret, None)
+    if isinstance(row.get("extra"), dict):
+        row["extra"] = {k: v for k, v in row["extra"].items()
+                        if k not in ("pending_checkout", "portal_auth")}
+    return row
+
+
 @router.get("/subscriptions")
 def list_subscriptions(
     search: Optional[str] = Query(None),
@@ -411,10 +426,12 @@ def list_subscriptions(
             if len(page) < 1000:
                 break
             off += 1000
-        return {"subscriptions": found[offset:offset + limit], "total": len(found)}
+        return {"subscriptions": [_sanitize_sub(r) for r in found[offset:offset + limit]],
+                "total": len(found)}
 
     res = q.range(offset, offset + limit - 1).execute()
-    return {"subscriptions": res.data or [], "total": res.count or 0}
+    return {"subscriptions": [_sanitize_sub(r) for r in (res.data or [])],
+            "total": res.count or 0}
 
 
 @router.get("/subscriptions/stats")
@@ -547,14 +564,7 @@ def get_subscription(id: str, user: UserContext = Depends(get_current_user)):
         .limit(1).execute().data
     if not rows:
         raise HTTPException(status_code=404, detail="Subscription not found")
-    sub = rows[0]
-    # Never expose payment secrets to the client. Card vault tokens / customer
-    # codes and in-flight checkout secrets stay server-side; the UI only needs
-    # the masked card display fields (card_last4 / card_brand / card_expiry).
-    for _secret in ("helcim_card_token", "helcim_customer_code"):
-        sub.pop(_secret, None)
-    if isinstance(sub.get("extra"), dict):
-        sub["extra"] = {k: v for k, v in sub["extra"].items() if k != "pending_checkout"}
+    sub = _sanitize_sub(rows[0])
     customer = None
     if sub.get("crm_customer_id"):
         c = db.table("crm_customers").select("*").eq("id", sub["crm_customer_id"]) \

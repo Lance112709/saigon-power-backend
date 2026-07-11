@@ -44,6 +44,7 @@ def trigger_reconciliation(billing_month: str, supplier_id: Optional[str] = None
         summary = run_reconciliation_v2(
             db, sup_id, group, label, rows,
             deals=deals, actor=actor, carry_resolved=carry, rule=rule)
+        findings = []
         try:
             findings = run_extended_audit(db, sup_id, group, label, rows, deals,
                                           run_id=summary["run_id"], actor=actor)
@@ -54,6 +55,12 @@ def trigger_reconciliation(billing_month: str, supplier_id: Optional[str] = None
             summary["findings_error"] = str(e)[:200]
         summary["cases"] = upsert_cases_from_run(db, summary["run_id"], sup_id, label,
                                                  deals=deals, actor=actor)
+        # Alert on wrong rates / big misses from manual re-runs too, not just imports
+        try:
+            from app.services.audit_notifications import notify_big_findings
+            notify_big_findings(db, group, [summary], findings)
+        except Exception:
+            pass
         results.append(summary)
     if not results:
         raise HTTPException(status_code=404,
