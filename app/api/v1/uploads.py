@@ -114,10 +114,24 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
             "service_start": r.get("service_start"), "service_end": r.get("service_end"),
             "provider_status": r.get("provider_status"), "row_type": r.get("row_type", "commission"),
             "statement_label": r.get("statement_label"),
+            "contract_start": r.get("contract_start"), "contract_end": r.get("contract_end"),
             "deal_source": deal["source"] if deal else None,
             "deal_id": deal["id"] if deal else None,
             "lead_id": deal.get("lead_id") if deal else None,
         }
+        # Self-healing: statements carry the contract stop date — fill it onto
+        # deals that don't have one so renewals/call list/forecast stay accurate.
+        if deal and r.get("contract_end") and not deal.get("end"):
+            end_col = "contract_end_date" if deal["source"] == "crm_deals" else "end_date"
+            end_val = str(r["contract_end"])[:10]
+            try:
+                db.table(deal["source"]).update({end_col: end_val}).eq("id", deal["id"]).execute()
+                audit(db, deal["source"], deal["id"], "end_date_backfilled",
+                      {end_col: None}, {end_col: end_val},
+                      reason="Contract stop date from imported statement", actor=actor)
+                deal["end"] = end_val
+            except Exception:
+                pass
         records.append({
             "upload_batch_id": batch_id,
             "supplier_id": supplier_id,

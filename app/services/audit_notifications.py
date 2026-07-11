@@ -68,13 +68,18 @@ def notify_big_findings(db, provider_name: str, run_results: list,
                       {"missing": r["missing"], "loss": round(missing_loss, 2)}):
                 lines.append("• " + msg)
         if r.get("short_paid"):
+            # Any adder mismatch ALWAYS raises an in-app alert — the provider
+            # paying a rate different from the CRM's contracted adder is the
+            # single most important thing to surface. Email only for big ones.
             disc = abs(min(0.0, float(r.get("total_discrepancy") or 0)))
-            if disc >= SHORTPAID_THRESHOLD:
-                msg = (f"{provider_name} {month}: {r['short_paid']} account(s) paid at the "
-                       f"wrong rate — ${disc:,.2f} short this month.")
-                if _alert(db, "wrong_rate", f"{r.get('run_id')}", msg, "warning",
-                          {"short_paid": r["short_paid"], "loss": round(disc, 2)}):
-                    lines.append("• " + msg)
+            sev = "critical" if disc >= SHORTPAID_THRESHOLD else "warning"
+            msg = (f"{provider_name} {month}: {r['short_paid']} account(s) paid at a rate "
+                   f"different from the CRM adder — ${disc:,.2f} short this month. "
+                   f"Review on the Reconciliation page.")
+            if _alert(db, "adder_mismatch", f"{r.get('run_id')}", msg, sev,
+                      {"short_paid": r["short_paid"], "loss": round(disc, 2),
+                       "billing_month": month}) and disc >= SHORTPAID_THRESHOLD:
+                lines.append("• " + msg)
 
     emailed = False
     if lines and resend is not None:

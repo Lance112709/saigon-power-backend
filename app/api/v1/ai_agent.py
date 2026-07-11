@@ -60,6 +60,14 @@ def manual_scan(user: UserContext = Depends(require_admin)):
     return run_full_scan()
 
 
+@router.get("/alerts/count")
+def alerts_count(user: UserContext = Depends(require_admin)):
+    """Cheap open-alert count for the sidebar notification badge."""
+    db = get_client()
+    res = db.table("ai_alerts").select("id", count="exact").eq("status", "open").limit(1).execute()
+    return {"open": getattr(res, "count", 0) or 0}
+
+
 @router.get("/alerts")
 def list_alerts(user: UserContext = Depends(require_admin)):
     db = get_client()
