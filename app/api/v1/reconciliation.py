@@ -294,8 +294,14 @@ def list_findings(
     rows = fetch_all(db, "audit_findings", "*", filters=filters)
     rows.sort(key=lambda f: (-(f.get("estimated_impact") or 0), f.get("billing_month") or ""))
     sups = _supplier_names(db)
+    try:
+        from app.services.recovery_stats import provider_recovery_stats, recovery_hint
+        stats = provider_recovery_stats(db)
+    except Exception:
+        stats = {}
     for r in rows:
         r["supplier"] = sups.get(r["supplier_id"], {})
+        r["recovery_hint"] = recovery_hint(stats, r["supplier_id"]) if stats else None
     return rows[:500]
 
 
@@ -342,8 +348,14 @@ def get_cases(
                       billing_month=billing_month, issue_type=issue_type,
                       min_loss=min_loss)
     sups = _supplier_names(db)
+    try:
+        from app.services.recovery_stats import provider_recovery_stats, recovery_hint
+        stats = provider_recovery_stats(db)
+    except Exception:
+        stats = {}
     for r in rows:
         r["supplier"] = sups.get(r["supplier_id"], {})
+        r["recovery_hint"] = recovery_hint(stats, r["supplier_id"]) if stats else None
     return rows
 
 

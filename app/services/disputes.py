@@ -23,38 +23,94 @@ def _month7(d) -> str:
     return str(d or "")[:7]
 
 
-def _build_xlsx(supplier_name: str, cases: list, finding: Optional[dict]) -> bytes:
+def _claims_from_cases(cases: list) -> list:
+    """Normalize exception cases into dispute claims."""
+    return [{
+        "esiid": c["esiid"],
+        "billing_month": c["billing_month"],
+        "claimed": round(float(c.get("estimated_loss") or 0), 2),
+        "case_id": c.get("id"),
+        "customer_name": c.get("customer_name") or "",
+        "issue": c.get("issue_type"),
+        "explanation": c.get("explanation") or "",
+        "rate_from": None, "rate_to": None, "kwh": None,
+    } for c in cases]
+
+
+def _claims_from_finding(db, finding: dict) -> list:
+    """Claims straight from a grouped finding's per-account breakdown.
+
+    This is the authoritative source for systemic findings: the per-account
+    reconciliation may show $0 (e.g. when the CRM adder itself matches the cut
+    rate), but the finding's history-based math carries each account's real
+    loss. Existing cases are linked by ESIID when present."""
+    accounts = (finding.get("details") or {}).get("accounts") or []
+    month = finding["billing_month"]
+    issue = finding.get("finding_type", "audit_finding")
+
+    case_by_esiid = {}
+    esiids = [a.get("esiid") for a in accounts if a.get("esiid")]
+    for i in range(0, len(esiids), 100):
+        for c in fetch_all(db, "exception_cases", "id,esiid,customer_name",
+                           filters=[("eq", ("supplier_id", finding["supplier_id"])),
+                                    ("eq", ("billing_month", month)),
+                                    ("in_", ("esiid", esiids[i:i + 100]))]):
+            case_by_esiid.setdefault(c["esiid"], c)
+
+    claims = []
+    for a in accounts:
+        esiid = a.get("esiid")
+        if not esiid:
+            continue
+        claimed = a.get("monthly_loss")
+        if claimed is None and a.get("rate_from") is not None and a.get("rate_to") is not None:
+            claimed = (float(a["rate_from"]) - float(a["rate_to"])) * float(a.get("kwh") or 0)
+        if claimed is None:
+            claimed = a.get("amount") or a.get("clawback") or a.get("last_amount") or 0
+        case = case_by_esiid.get(esiid, {})
+        claims.append({
+            "esiid": esiid,
+            "billing_month": month,
+            "claimed": round(abs(float(claimed or 0)), 2),
+            "case_id": case.get("id"),
+            "customer_name": case.get("customer_name") or a.get("customer") or "",
+            "issue": issue,
+            "explanation": (f"Paid {a['rate_to']:g} $/kWh instead of the established "
+                            f"{a['rate_from']:g} $/kWh"
+                            if a.get("rate_from") is not None and a.get("rate_to") is not None
+                            else finding.get("title", "")),
+            "rate_from": a.get("rate_from"), "rate_to": a.get("rate_to"),
+            "kwh": a.get("kwh"),
+        })
+    return claims
+
+
+def _build_xlsx(supplier_name: str, claims: list) -> bytes:
     import pandas as pd
 
-    months = sorted({_month7(c["billing_month"]) for c in cases})
-    total = round(sum(float(c.get("estimated_loss") or 0) for c in cases), 2)
+    months = sorted({_month7(c["billing_month"]) for c in claims})
+    total = round(sum(c["claimed"] for c in claims), 2)
 
     summary = pd.DataFrame([{
         "Provider": supplier_name,
         "Statement Months": ", ".join(months),
-        "Accounts": len(cases),
+        "Accounts": len(claims),
         "Total Claimed $": total,
         "Prepared": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
         "Prepared By": "Saigon Power LLC — Broker VID 319010",
     }])
 
-    rate_detail = {}
-    if finding and (finding.get("details") or {}).get("accounts"):
-        for a in finding["details"]["accounts"]:
-            rate_detail[a.get("esiid")] = a
-
     rows = []
-    for c in sorted(cases, key=lambda c: -(float(c.get("estimated_loss") or 0))):
-        extra = rate_detail.get(c["esiid"], {})
+    for c in sorted(claims, key=lambda c: -c["claimed"]):
         rows.append({
             "ESI ID": c["esiid"],
             "Customer": c.get("customer_name") or "",
             "Statement Month": _month7(c["billing_month"]),
-            "Issue": c.get("issue_type"),
-            "Contract Rate": extra.get("rate_from"),
-            "Paid Rate": extra.get("rate_to"),
-            "kWh": extra.get("kwh"),
-            "Amount Claimed $": float(c.get("estimated_loss") or 0),
+            "Issue": c.get("issue"),
+            "Contract Rate": c.get("rate_from"),
+            "Paid Rate": c.get("rate_to"),
+            "kWh": c.get("kwh"),
+            "Amount Claimed $": c["claimed"],
             "Explanation": c.get("explanation") or "",
         })
 
@@ -66,7 +122,7 @@ def _build_xlsx(supplier_name: str, cases: list, finding: Optional[dict]) -> byt
     return buf.getvalue()
 
 
-def _draft_email(supplier_name: str, cases: list, finding: Optional[dict],
+def _draft_email(supplier_name: str, claims: list, finding: Optional[dict],
                  months: list, total: float) -> tuple:
     subject = (f"Commission discrepancy — Saigon Power (VID 319010) — "
                f"{', '.join(months)} — ${total:,.2f}")
@@ -74,8 +130,8 @@ def _draft_email(supplier_name: str, cases: list, finding: Optional[dict],
         issue_line = finding.get("explanation") or finding.get("title") or ""
     else:
         by_type: dict = {}
-        for c in cases:
-            by_type[c["issue_type"]] = by_type.get(c["issue_type"], 0) + 1
+        for c in claims:
+            by_type[c["issue"]] = by_type.get(c["issue"], 0) + 1
         issue_line = ("Our reconciliation of your commission statements found " +
                       ", ".join(f"{n} account(s) with {t.replace('_', ' ')}"
                                 for t, n in sorted(by_type.items())) + ".")
@@ -83,7 +139,7 @@ def _draft_email(supplier_name: str, cases: list, finding: Optional[dict],
         f"Hello,\n\n"
         f"We reconciled the {' and '.join(months)} commission statement(s) for "
         f"Saigon Power LLC (Broker VID 319010) and found discrepancies totaling "
-        f"${total:,.2f} across {len(cases)} account(s).\n\n"
+        f"${total:,.2f} across {len(claims)} account(s).\n\n"
         f"{issue_line}\n\n"
         f"The attached spreadsheet lists every affected ESI ID with the amount "
         f"claimed and the reason. Please review and issue a true-up on the next "
@@ -106,35 +162,34 @@ def build_dispute_package(db, supplier_id: str, actor: str,
         if not f:
             raise ValueError("Finding not found")
         finding = f[0]
-        cases = fetch_all(db, "exception_cases", "*",
-                          filters=[("eq", ("finding_id", finding_id))])
-        if not cases:  # fall back to the finding's own account list
-            esiids = [a.get("esiid") for a in
-                      (finding.get("details") or {}).get("accounts", [])]
-            cases = []
-            for i in range(0, len(esiids), 100):
-                cases += fetch_all(db, "exception_cases", "*",
-                                   filters=[("eq", ("supplier_id", supplier_id)),
-                                            ("eq", ("billing_month", finding["billing_month"])),
-                                            ("in_", ("esiid", esiids[i:i + 100]))])
+        # The finding's own per-account breakdown is the authoritative claim
+        # source — per-account cases can be missing or $0 when the CRM adder
+        # itself matches the (wrong) paid rate.
+        claims = _claims_from_finding(db, finding)
+        if not claims:
+            cases = fetch_all(db, "exception_cases", "*",
+                              filters=[("eq", ("finding_id", finding_id))])
+            claims = _claims_from_cases(cases)
     elif case_ids:
         cases = []
         for i in range(0, len(case_ids), 100):
             cases += fetch_all(db, "exception_cases", "*",
                                filters=[("in_", ("id", case_ids[i:i + 100]))])
+        claims = _claims_from_cases(cases)
     else:
         raise ValueError("Provide case_ids or finding_id")
-    if not cases:
-        raise ValueError("No exception cases to dispute")
+    claims = [c for c in claims if c["claimed"] > 0]
+    if not claims:
+        raise ValueError("Nothing to claim — the selected cases/finding carry no dollar amounts")
 
     sup = db.table("suppliers").select("name,contact_email").eq("id", supplier_id) \
         .limit(1).execute().data
     supplier_name = (sup[0]["name"] if sup else "Provider")
     contact_email = (sup[0].get("contact_email") if sup else None) or ""
 
-    months = sorted({_month7(c["billing_month"]) for c in cases})
-    total = round(sum(float(c.get("estimated_loss") or 0) for c in cases), 2)
-    subject, body = _draft_email(supplier_name, cases, finding, months, total)
+    months = sorted({_month7(c["billing_month"]) for c in claims})
+    total = round(sum(c["claimed"] for c in claims), 2)
+    subject, body = _draft_email(supplier_name, claims, finding, months, total)
 
     dispute = db.table("disputes").insert({
         "supplier_id": supplier_id,
@@ -149,7 +204,7 @@ def build_dispute_package(db, supplier_id: str, actor: str,
         "created_by": actor,
     }).execute().data[0]
 
-    blob = _build_xlsx(supplier_name, cases, finding)
+    blob = _build_xlsx(supplier_name, claims)
     path = f"disputes/{dispute['id']}.xlsx"
     try:
         db.storage.from_(DISPUTES_BUCKET).upload(
@@ -164,21 +219,21 @@ def build_dispute_package(db, supplier_id: str, actor: str,
         .eq("id", dispute["id"]).execute()
     dispute["attachment_path"] = f"{DISPUTES_BUCKET}/{path}"
 
-    items = [{"dispute_id": dispute["id"], "case_id": c["id"], "esiid": c["esiid"],
-              "billing_month": c["billing_month"],
-              "claimed_amount": round(float(c.get("estimated_loss") or 0), 2)}
-             for c in cases]
+    items = [{"dispute_id": dispute["id"], "case_id": c.get("case_id"), "esiid": c["esiid"],
+              "billing_month": c["billing_month"], "claimed_amount": c["claimed"]}
+             for c in claims]
     for i in range(0, len(items), 200):
         db.table("dispute_items").insert(items[i:i + 200]).execute()
-    for i in range(0, len(cases), 100):
+    linked_case_ids = [c["case_id"] for c in claims if c.get("case_id")]
+    for i in range(0, len(linked_case_ids), 100):
         db.table("exception_cases").update({"dispute_id": dispute["id"]}) \
-            .in_("id", [c["id"] for c in cases[i:i + 100]]).execute()
+            .in_("id", linked_case_ids[i:i + 100]).execute()
     if finding:
         db.table("audit_findings").update({"status": "disputed"}) \
             .eq("id", finding["id"]).eq("status", "open").execute()
 
     audit(db, "disputes", dispute["id"], "dispute_drafted", None,
-          {"supplier": supplier_name, "cases": len(cases), "total": total},
+          {"supplier": supplier_name, "accounts": len(claims), "total": total},
           reason=dispute["title"], actor=actor)
     return {**dispute, "items_count": len(items)}
 

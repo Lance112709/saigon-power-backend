@@ -66,9 +66,18 @@ def _upsert_cases(db, run_id: str, supplier_id: str, label: str,
                   deals: Optional[dict], actor: str) -> dict:
     month = f"{label}-01"
     by_esiid = (deals or {}).get("by_esiid", {})
+
+    # Learning from outcomes: providers whose disputes historically pay get a
+    # priority boost — chasing them demonstrably recovers money.
+    priority_boost = 1.0
+    try:
+        from app.services.recovery_stats import priority_multiplier, provider_recovery_stats
+        priority_boost = priority_multiplier(provider_recovery_stats(db), supplier_id)
+    except Exception:
+        pass
     items = fetch_all(db, "reconciliation_items",
                       "id,esiid,status,severity,expected_amount,actual_amount,"
-                      "discrepancy_amount,resolution_notes",
+                      "discrepancy_amount,resolution_notes,finding_id",
                       filters=[("eq", ("reconciliation_run_id", run_id))])
     open_issues = [it for it in items if it.get("status") != "matched"]
 
@@ -89,7 +98,7 @@ def _upsert_cases(db, run_id: str, supplier_id: str, label: str,
         deal = by_esiid.get(it["esiid"]) or {}
         loss = _estimated_loss(it)
         fields = {
-            "priority_score": _priority(it.get("severity"), loss),
+            "priority_score": round(_priority(it.get("severity"), loss) * priority_boost, 2),
             "estimated_loss": round(loss, 2),
             "explanation": (it.get("resolution_notes") or "").replace("ROOT CAUSE: ", ""),
             "recommended_action": _RECOMMENDED.get(it["status"], "Review this account."),
@@ -98,6 +107,7 @@ def _upsert_cases(db, run_id: str, supplier_id: str, label: str,
             "last_seen_run_id": run_id,
             "last_seen_at": now,
             "updated_at": now,
+            **({"finding_id": it["finding_id"]} if it.get("finding_id") else {}),
         }
         cur = existing.get(key)
         if cur:

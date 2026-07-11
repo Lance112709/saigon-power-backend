@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from fakedb import FakeDB
 from app.services.disputes import (
-    _build_xlsx, _draft_email, build_dispute_package, record_outcome,
+    _build_xlsx, _claims_from_cases, _claims_from_finding, _draft_email,
+    build_dispute_package, record_outcome,
 )
 
 SUP = "00000000-0000-0000-0000-000000000001"
@@ -31,9 +32,8 @@ def _seed(db, cases):
 
 
 def test_draft_email_totals_and_tone():
-    subject, body = _draft_email("Discount Power",
-                                 [case(E1, 3.0), case(E2, 5.5)], None,
-                                 ["2026-04"], 8.5)
+    claims = _claims_from_cases([case(E1, 3.0), case(E2, 5.5)])
+    subject, body = _draft_email("Discount Power", claims, None, ["2026-04"], 8.5)
     assert "$8.50" in subject and "2026-04" in subject and "319010" in subject
     assert "2 account(s)" in body
     assert "true-up" in body
@@ -41,7 +41,7 @@ def test_draft_email_totals_and_tone():
 
 def test_xlsx_contains_all_accounts_and_total():
     import openpyxl
-    blob = _build_xlsx("Discount Power", [case(E1, 3.0), case(E2, 5.5)], None)
+    blob = _build_xlsx("Discount Power", _claims_from_cases([case(E1, 3.0), case(E2, 5.5)]))
     wb = openpyxl.load_workbook(io.BytesIO(blob))
     assert wb.sheetnames == ["Summary", "Accounts"]
     summary = list(wb["Summary"].iter_rows(values_only=True))
@@ -50,6 +50,50 @@ def test_xlsx_contains_all_accounts_and_total():
     assert len(accounts) == 3  # header + 2 rows
     esiids = {r[0] for r in accounts[1:]}
     assert esiids == {E1, E2}
+
+
+def test_finding_claims_use_per_account_losses_even_without_cases():
+    """The May 2026 Discount Power bug: cases missing/$0, but the finding's
+    account breakdown carries the real per-account losses."""
+    db = FakeDB()  # no exception_cases at all
+    finding = {
+        "id": "f1", "supplier_id": SUP, "billing_month": "2026-05-01",
+        "finding_type": "systemic_rate_change",
+        "details": {"rate_from": 0.008, "rate_to": 0.005, "accounts": [
+            {"esiid": E1, "rate_from": 0.008, "rate_to": 0.005, "kwh": 1000.0,
+             "monthly_loss": 3.0},
+            {"esiid": E2, "rate_from": 0.008, "rate_to": 0.005, "kwh": 2000.0,
+             "monthly_loss": 6.0},
+        ]},
+    }
+    claims = _claims_from_finding(db, finding)
+    assert len(claims) == 2
+    assert sum(c["claimed"] for c in claims) == 9.0
+    assert claims[0]["case_id"] is None
+    assert "0.008" in claims[0]["explanation"]
+
+
+def test_build_dispute_from_finding_claims_real_total():
+    db = FakeDB()
+    db.tables["suppliers"] = [{"id": SUP, "name": "Discount Power",
+                               "contact_email": "rep@discountpower.com"}]
+    db.tables["audit_findings"] = [{
+        "id": "f1", "supplier_id": SUP, "billing_month": "2026-05-01",
+        "finding_type": "systemic_rate_change", "status": "open",
+        "title": "Discount Power cut 2 accounts from 0.008 to 0.005 $/kWh",
+        "explanation": "why text",
+        "details": {"accounts": [
+            {"esiid": E1, "rate_from": 0.008, "rate_to": 0.005, "kwh": 1000.0,
+             "monthly_loss": 3.0},
+            {"esiid": E2, "rate_from": 0.008, "rate_to": 0.005, "kwh": 2000.0,
+             "monthly_loss": 6.0},
+        ]},
+    }]
+    d = build_dispute_package(db, SUP, "lance", finding_id="f1")
+    assert d["total_claimed"] == 9.0
+    assert d["items_count"] == 2
+    amounts = sorted(i["claimed_amount"] for i in db.tables["dispute_items"])
+    assert amounts == [3.0, 6.0]
 
 
 def test_build_dispute_package_creates_draft_and_links_cases():

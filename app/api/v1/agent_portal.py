@@ -215,3 +215,68 @@ def alerts(agent: Optional[str] = Query(None), user: UserContext = Depends(get_c
     sev_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     alerts.sort(key=lambda a: sev_rank.get(a["severity"], 3))
     return {"agent": name, "alerts": alerts[:200]}
+
+
+@router.get("/earnings")
+def earnings(agent: Optional[str] = Query(None), user: UserContext = Depends(get_current_user)):
+    """Expected vs verified-received dollars on MY accounts, by month.
+
+    'Received' is what providers actually paid on the agent's ESI IDs (the
+    book's gross commission, not the agent's payout — payouts live under
+    /commissions). 'Expected' is the active in-window book: adder x est_kwh.
+    """
+    db = get_client()
+    name = _resolve_agent(user, agent)
+    deals = _my_deals(db, name)
+    active = [d for d in deals if d["active"]]
+    my_esiids = [d["esiid"] for d in active if d["esiid"]]
+
+    expected_monthly = round(sum(
+        float(d.get("adder") or 0) * float(d.get("est_kwh") or 1100.0)
+        for d in active), 2)
+
+    # verified received on my accounts, last 6 statement months
+    labels = sorted({r["billing_month"][:7] for r in
+                     (db.table("reconciliation_runs").select("billing_month")
+                      .like("notes", '%"engine": "v2"%').order("billing_month", desc=True)
+                      .limit(100).execute().data or [])}, reverse=True)[:6]
+    received_by_month = {lb: 0.0 for lb in labels}
+    paid_accounts_by_month = {lb: set() for lb in labels}
+    for i in range(0, len(my_esiids), 100):
+        chunk = my_esiids[i:i + 100]
+        rows = fetch_all(db, "actual_commissions", "raw_esiid,raw_amount,billing_month",
+                         filters=[("in_", ("billing_month", [f"{lb}-01" for lb in labels])),
+                                  ("in_", ("raw_esiid", chunk))])
+        for r in rows:
+            lb = str(r["billing_month"])[:7]
+            if lb in received_by_month:
+                received_by_month[lb] += float(r.get("raw_amount") or 0)
+                paid_accounts_by_month[lb].add(r["raw_esiid"])
+
+    months = [{
+        "month": lb,
+        "received": round(received_by_month[lb], 2),
+        "accounts_paid": len(paid_accounts_by_month[lb]),
+        "accounts_active": len(my_esiids),
+    } for lb in labels]
+
+    # open money issues on my accounts (durable cases)
+    open_loss, open_cases = 0.0, 0
+    try:
+        for i in range(0, len(my_esiids), 100):
+            cases = fetch_all(db, "exception_cases", "estimated_loss,workflow_status",
+                              filters=[("in_", ("esiid", my_esiids[i:i + 100])),
+                                       ("in_", ("workflow_status",
+                                                ["open", "investigating", "waiting_on_provider"]))])
+            open_cases += len(cases)
+            open_loss += sum(float(c.get("estimated_loss") or 0) for c in cases)
+    except Exception:
+        pass
+
+    return {
+        "agent": name,
+        "expected_monthly": expected_monthly,
+        "months": months,
+        "open_issue_cases": open_cases,
+        "open_issue_dollars": round(open_loss, 2),
+    }

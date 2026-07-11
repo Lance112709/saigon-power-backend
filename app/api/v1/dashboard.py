@@ -599,3 +599,13 @@ def provider_scorecards(months: int = Query(6), user: UserContext = Depends(requ
                 "issues": total_items - (r.get("matched_count") or 0),
             }
     return {"months": sorted(seen_months), "providers": list(out.values())}
+
+
+@router.get("/commission-forecast")
+def get_commission_forecast(user: UserContext = Depends(require_manager)):
+    """12-month commission projection from verified payments, contract
+    roll-offs, and clawback exposure. Deterministic — see
+    services/commission_forecast.py."""
+    from app.services.commission_forecast import commission_forecast
+    db = get_client()
+    return commission_forecast(db)
