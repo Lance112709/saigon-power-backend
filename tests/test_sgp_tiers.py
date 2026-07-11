@@ -283,3 +283,19 @@ def test_apply_overrides_missing_tables_falls_back():
     db = FakeDB()  # no sales_agents/sgp tables at all
     plans = {"x": {"id": "1", "name": "X", "rules": {}, "components": []}}
     assert apply_sgp_overrides(db, dict(plans), "2026-03") == plans
+
+
+def test_export_endpoint_streams_workbook(monkeypatch):
+    """Regression: export must not pass FastAPI Query() defaults into list_agents
+    (a Query object is truthy → q.lower() blew up with a 500)."""
+    import app.api.v1.sgp as sgp_api
+    db = make_db(months_gp={"2026-03": 6000.0})
+    monkeypatch.setattr(sgp_api, "get_client", lambda: db)
+    resp = sgp_api.export(user=None)
+    import asyncio
+
+    async def collect():
+        return b"".join([chunk async for chunk in resp.body_iterator])
+    body = asyncio.run(collect())
+    assert body[:2] == b"PK"  # xlsx zip magic
+    assert "sgp_agent_commission.xlsx" in resp.headers["content-disposition"]

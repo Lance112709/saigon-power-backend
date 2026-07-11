@@ -287,7 +287,8 @@ def evaluate(body: EvaluateBody = EvaluateBody(), user: UserContext = Depends(re
 def export(user: UserContext = Depends(require_admin)):
     import pandas as pd
     db = get_client()
-    agents = list_agents(user=user)  # reuse enriched rows
+    # explicit Nones: calling the route directly would otherwise pass Query(None) defaults as values
+    agents = list_agents(classification=None, agreement_status=None, tier=None, q=None, user=user)
     tiers = load_tiers(db)
     progress = fetch_all(db, "sgp_tier_progress", "*")
     history = fetch_all(db, "sgp_tier_history", "*")
