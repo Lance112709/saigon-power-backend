@@ -918,7 +918,8 @@ def portal_bill(body: PortalBill, user: dict = Depends(portal_user)):
         pass  # note is best-effort
 
     db.table("tasks").insert({
-        "task_type": "bill_review",
+        # tasks_task_type_check only allows call/email/text/general
+        "task_type": "general",
         "title": f"📄 GiaDienRe bill uploaded: {sub.get('full_name') or user['phone']}",
         "description": f"{summary}\nPhone: {user['phone']}\n[gdr:{sub['id']}]",
         "due_date": (_now() + timedelta(days=2)).isoformat(),
@@ -935,6 +936,36 @@ def portal_bill(body: PortalBill, user: dict = Depends(portal_user)):
         days_left = (datetime.strptime(end_date, "%Y-%m-%d").date()
                      - _now().date()).days
     return {"ok": True, "subscription_id": sub["id"], "days_left": days_left}
+
+
+@router.post("/portal/smt-interest")
+def portal_smt_interest(user: dict = Depends(portal_user)):
+    """Khách đăng ký nhận thông báo khi Smart Meter Texas được kích hoạt."""
+    db = get_client()
+    sub = _find_sub_by_phone(db, user["phone"])
+    if not sub:
+        raise HTTPException(status_code=404,
+                            detail="No GiaDienRe membership found for this account.")
+    extra = dict(sub.get("extra") or {})
+    already = bool(extra.get("smt_interest"))
+    if not already:
+        extra["smt_interest"] = {"at": _now().isoformat()}
+        db.table("giadienre_subscriptions").update(
+            {"extra": extra, "updated_at": _now().isoformat()}).eq("id", sub["id"]).execute()
+        db.table("tasks").insert({
+            "task_type": "general",
+            "title": f"📡 SMT interest: {sub.get('full_name') or user['phone']}",
+            "description": (f"Customer wants Smart Meter Texas monitoring when it launches.\n"
+                            f"Phone: {user['phone']}\n[gdr:{sub['id']}]"),
+            "due_date": (_now() + timedelta(days=30)).isoformat(),
+            "status": "pending", "priority": "low",
+            "lead_id": None, "customer_id": None, "deal_id": None,
+        }).execute()
+        audit(db, "giadienre_subscriptions", sub["id"], "smt_interest", None,
+              {"at": extra["smt_interest"]["at"]},
+              reason="Customer registered Smart Meter Texas interest via portal",
+              actor=f"customer:{user['phone']}")
+    return {"ok": True, "already": already}
 
 
 # — Daily AI contract monitoring (cron; giadienre.com Vercel Cron calls this) —
@@ -984,7 +1015,7 @@ def monitor_run(x_cron_key: str = Header(default="")):
         # one open renewal task per subscription — dedupe on the [gdr:id] marker
         marker = f"[gdr:{sub['id']}]"
         existing = db.table("tasks").select("id") \
-            .eq("task_type", "renewal").eq("status", "pending") \
+            .eq("task_type", "general").eq("status", "pending") \
             .ilike("description", f"%{marker}%").limit(1).execute().data
         if existing:
             continue
@@ -996,7 +1027,7 @@ def monitor_run(x_cron_key: str = Header(default="")):
         else:
             urgency, priority = f"contract expires in {days_left} days", "medium"
         db.table("tasks").insert({
-            "task_type": "renewal",
+            "task_type": "general",   # constraint: call/email/text/general only
             "title": f"⚡ GiaDienRe renewal: {sub.get('full_name') or sub.get('phone') or sub['id'][:8]}",
             "description": (f"Daily monitor: {urgency}.\n"
                             f"REP: {sub.get('current_provider') or '—'} · "

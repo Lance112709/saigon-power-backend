@@ -200,6 +200,14 @@ def me(user: dict = Depends(portal_user)):
     referrals = [e for e in _fetch(db, "enrollments", "id, status, source, created_at")
                  if f"ref:{ref_code}" in (e.get("source") or "")]
 
+    # giadienre.com referrals: signups carrying ?ref=<code> (stored in extra.ref)
+    gdr_refs = []
+    try:
+        gdr_refs = db.table("giadienre_subscriptions").select("id, status") \
+            .eq("extra->>ref", ref_code).execute().data or []
+    except Exception:
+        pass
+
     # GiaDienRe membership (website subscription), matched by phone
     membership = None
     try:
@@ -235,6 +243,9 @@ def me(user: dict = Depends(portal_user)):
             "link": f"https://saigonpowertx.com/enroll?ref={ref_code}",
             "count": len(referrals),
             "active": sum(1 for r in referrals if r["status"] in ("accepted", "active")),
+            # giadienre.com referral counts (additive — other clients unaffected)
+            "gdr_count": len(gdr_refs),
+            "gdr_active": sum(1 for r in gdr_refs if r.get("status") == "ACTIVE"),
         },
     }
 
@@ -246,7 +257,7 @@ def renewal_request(data: dict = Body(...), user: dict = Depends(portal_user)):
     plan = data.get("plan") or {}
     title = f"📱 Portal renewal request: {user.get('name') or user['phone']}"
     db.table("tasks").insert({
-        "task_type": "renewal",
+        "task_type": "general",   # tasks_task_type_check: call/email/text/general only
         "title": title,
         "description": f"Customer requested renewal from the portal.\n"
                        f"Phone: {user['phone']}\n"
