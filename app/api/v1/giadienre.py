@@ -74,8 +74,10 @@ class PublicSubscription(BaseModel):
     current_provider: Optional[str] = Field(default=None, max_length=120)
     contract_end_date: Optional[str] = None
 
-    plan_id: Optional[str] = None            # managed | managed-plus
+    plan_id: Optional[str] = None            # plus (current) | legacy tiers
     billing_cycle: Optional[str] = None      # monthly | annual
+    password: Optional[str] = Field(default=None, min_length=8, max_length=128,
+                                    repr=False)  # portal login (hashed, never stored raw)
     form_type: str = "signup"                # signup | bill_analysis
     lead_source: Optional[str] = None        # which website (see SITES)
     extra: Optional[dict] = None             # any additional website fields
@@ -226,6 +228,8 @@ def submit_subscription(body: PublicSubscription, request: Request):
             recent_dupe = False
 
         updates = {k: v for k, v in fields.items() if v not in (None, "", {})}
+        if "extra" in updates:   # merge — never clobber portal_auth / bills / pending_checkout
+            updates["extra"] = {**(existing.get("extra") or {}), **updates["extra"]}
         # a real signup upgrades a bill-analysis record; never downgrade
         if body.form_type == "signup":
             updates["form_type"] = "signup"
@@ -260,6 +264,18 @@ def submit_subscription(body: PublicSubscription, request: Request):
         sub_id = sub["id"]
         crm_customer_id = None
         action = "subscription"
+
+    # portal password (optional) — hash and store; never overwrite an existing one
+    if body.password:
+        from app.auth.core import hash_password
+        cur = db.table("giadienre_subscriptions").select("extra") \
+            .eq("id", sub_id).limit(1).execute().data
+        cur_extra = dict((cur[0].get("extra") if cur else {}) or {})
+        if not (cur_extra.get("portal_auth") or {}).get("password_hash"):
+            cur_extra["portal_auth"] = {"password_hash": hash_password(body.password),
+                                        "set_at": now}
+            db.table("giadienre_subscriptions").update({"extra": cur_extra}) \
+                .eq("id", sub_id).execute()
 
     # CRM mirroring: create or dedupe the customer record (best effort —
     # the subscription stands alone even if this hiccups)
