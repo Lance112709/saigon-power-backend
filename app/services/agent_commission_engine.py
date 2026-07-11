@@ -172,13 +172,18 @@ def _paid_rows(db, label: str) -> list:
 
 
 def _previously_paid_esiids(db, esiids: list, label: str) -> set:
-    """ESIIDs that already had a payment in ANY month before `label`."""
+    """ESIIDs that already had a payment in ANY month before `label`.
+
+    Must paginate past PostgREST's row cap: a bare limit(1000) returned an
+    ARBITRARY subset when a chunk had more prior payments than that, which
+    made first-payment detection — and therefore new-deal bonuses —
+    nondeterministic between runs."""
     seen = set()
     esiids = list(esiids)
     for i in range(0, len(esiids), 100):
-        rows = db.table("actual_commissions").select("raw_esiid") \
-            .lt("billing_month", f"{label}-01") \
-            .in_("raw_esiid", esiids[i:i + 100]).limit(1000).execute().data or []
+        rows = fetch_all(db, "actual_commissions", "raw_esiid",
+                         filters=[("lt", ("billing_month", f"{label}-01")),
+                                  ("in_", ("raw_esiid", esiids[i:i + 100]))])
         seen.update(r["raw_esiid"] for r in rows)
     return seen
 
