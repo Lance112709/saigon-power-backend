@@ -329,6 +329,8 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
     usage_floor = (today.replace(day=1) - timedelta(days=155)).isoformat()
     usage_sum: dict = {}
     usage_months: dict = {}
+    usage_latest: dict = {}         # per ESI: actual kWh from its most recent statement
+    usage_latest_month: dict = {}   # per ESI: the billing month of that statement
     u_off = 0
     while True:
         page = db.table("actual_commissions").select("raw_esiid, raw_kwh, billing_month") \
@@ -339,7 +341,12 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
             if not es or kwh <= 0:
                 continue
             usage_sum[es] = usage_sum.get(es, 0.0) + kwh
-            usage_months.setdefault(es, set()).add(r["billing_month"][:7])
+            month = r.get("billing_month") or ""
+            usage_months.setdefault(es, set()).add(month[:7])
+            # keep the most recent statement's actual usage for this meter
+            if month > usage_latest_month.get(es, ""):
+                usage_latest_month[es] = month
+                usage_latest[es] = kwh
         if len(page) < 1000:
             break
         u_off += 1000
@@ -459,11 +466,14 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
     sorted_months = sorted(monthly.keys())
     total = sum(monthly.values())
 
-    # Actual usage you're getting paid on: sum the real trailing-average
-    # monthly kWh across the UNIQUE active-deal ESI IDs that appear on
-    # statements (fallback estimates are excluded — this is billed-on usage).
-    usage_esiids = active_esiids & usage_avg.keys()
-    actual_usage_kwh_mo = round(sum(usage_avg[es] for es in usage_esiids))
+    # Actual usage you're getting paid on: for each active-deal ESI that
+    # appears on a statement, take the kWh from its MOST RECENT monthly
+    # commission statement, and sum across the active book. Fallback
+    # estimates are excluded — this is the real metered usage billed on.
+    usage_esiids = active_esiids & usage_latest.keys()
+    actual_usage_kwh_mo = round(sum(usage_latest[es] for es in usage_esiids))
+    latest_statement_month = max(
+        (usage_latest_month[es] for es in usage_esiids), default=None)
 
     return {
         "monthly": [{"month": m, "amount": round(monthly[m], 2)} for m in sorted_months],
@@ -475,12 +485,13 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
         "total_in_report": contributing + skipped,
         "not_projected": not_projected,
         "months_out": len(sorted_months),
-        # Actual metered usage from provider statements, across the active book
-        "actual_usage_kwh_mo": actual_usage_kwh_mo,          # avg monthly kWh billed on
+        # Actual metered usage from the latest provider statement per meter,
+        # across the active book.
+        "actual_usage_kwh_mo": actual_usage_kwh_mo,          # latest-statement kWh billed on
         "actual_usage_kwh_yr": actual_usage_kwh_mo * 12,     # annualized
         "actual_usage_accounts": len(usage_esiids),          # active ESIs with statement usage
         "active_accounts_total": len(active_esiids),         # all unique active ESIs
-        "usage_window_months": 5,                            # trailing window used
+        "latest_statement_month": (latest_statement_month or "")[:7] or None,
     }
 
 @router.get("/supplier-breakdown")
