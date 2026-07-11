@@ -350,6 +350,7 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
     contributing = 0
     skipped = 0
     usage_based = 0
+    active_esiids: set = set()   # every active deal's ESI, for actual-usage totals
     not_projected = {"expired_or_month_to_month": 0, "missing_adder": 0, "missing_end_date": 0}
 
     def _next_month(d: date) -> date:
@@ -376,6 +377,8 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
         ).eq("status", "Active").range(ld_offset, ld_offset + 999).execute().data or []
         for d in rows:
             es = re.sub(r"\D", "", d.get("esiid") or "")
+            if es:
+                active_esiids.add(es)
             real = usage_avg.get(es)
             kwh   = real or float(d.get("est_kwh") or 0)
             adder = float(d.get("adder") or 0)
@@ -418,6 +421,9 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
             "esiid, adder, meter_type, contract_end_date, provider, deal_status"
         ).eq("deal_status", "ACTIVE").range(cd_offset, cd_offset + 999).execute().data or []
         for d in rows:
+            es = re.sub(r"\D", "", d.get("esiid") or "")
+            if es:
+                active_esiids.add(es)
             adder = float(d.get("adder") or 0)
             if not adder:
                 not_projected["missing_adder"] += 1
@@ -441,7 +447,6 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
                 not_projected["expired_or_month_to_month"] += 1
                 skipped += 1
                 continue
-            es = re.sub(r"\D", "", d.get("esiid") or "")
             real = usage_avg.get(es)
             kwh = real or _default_kwh(d.get("meter_type"))
             if real:
@@ -453,6 +458,13 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
 
     sorted_months = sorted(monthly.keys())
     total = sum(monthly.values())
+
+    # Actual usage you're getting paid on: sum the real trailing-average
+    # monthly kWh across the UNIQUE active-deal ESI IDs that appear on
+    # statements (fallback estimates are excluded — this is billed-on usage).
+    usage_esiids = active_esiids & usage_avg.keys()
+    actual_usage_kwh_mo = round(sum(usage_avg[es] for es in usage_esiids))
+
     return {
         "monthly": [{"month": m, "amount": round(monthly[m], 2)} for m in sorted_months],
         "by_supplier": [{"supplier": k, "amount": round(v, 2)} for k, v in sorted(by_supplier.items(), key=lambda x: -x[1])],
@@ -463,6 +475,12 @@ def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
         "total_in_report": contributing + skipped,
         "not_projected": not_projected,
         "months_out": len(sorted_months),
+        # Actual metered usage from provider statements, across the active book
+        "actual_usage_kwh_mo": actual_usage_kwh_mo,          # avg monthly kWh billed on
+        "actual_usage_kwh_yr": actual_usage_kwh_mo * 12,     # annualized
+        "actual_usage_accounts": len(usage_esiids),          # active ESIs with statement usage
+        "active_accounts_total": len(active_esiids),         # all unique active ESIs
+        "usage_window_months": 5,                            # trailing window used
     }
 
 @router.get("/supplier-breakdown")
