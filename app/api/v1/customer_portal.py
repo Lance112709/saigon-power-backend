@@ -324,7 +324,7 @@ def _send_portal_email(to: str, subject: str, html: str) -> bool:
         msg["Subject"] = subject
         msg["From"] = f"Saigon Power <{user}>"
         msg["To"] = to
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as s:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=10) as s:
             s.login(user, pwd)
             s.sendmail(user, [to], msg.as_string())
         return True
@@ -360,7 +360,8 @@ def portal_login(data: dict = Body(...), request: Request = None):
 
 
 @router.post("/password/request-code")
-def portal_password_request_code(data: dict = Body(...), request: Request = None):
+def portal_password_request_code(data: dict = Body(...), request: Request = None,
+                                 x_relay_key: str = Header(default="")):
     email = str(data.get("email") or "").strip().lower()
     if request is not None:
         rate_limit(request, "pwd_code_request", limit=5, window_seconds=600)
@@ -385,8 +386,13 @@ def portal_password_request_code(data: dict = Body(...), request: Request = None
             f"Nếu bạn không yêu cầu, hãy bỏ qua email này.</p>"
             f"<p style='color:#64748b;font-size:13px'>Saigon Power · (832) 937-9999"
             f" · www.giadienre.com</p></div>")
-    if not _send_portal_email(email, "Mã xác nhận Saigon Power (GiaDienRe)", html):
-        raise HTTPException(status_code=503, detail="email_send_failed")
+    # Railway blocks outbound SMTP, so when the trusted giadienre.com server
+    # calls (shared CRON_SECRET), it delivers the email from its own network.
+    relay_secret = os.environ.get("CRON_SECRET", "").strip()
+    relayed = bool(relay_secret) and x_relay_key == relay_secret
+    if not relayed:
+        if not _send_portal_email(email, "Mã xác nhận Saigon Power (GiaDienRe)", html):
+            raise HTTPException(status_code=503, detail="email_send_failed")
 
     challenge = jwt.encode({
         "purpose": "portal_pwd",
@@ -398,7 +404,11 @@ def portal_password_request_code(data: dict = Body(...), request: Request = None
 
     local, _, domain = email.partition("@")
     hint = f"{local[0]}•••@{domain}" if local else f"•••@{domain}"
-    return {"ok": True, "challenge": challenge, "hint": hint}
+    resp = {"ok": True, "challenge": challenge, "hint": hint}
+    if relayed:  # server-to-server only — never reaches a browser
+        resp["relay_code"] = code
+        resp["relay_name"] = sub.get("full_name") or ""
+    return resp
 
 
 @router.post("/password/reset")
