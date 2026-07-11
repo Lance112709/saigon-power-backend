@@ -33,9 +33,10 @@ PLAN_PRICES = {
     ("managed", "annual"): 140.29,
     ("managed-plus", "monthly"): 19.99,
     ("managed-plus", "annual"): 215.89,
-    # saigonllc.com (packages/shared PLAN_CATALOG)
-    ("MONTHLY", "monthly"): 12.99,
-    ("ANNUAL", "annual"): 129.99,
+    # saigonllc.com (packages/shared PLAN_CATALOG — repriced 2026-07 to
+    # $9.99/mo base membership, services unlock as $9.99/mo add-ons)
+    ("MONTHLY", "monthly"): 9.99,
+    ("ANNUAL", "annual"): 99.99,
     ("FAMILY_MONTHLY", "monthly"): 24.99,
     ("BUSINESS_MONTHLY", "monthly"): 49.99,
 }
