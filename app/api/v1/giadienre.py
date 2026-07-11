@@ -28,7 +28,9 @@ router = APIRouter()
 STATUSES = ["NEW", "CONTACTED", "ACTIVE", "CANCELLED"]
 FORM_TYPES = ["signup", "bill_analysis"]
 PLAN_NAMES = {
-    # giadienre.com
+    # giadienre.com — current single plan ($9.99/mo)
+    "plus": "Saigon Power Plus",
+    # giadienre.com — legacy two-plan lineup (existing subscribers)
     "managed": "Saigon Power Managed",
     "managed-plus": "Saigon Power Managed Plus",
     # saigonllc.com (keys match packages/shared PLAN_CATALOG)

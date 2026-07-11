@@ -25,7 +25,10 @@ API_BASE = "https://api.helcim.com/v2"
 
 # Membership pricing per website (must match each site's plan catalog)
 PLAN_PRICES = {
-    # giadienre.com (lib/plans.ts)
+    # giadienre.com (lib/plans.ts) — current single plan
+    ("plus", "monthly"): 9.99,
+    ("plus", "annual"): 107.89,
+    # giadienre.com — legacy two-plan lineup (existing subscribers)
     ("managed", "monthly"): 12.99,
     ("managed", "annual"): 140.29,
     ("managed-plus", "monthly"): 19.99,
@@ -37,6 +40,8 @@ PLAN_PRICES = {
     ("BUSINESS_MONTHLY", "monthly"): 49.99,
 }
 PLAN_LABELS = {
+    ("plus", "monthly"): "GiaDienRe Plus — Monthly",
+    ("plus", "annual"): "GiaDienRe Plus — Annual",
     ("managed", "monthly"): "GiaDienRe Managed — Monthly",
     ("managed", "annual"): "GiaDienRe Managed — Annual",
     ("managed-plus", "monthly"): "GiaDienRe Managed Plus — Monthly",
