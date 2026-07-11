@@ -14,7 +14,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -822,3 +822,184 @@ def billing_card_confirm(data: dict = Body(...), user: dict = Depends(portal_use
     return {"ok": True, "card_last4": updated.get("card_last4"),
             "card_brand": updated.get("card_brand"),
             "card_expiry": updated.get("card_expiry")}
+
+
+# — Customer portal: AI-extracted bill intake (customer JWT from /api/v1/portal) —
+#
+# giadienre.com runs the OCR (Claude vision) in its own backend, lets the
+# customer review the extracted fields, then posts the confirmed data here.
+# We store it on the customer's subscription, surface it to staff as a task,
+# and the daily monitor (below) watches the contract end date from then on.
+
+class PortalBill(BaseModel):
+    customer_name: Optional[str] = Field(default=None, max_length=200)
+    service_address: Optional[str] = Field(default=None, max_length=300)
+    provider: Optional[str] = Field(default=None, max_length=120)       # REP
+    esi_id: Optional[str] = Field(default=None, max_length=40)
+    current_rate: Optional[float] = None                               # ¢/kWh
+    contract_end_date: Optional[str] = None                            # YYYY-MM-DD
+    average_kwh: Optional[float] = None
+    tdu: Optional[str] = Field(default=None, max_length=120)
+    meter_number: Optional[str] = Field(default=None, max_length=60)
+    bill_file_name: Optional[str] = Field(default=None, max_length=300)
+    source: str = "portal_ocr"                                          # portal_ocr | portal_manual
+
+
+def _valid_date(s: Optional[str]) -> Optional[str]:
+    try:
+        return datetime.strptime(str(s)[:10], "%Y-%m-%d").date().isoformat()
+    except Exception:
+        return None
+
+
+@router.post("/portal/bill")
+def portal_bill(body: PortalBill, user: dict = Depends(portal_user)):
+    db = get_client()
+    sub = _find_sub_by_phone(db, user["phone"])
+    if not sub:
+        raise HTTPException(status_code=404,
+                            detail="No GiaDienRe membership found for this account.")
+
+    end_date = _valid_date(body.contract_end_date)
+    bill = {k: v for k, v in body.model_dump().items() if v not in (None, "")}
+    bill["contract_end_date"] = end_date
+    bill["received_at"] = _now().isoformat()
+
+    # extra JSONB keeps the full extraction history (latest 12 bills)
+    extra = dict(sub.get("extra") or {})
+    bills = (extra.get("bills") or [])[-11:]
+    bills.append(bill)
+    extra["bills"] = bills
+    extra["latest_bill"] = bill
+
+    updates = {"extra": extra, "updated_at": _now().isoformat()}
+    # fill/refresh the structured columns the CRM and monitor key off
+    if body.service_address and not sub.get("service_address"):
+        updates["service_address"] = body.service_address.strip()
+    if body.provider:
+        updates["current_provider"] = body.provider.strip()
+    if body.tdu:
+        updates["utility_provider"] = body.tdu.strip()
+    if end_date:
+        updates["contract_end_date"] = end_date
+    db.table("giadienre_subscriptions").update(updates).eq("id", sub["id"]).execute()
+
+    rate = f"{body.current_rate}¢/kWh" if body.current_rate is not None else "—"
+    usage = f"{body.average_kwh:g} kWh/mo" if body.average_kwh is not None else "—"
+    summary = (f"Bill received via portal ({body.source}). "
+               f"REP: {body.provider or '—'} · Rate: {rate} · Usage: {usage} · "
+               f"TDU: {body.tdu or '—'} · ESI: {body.esi_id or '—'} · "
+               f"Contract ends: {end_date or '—'}"
+               + (f" · File: {body.bill_file_name}" if body.bill_file_name else ""))
+    try:
+        db.table("giadienre_subscription_notes").insert({
+            "subscription_id": sub["id"], "content": summary,
+            "author_name": "GiaDienRe AI", "is_internal": False,
+        }).execute()
+    except Exception:
+        pass  # note is best-effort
+
+    db.table("tasks").insert({
+        "task_type": "bill_review",
+        "title": f"📄 GiaDienRe bill uploaded: {sub.get('full_name') or user['phone']}",
+        "description": f"{summary}\nPhone: {user['phone']}\n[gdr:{sub['id']}]",
+        "due_date": (_now() + timedelta(days=2)).isoformat(),
+        "status": "pending", "priority": "medium",
+        "lead_id": None, "customer_id": None, "deal_id": None,
+    }).execute()
+
+    audit(db, "giadienre_subscriptions", sub["id"], "portal_bill", None, bill,
+          reason="Customer uploaded bill via portal (AI extraction)",
+          actor=f"customer:{user['phone']}")
+
+    days_left = None
+    if end_date:
+        days_left = (datetime.strptime(end_date, "%Y-%m-%d").date()
+                     - _now().date()).days
+    return {"ok": True, "subscription_id": sub["id"], "days_left": days_left}
+
+
+# — Daily AI contract monitoring (cron; giadienre.com Vercel Cron calls this) —
+
+MONITOR_WINDOW_DAYS = 90
+
+
+@router.post("/monitor/run")
+def monitor_run(x_cron_key: str = Header(default="")):
+    expected = os.environ.get("GDR_CRON_KEY") or os.environ.get("CRON_SECRET")
+    if not expected:
+        raise HTTPException(status_code=503, detail="Monitoring is not configured.")
+    if x_cron_key != expected:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    db = get_client()
+    subs, off = [], 0
+    while True:
+        page = db.table("giadienre_subscriptions") \
+            .select("id, full_name, phone, phone_digits, current_provider, "
+                    "utility_provider, contract_end_date, status, extra") \
+            .neq("status", "CANCELLED").range(off, off + 999).execute().data or []
+        subs.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+
+    today = _now().date()
+    counts = {"checked": len(subs), "with_end_date": 0, "expired": 0,
+              "expiring_30": 0, "expiring_90": 0, "tasks_created": 0}
+
+    for sub in subs:
+        end = _valid_date(sub.get("contract_end_date"))
+        if not end:
+            continue
+        counts["with_end_date"] += 1
+        days_left = (datetime.strptime(end, "%Y-%m-%d").date() - today).days
+        if days_left < 0:
+            counts["expired"] += 1
+        elif days_left <= 30:
+            counts["expiring_30"] += 1
+        elif days_left <= MONITOR_WINDOW_DAYS:
+            counts["expiring_90"] += 1
+        else:
+            continue
+
+        # one open renewal task per subscription — dedupe on the [gdr:id] marker
+        marker = f"[gdr:{sub['id']}]"
+        existing = db.table("tasks").select("id") \
+            .eq("task_type", "renewal").eq("status", "pending") \
+            .ilike("description", f"%{marker}%").limit(1).execute().data
+        if existing:
+            continue
+
+        if days_left < 0:
+            urgency, priority = f"contract EXPIRED {-days_left} days ago", "high"
+        elif days_left <= 30:
+            urgency, priority = f"contract expires in {days_left} days", "high"
+        else:
+            urgency, priority = f"contract expires in {days_left} days", "medium"
+        db.table("tasks").insert({
+            "task_type": "renewal",
+            "title": f"⚡ GiaDienRe renewal: {sub.get('full_name') or sub.get('phone') or sub['id'][:8]}",
+            "description": (f"Daily monitor: {urgency}.\n"
+                            f"REP: {sub.get('current_provider') or '—'} · "
+                            f"TDU: {sub.get('utility_provider') or '—'} · "
+                            f"Ends: {end}\nPhone: {sub.get('phone') or '—'}\n{marker}"),
+            "due_date": (_now() + timedelta(days=1)).isoformat(),
+            "status": "pending", "priority": priority,
+            "lead_id": None, "customer_id": None, "deal_id": None,
+        }).execute()
+        counts["tasks_created"] += 1
+
+    audit(db, "giadienre_subscriptions", "daily-run", "monitor_run", None, counts,
+          reason="Daily GiaDienRe contract monitoring", actor="cron:giadienre")
+
+    if counts["tasks_created"]:
+        try:
+            from app.services.sms import send_sms
+            send_sms(os.environ.get("ADMIN_ALERT_PHONE", "+18329379999"),
+                     f"GiaDienRe monitor: {counts['tasks_created']} renewal "
+                     f"opportunity(ies) found — check Tasks in the CRM.")
+        except Exception:
+            pass
+
+    return {"ok": True, **counts}
