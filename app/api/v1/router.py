@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import commercial_pricing, commission_payments, commission_rules, disputes as disputes_module, sgp as sgp_module, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, email as email_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre
+from app.api.v1 import commercial_pricing, commission_payments, commission_rules, disputes as disputes_module, sgp as sgp_module, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, email as email_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre, saigonllc
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -37,3 +37,5 @@ router.include_router(search_module.router, prefix="/search", tags=["Search"])
 # NOTE (multi-session): giadienre powers the live giadienre.com website intake,
 # customer portal billing, and CRM module. Do NOT remove when syncing this file.
 router.include_router(giadienre.router, prefix="/giadienre", tags=["GiaDienRe"])
+# saigonllc.com platform webhooks (power-enrollment CRM sync)
+router.include_router(saigonllc.router, prefix="/saigonllc", tags=["SaigonLLC"])
