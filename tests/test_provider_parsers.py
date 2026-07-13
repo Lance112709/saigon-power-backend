@@ -289,3 +289,65 @@ def test_apge_residual_parsed():
     assert r["rate"] == 0.00697       # $/MWh converted to $/kWh
     assert r["usage_kwh"] == 1513.0   # MWh converted to kWh
     assert r["statement_label"] == "2026-05"
+
+
+def test_hudson_premise_detail_parsed():
+    buf = io.BytesIO()
+    letterhead = [[None] * 25 for _ in range(9)]
+    letterhead[0][2] = "Statement To:"
+    letterhead[1][2] = "SAIGON POWER LLC"
+    letterhead[4][2] = "6/25/2026"
+    letterhead[5][2] = "Statement #:"
+    letterhead[6][2] = "223514"
+    premise_header = ["Division", "Customer Name", "Document #", "Premise", "Term",
+                      "Term Start Date", "Term End Date", "Drop?", "Payment Plan",
+                      "Plan Type", "Utility", "Commodity Type", "Fee",
+                      "Forecasted Term Usage", "Payment To Date", "Forecasted Usage",
+                      "Actuals Usage", "Statement Usage", "Forecasted Payment",
+                      "Actuals Payment", "Statement Payment", "Transaction Type",
+                      "Document Payment Total", "Customer Subtotal", "Total"]
+    premise_rows = [
+        ["HES_ERCOT_TX", "Adore Nail Studio", "H24051648482171", "1008901007185252692100",
+         "24", "2024-05-29", "2026-05-16", None, "Monthly Actuals Payment", "Actuals",
+         "CNTP", "POWER", "0.009", "24839", "443.95", "0", "2820", "2820", "0",
+         "25.38", "25.38", "Payment", None, None, None],
+        ["HES_ERCOT_TX", "AVA NAILS", "H25030650968058", "1008901006901086310116",
+         "60", "2025-03-17", "2030-03-17", "Y", "Monthly Actuals Payment", "Actuals",
+         "CNTP", "POWER", "0.01", "134027", "248.53", "0", "1644", "1644", "0",
+         "16.44", "16.44", "Payment", None, None, None],
+    ]
+    txn_header = ["Division", "Customer Name", "Document #", "Premise", "Term",
+                  "Term Start Date", "Term End Date", "Drop?", "Payment Plan",
+                  "Plan Type", "Utility", "Commodity Type", "Fee", "Forecasted Usage",
+                  "Actual Usage", "Statement Usage", "Forecasted Payment",
+                  "Actuals Payment", "Statement Payment", "Period Start Date",
+                  "Period End Date", "Transaction Type", "Document Payment Total",
+                  "Customer Subtotal", "Total"]
+    txn_rows = [
+        ["HES_ERCOT_TX", "Adore Nail Studio", "H24051648482171", "1008901007185252692100",
+         "24", "2024-05-29", "2026-05-16", None, "Monthly Actuals Payment", "Actuals",
+         "CNTP", "POWER", "0.009", "0", "1400", "1400", "0", "12.69", "12.69",
+         "2026-04-08", "2026-04-30", "Actuals", None, None, None],
+        ["HES_ERCOT_TX", "Adore Nail Studio", "H24051648482171", "1008901007185252692100",
+         "24", "2024-05-29", "2026-05-16", None, "Monthly Actuals Payment", "Actuals",
+         "CNTP", "POWER", "0.009", "0", "1420", "1420", "0", "12.69", "12.69",
+         "2026-05-01", "2026-05-16", "Actuals", None, None, None],
+    ]
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame([[None]]).to_excel(w, sheet_name="Summary", index=False, header=False)
+        pd.DataFrame(letterhead + [premise_header] + premise_rows).to_excel(
+            w, sheet_name="Premise Detail", index=False, header=False)
+        pd.DataFrame(letterhead + [txn_header] + txn_rows).to_excel(
+            w, sheet_name="Transaction Detail", index=False, header=False)
+    res = detect_and_parse(buf.getvalue(), "SAIGON POWER LLC_223514_06-25-26.xlsx")
+    assert res and res["provider_group"] == "Hudson Energy"
+    assert res["supplier"]["code"] == "HUDSON"
+    assert res["row_count"] == 2
+    r = res["rows"][0]
+    assert r["esiid"] == "1008901007185252692100"
+    assert r["amount"] == 25.38 and r["rate"] == 0.009 and r["usage_kwh"] == 2820.0
+    assert r["statement_label"] == "2026-06"          # letterhead date, not filename
+    assert r["service_start"] == "2026-04-08"         # merged from Transaction Detail
+    assert r["service_end"] == "2026-05-16"
+    assert res["rows"][1]["provider_status"].startswith("drop")
+    assert [g["esiid"] for g in res["going_final"]] == ["1008901006901086310116"]

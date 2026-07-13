@@ -15,6 +15,7 @@ Supported formats:
   - Chariot Energy                ("Commissions" + "Clawback" sheets)
   - Budget Power                  (Affinity report, .xlsx and legacy .xls)
   - CleanSky Energy               (workbook with one sheet per month)
+  - Hudson Energy                 (Summary/Document/Premise/Transaction Detail workbook)
 
 Unknown formats return None so the caller can fall back to AI column mapping.
 """
@@ -43,6 +44,7 @@ PROVIDER_SUPPLIERS = {
     "Chariot":              {"code": "CHARIOT", "name": "Chariot Energy"},
     "Budget Power":         {"code": "BUDGET", "name": "Budget Power"},
     "CleanSky":             {"code": "CLEANSKY", "name": "CleanSky Energy"},
+    "Hudson Energy":        {"code": "HUDSON", "name": "Hudson Energy"},
 }
 
 # Providers whose statements restate the FULL payment history every time —
@@ -62,6 +64,7 @@ CRM_PROVIDER_GROUPS = {
     "chariot": "Chariot", "chariot energy": "Chariot",
     "budget power": "Budget Power",
     "cleansky energy": "CleanSky", "cleansky": "CleanSky",
+    "hudson": "Hudson Energy", "hudson energy": "Hudson Energy",
 }
 
 
@@ -600,6 +603,82 @@ def _parse_apge(xl, path_label, warnings):
     return rows
 
 
+def _parse_hudson(xl, path_label, warnings):
+    """Hudson Energy 'Sales Partner Fee Payment' statement. One row per
+    premise from the Premise Detail sheet; the Fee column is $/kWh and the
+    Statement Payment column is what was actually paid this statement.
+    Service periods live on the Transaction Detail sheet, keyed by
+    Document # + Premise, so they are merged in when that sheet exists."""
+    if "Premise Detail" not in xl.sheet_names:
+        return None
+    df = pd.read_excel(xl, sheet_name="Premise Detail", dtype=str, header=None).dropna(how="all")
+
+    label, header_i = "", None
+    for i in range(min(15, len(df))):
+        vals = [_s(v) for v in df.iloc[i]]
+        if "Premise" in vals and "Customer Name" in vals:
+            header_i = i
+            break
+        # statement date sits in the letterhead block above the header row
+        if not label:
+            for v in vals:
+                if re.fullmatch(r"\d{1,2}/\d{1,2}/\d{4}", v) or \
+                        re.fullmatch(r"\d{4}-\d{2}-\d{2}( 00:00:00)?", v):
+                    d = _d(v)
+                    if d:
+                        label = d[:7]
+    if header_i is None:
+        return None
+
+    cols = [re.sub(r"\s+", " ", _s(c)) for c in df.iloc[header_i]]
+    body = df.iloc[header_i + 1:]
+    body.columns = cols + [f"x{i}" for i in range(len(body.columns) - len(cols))]
+
+    def pick(row, *names):
+        for n in names:
+            if n in cols:
+                return row.get(n)
+        return None
+
+    # per-premise service window from Transaction Detail (min start, max end)
+    periods = {}
+    if "Transaction Detail" in xl.sheet_names:
+        td = pd.read_excel(xl, sheet_name="Transaction Detail", dtype=str, header=None).dropna(how="all")
+        td_i = next((i for i in range(min(15, len(td)))
+                     if "Premise" in [_s(v) for v in td.iloc[i]]), None)
+        if td_i is not None:
+            tcols = [re.sub(r"\s+", " ", _s(c)) for c in td.iloc[td_i]]
+            tbody = td.iloc[td_i + 1:]
+            tbody.columns = tcols + [f"x{i}" for i in range(len(tbody.columns) - len(tcols))]
+            for _, r in tbody.iterrows():
+                key = (_s(r.get("Document #")), normalize_esiid(r.get("Premise")))
+                ps, pe = _d(r.get("Period Start Date")), _d(r.get("Period End Date"))
+                if not key[1] or not (ps or pe):
+                    continue
+                cur = periods.get(key, (None, None))
+                periods[key] = (min(filter(None, [cur[0], ps]), default=None),
+                                max(filter(None, [cur[1], pe]), default=None))
+
+    rows = []
+    for _, r in body.iterrows():
+        es = normalize_esiid(r.get("Premise"))
+        amt = _f(pick(r, "Statement Payment", "Actuals Payment", "Payment"))
+        if not es or amt is None:
+            continue
+        drop = _s(pick(r, "Drop?", "Drop"))
+        span = periods.get((_s(r.get("Document #")), es), (None, None))
+        rows.append(_mk_row(
+            es, customer_name=_s(r.get("Customer Name")),
+            usage_kwh=_f(pick(r, "Statement Usage", "Actuals Usage", "Actual Usage")),
+            rate=_f(r.get("Fee")), amount=amt,
+            service_start=span[0], service_end=span[1],
+            provider_status=f"drop {drop}" if drop else _s(r.get("Transaction Type")),
+            contract_start=_d(r.get("Term Start Date")), contract_end=_d(r.get("Term End Date")),
+            statement_label=label, raw=_clean_raw(r.to_dict()),
+        ))
+    return rows
+
+
 _PARSERS = [
     ("Discount Power/Cirro", _parse_dp),
     ("NRG Commercial", _parse_nrg_business),  # before Chariot: both have a Commissions sheet
@@ -610,6 +689,7 @@ _PARSERS = [
     ("Tara Energy", _parse_tara_xls),
     ("Reliant Energy", _parse_reliant),
     ("APG&E", _parse_apge),
+    ("Hudson Energy", _parse_hudson),
 ]
 
 

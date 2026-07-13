@@ -39,13 +39,18 @@ def _config():
             os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip())
 
 
-def poll_inbox(actor: str = "email-ingest") -> dict:
+def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
+               from_filter: str = None) -> dict:
+    """Scan the mailbox for commission statements. The scheduled run uses the
+    defaults (INBOX, INGEST_LOOKBACK_DAYS). A targeted backfill can pass
+    from_filter (sender address) + lookback_days; sender-filtered runs search
+    All Mail so archived statements are found too."""
     user, password = _config()
     if not user or not password:
         return {"ok": False,
                 "error": "Email ingest isn't configured — set GMAIL_USER and GMAIL_APP_PASSWORD in Railway."}
 
-    lookback = int(os.environ.get("INGEST_LOOKBACK_DAYS", "40"))
+    lookback = int(lookback_days or os.environ.get("INGEST_LOOKBACK_DAYS", "40"))
     since = (datetime.now(timezone.utc) - timedelta(days=lookback)).strftime("%d-%b-%Y")
 
     db = get_client()
@@ -54,13 +59,16 @@ def poll_inbox(actor: str = "email-ingest") -> dict:
     try:
         imap = imaplib.IMAP4_SSL(IMAP_HOST)
         imap.login(user, password)
-        imap.select("INBOX")
+        imap.select('"[Gmail]/All Mail"' if from_filter else "INBOX")
     except Exception as e:
         return {"ok": False, "error": f"Could not log in to {IMAP_HOST} as {user}: {str(e)[:150]}"}
 
     try:
         # candidate messages: recent, not yet labeled by us
-        status, data = imap.search(None, f'(SINCE {since} NOT X-GM-LABELS "{LABEL}")')
+        criteria = f'(SINCE {since} NOT X-GM-LABELS "{LABEL}")'
+        if from_filter:
+            criteria = f'(FROM "{from_filter}" SINCE {since} NOT X-GM-LABELS "{LABEL}")'
+        status, data = imap.search(None, criteria)
         ids = (data[0].split() if status == "OK" and data and data[0] else [])[-100:]
 
         processed_count = 0
