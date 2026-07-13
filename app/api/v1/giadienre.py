@@ -38,6 +38,9 @@ PLAN_NAMES = {
     "ANNUAL": "Saigon Membership (Annual)",
     "FAMILY_MONTHLY": "Saigon Family Membership",
     "BUSINESS_MONTHLY": "Saigon Business Membership",
+    # saigonpowertx.com/membership — SAIGON POWER PLUS
+    "POWER_PLUS_RES": "SAIGON POWER PLUS — Residential",
+    "POWER_PLUS_COM": "SAIGON POWER PLUS — Commercial",
 }
 LEAD_SOURCE = "GiaDienRe Website"            # default (giadienre.com)
 
@@ -48,6 +51,8 @@ SITES = {
                           "tab": "GiaDienRe Subscription"},
     "SaigonLLC Website": {"label": "SAIGON", "domain": "saigonllc.com",
                           "tab": "SAIGON Subscription"},
+    "SaigonPowerTX Website": {"label": "POWER PLUS", "domain": "saigonpowertx.com",
+                              "tab": "POWER PLUS Membership"},
 }
 
 

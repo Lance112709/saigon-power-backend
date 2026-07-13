@@ -39,6 +39,9 @@ PLAN_PRICES = {
     ("ANNUAL", "annual"): 99.99,
     ("FAMILY_MONTHLY", "monthly"): 24.99,
     ("BUSINESS_MONTHLY", "monthly"): 49.99,
+    # saigonpowertx.com/membership — SAIGON POWER PLUS
+    ("POWER_PLUS_RES", "monthly"): 9.99,
+    ("POWER_PLUS_COM", "monthly"): 19.99,
 }
 PLAN_LABELS = {
     ("plus", "monthly"): "GiaDienRe Plus — Monthly",
@@ -51,6 +54,8 @@ PLAN_LABELS = {
     ("ANNUAL", "annual"): "Saigon Membership — Annual",
     ("FAMILY_MONTHLY", "monthly"): "Saigon Membership Family — Monthly",
     ("BUSINESS_MONTHLY", "monthly"): "Saigon Membership Business — Monthly",
+    ("POWER_PLUS_RES", "monthly"): "SAIGON POWER PLUS Residential — Monthly",
+    ("POWER_PLUS_COM", "monthly"): "SAIGON POWER PLUS Commercial — Monthly",
 }
 
 _plan_id_cache: dict = {}
