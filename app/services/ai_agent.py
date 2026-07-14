@@ -785,7 +785,10 @@ def chat_with_context(message: str, history: list) -> str:
     configured or the API errors."""
     import json as _json
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-    if api_key:
+    # Chat stays on the free keyword engine unless explicitly opted in —
+    # the API key alone (added for bill OCR) must not turn on paid chat.
+    llm_chat_on = os.environ.get("AI_CHAT_LLM", "").strip().lower() in ("1", "true", "yes", "on")
+    if api_key and llm_chat_on:
         try:
             from app.services.ai_tools import TOOL_DEFINITIONS, execute_tool
             db = get_client()
