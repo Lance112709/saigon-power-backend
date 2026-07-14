@@ -6,6 +6,7 @@ from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_lead_access
 from app.core.security import sanitize_search, rate_limit
+from app.services.merge_vars import lead_merge_vars
 from app.api.v1.tasks import create_lead_tasks
 
 router = APIRouter()
@@ -199,9 +200,172 @@ def delete_agent(agent_id: str, user: UserContext = Depends(require_manager)):
 
 # ── Converted Customers (declared BEFORE /{id} to avoid route conflict) ────────
 
+def _build_customer_filters(search, provider, end_from, end_to, status,
+                            city, state, zip_, last_name, segment) -> dict:
+    """Normalize the /customers filter query params into one dict."""
+    s = (search or "").strip()
+    return {
+        "search":    s,
+        "s_lower":   s.lower(),
+        "s_digits":  re.sub(r"\D", "", s),
+        "provider":  (provider or "").strip().lower(),
+        "end_from":  (end_from or "").strip(),
+        "end_to":    (end_to or "").strip(),
+        "status":    (status or "all").strip().lower(),
+        "city":      (city or "").strip().lower(),
+        "state":     (state or "").strip().lower(),
+        "zip":       (zip_ or "").strip(),
+        "last_name": (last_name or "").strip().lower(),
+        "segment":   (segment or "all").strip().lower(),
+    }
+
+
+def _any_customer_filter(f: dict) -> bool:
+    return bool(f["search"] or f["provider"] or f["end_from"] or f["end_to"]
+                or f["status"] not in ("", "all") or f["city"] or f["state"]
+                or f["zip"] or f["last_name"] or f["segment"] not in ("", "all"))
+
+
+def _passes_customer_filters(lead: dict, deals: list, name: str, f: dict) -> bool:
+    """True if this converted customer matches every active filter."""
+    # Free-text search across every meaningful field (phone/ESI by digits too).
+    if f["search"]:
+        deal_bits, phone_pool = [], [re.sub(r"\D", "", lead.get("phone") or "")]
+        for d in deals:
+            deal_bits += [d.get("esiid"), d.get("service_address"), d.get("service_city"),
+                          d.get("service_state"), d.get("service_zip"), d.get("supplier"),
+                          d.get("plan_name"), d.get("product_type")]
+            phone_pool.append(re.sub(r"\D", "", d.get("esiid") or ""))
+        haystack = " ".join(str(x) for x in [
+            name, lead.get("phone"), lead.get("email"), lead.get("business_name"),
+            lead.get("sgp_customer_id"), lead.get("address"), lead.get("city"),
+            lead.get("state"), lead.get("zip"),
+        ] + deal_bits if x).lower()
+        text_hit = f["s_lower"] in haystack
+        digit_hit = bool(f["s_digits"]) and any(f["s_digits"] in p for p in phone_pool if p)
+        if not text_hit and not digit_hit:
+            return False
+    # Provider / supplier (matches any of the customer's deals).
+    if f["provider"] and not any(f["provider"] in (d.get("supplier") or "").lower() for d in deals):
+        return False
+    # Contract end-date range (ISO strings compare lexicographically).
+    if f["end_from"] or f["end_to"]:
+        hit = False
+        for d in deals:
+            ed = d.get("end_date")
+            if not ed:
+                continue
+            if f["end_from"] and ed < f["end_from"]:
+                continue
+            if f["end_to"] and ed > f["end_to"]:
+                continue
+            hit = True
+            break
+        if not hit:
+            return False
+    # Active vs inactive (active = at least one Active deal).
+    active_cnt = sum(1 for d in deals if (d.get("status") or "") == "Active")
+    if f["status"] == "active" and active_cnt == 0:
+        return False
+    if f["status"] == "inactive" and active_cnt > 0:
+        return False
+    # Geography (customer record or any deal's service location).
+    if f["city"]:
+        pool = " ".join([lead.get("city") or ""] + [d.get("service_city") or "" for d in deals]).lower()
+        if f["city"] not in pool:
+            return False
+    if f["state"]:
+        pool = [(lead.get("state") or "").lower()] + [(d.get("service_state") or "").lower() for d in deals]
+        if f["state"] not in pool:
+            return False
+    if f["zip"]:
+        pool = [lead.get("zip") or ""] + [d.get("service_zip") or "" for d in deals]
+        if not any(f["zip"] in (z or "") for z in pool):
+            return False
+    # Last name.
+    if f["last_name"] and f["last_name"] not in (lead.get("last_name") or "").lower():
+        return False
+    # Residential vs commercial (business name present or a commercial deal ⇒ commercial).
+    if f["segment"] in ("residential", "commercial"):
+        is_comm = bool((lead.get("business_name") or "").strip()) or \
+            any((d.get("product_type") or "").lower() == "commercial" for d in deals)
+        if f["segment"] == "commercial" and not is_comm:
+            return False
+        if f["segment"] == "residential" and is_comm:
+            return False
+    return True
+
+
+def _customer_result(c: dict, lead: dict, deals: list) -> dict:
+    name = _full_name(lead)
+    start_dates = [d.get("start_date") for d in deals if d.get("start_date")]
+    contract_start = min(start_dates) if start_dates else None
+    return {
+        "id": c["id"],
+        "lead_id": c["lead_id"],
+        "customer_since": contract_start or c["created_at"],
+        "full_name": name,
+        "sgp_customer_id": lead.get("sgp_customer_id"),
+        "business_name": lead.get("business_name"),
+        "phone": lead.get("phone"),
+        "email": lead.get("email"),
+        "address": lead.get("address"),
+        "city": lead.get("city"),
+        "state": lead.get("state"),
+        "zip": lead.get("zip"),
+        "deals": deals,
+        "active_deal_count": sum(1 for d in deals if d.get("status") == "Active"),
+        # Frozen at read time so the bulk-email builder can reuse the exact same
+        # personalization the composer would show — no second resolve pass.
+        "variables": lead_merge_vars(lead, deals),
+    }
+
+
+def collect_matching_customers(db, agent_name: Optional[str], f: dict) -> list:
+    """Scan ALL converted customers and return every one matching the filters.
+
+    Shared by the customer list (when any filter is active) and the bulk-email
+    campaign builder, so "what you see is who gets emailed" always holds.
+    """
+    _cols = "id, lead_id, created_at, leads(*, lead_deals(*))"
+    rows, off = [], 0
+    while True:
+        page = db.table("lead_customers").select(_cols).order("created_at", desc=True) \
+            .range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+
+    results = []
+    an = (agent_name or "").lower()
+    for c in rows:
+        lead = c.get("leads") or {}
+        deals = _auto_promote_deals(db, lead.pop("lead_deals", []) or [])
+        if agent_name:
+            lead_agent = (lead.get("sales_agent") or "").strip().lower()
+            deal_agents = [(d.get("sales_agent") or "").strip().lower() for d in deals]
+            if lead_agent != an and not any(a == an for a in deal_agents):
+                continue
+        name = _full_name(lead)
+        if not _passes_customer_filters(lead, deals, name, f):
+            continue
+        results.append(_customer_result(c, lead, deals))
+    return results
+
+
 @router.get("/customers")
 def list_lead_customers(
-    search: Optional[str] = Query(None),
+    search:    Optional[str] = Query(None),
+    provider:  Optional[str] = Query(None),
+    end_from:  Optional[str] = Query(None),  # contract end date >= (YYYY-MM-DD)
+    end_to:    Optional[str] = Query(None),  # contract end date <= (YYYY-MM-DD)
+    status:    Optional[str] = Query(None),  # active | inactive | all
+    city:      Optional[str] = Query(None),
+    state:     Optional[str] = Query(None),
+    zip:       Optional[str] = Query(None),
+    last_name: Optional[str] = Query(None),
+    segment:   Optional[str] = Query(None),  # residential | commercial | all
     limit: int = Query(50),
     offset: int = Query(0),
     user: UserContext = Depends(get_current_user),
@@ -212,80 +376,57 @@ def list_lead_customers(
         return []
     agent_name = user.sales_agent_name if user.is_sales_agent else None
 
-    s = (search or "").strip()
-    s_lower = s.lower()
-    s_digits = re.sub(r"\D", "", s)   # phone match ignores dashes/spaces/parens
+    f = _build_customer_filters(search, provider, end_from, end_to, status,
+                                city, state, zip, last_name, segment)
 
+    if _any_customer_filter(f):
+        # Any active filter ⇒ scan every customer, filter, then page the matches.
+        matches = collect_matching_customers(db, agent_name, f)
+        return matches[offset:offset + limit]
+
+    # No filter ⇒ cheap single-page fetch.
     _cols = "id, lead_id, created_at, leads(*, lead_deals(*))"
-    if s:
-        # Searching must span ALL converted customers, not just the first page —
-        # otherwise anyone beyond the fetched window is invisible to search.
-        rows, off = [], 0
-        while True:
-            page = db.table("lead_customers").select(_cols).order("created_at", desc=True) \
-                .range(off, off + 999).execute().data or []
-            rows.extend(page)
-            if len(page) < 1000:
-                break
-            off += 1000
-    else:
-        rows = db.table("lead_customers").select(_cols).order("created_at", desc=True) \
-            .range(offset, offset + limit - 1).execute().data or []
-
+    rows = db.table("lead_customers").select(_cols).order("created_at", desc=True) \
+        .range(offset, offset + limit - 1).execute().data or []
     results = []
+    an = (agent_name or "").lower()
     for c in rows:
         lead = c.get("leads") or {}
         deals = _auto_promote_deals(db, lead.pop("lead_deals", []) or [])
         if agent_name:
             lead_agent = (lead.get("sales_agent") or "").strip().lower()
             deal_agents = [(d.get("sales_agent") or "").strip().lower() for d in deals]
-            if lead_agent != agent_name.lower() and not any(a == agent_name.lower() for a in deal_agents):
+            if lead_agent != an and not any(a == an for a in deal_agents):
                 continue
-        name = _full_name(lead)
-        if s:
-            # Search spans every meaningful field: name, contact info, address,
-            # SGP ID, and each deal's ESI ID / service address / provider. Phone
-            # and ESI ID also match by digits so dashes/spaces never matter.
-            deal_bits = []
-            phone_digit_pool = [re.sub(r"\D", "", lead.get("phone") or "")]
-            for d in deals:
-                deal_bits += [
-                    d.get("esiid"), d.get("service_address"), d.get("service_city"),
-                    d.get("service_state"), d.get("service_zip"), d.get("supplier"),
-                    d.get("plan_name"), d.get("product_type"),
-                ]
-                phone_digit_pool.append(re.sub(r"\D", "", d.get("esiid") or ""))
-            haystack = " ".join(str(x) for x in [
-                name, lead.get("phone"), lead.get("email"), lead.get("business_name"),
-                lead.get("sgp_customer_id"), lead.get("address"), lead.get("city"),
-                lead.get("state"), lead.get("zip"),
-            ] + deal_bits if x).lower()
-            text_hit = bool(s_lower) and s_lower in haystack
-            digit_hit = bool(s_digits) and any(s_digits in p for p in phone_digit_pool if p)
-            if not text_hit and not digit_hit:
-                continue
-        start_dates = [d.get("start_date") for d in deals if d.get("start_date")]
-        contract_start = min(start_dates) if start_dates else None
-        results.append({
-            "id": c["id"],
-            "lead_id": c["lead_id"],
-            "customer_since": contract_start or c["created_at"],
-            "full_name": name,
-            "sgp_customer_id": lead.get("sgp_customer_id"),
-            "business_name": lead.get("business_name"),
-            "phone": lead.get("phone"),
-            "email": lead.get("email"),
-            "address": lead.get("address"),
-            "city": lead.get("city"),
-            "state": lead.get("state"),
-            "zip": lead.get("zip"),
-            "deals": deals,
-            "active_deal_count": sum(1 for d in deals if d.get("status") == "Active"),
-        })
-    # When searching we scanned everything; page the filtered matches here.
-    if s:
-        return results[offset:offset + limit]
+        results.append(_customer_result(c, lead, deals))
     return results
+
+
+@router.get("/customers/count")
+def count_lead_customers(
+    search:    Optional[str] = Query(None),
+    provider:  Optional[str] = Query(None),
+    end_from:  Optional[str] = Query(None),
+    end_to:    Optional[str] = Query(None),
+    status:    Optional[str] = Query(None),
+    city:      Optional[str] = Query(None),
+    state:     Optional[str] = Query(None),
+    zip:       Optional[str] = Query(None),
+    last_name: Optional[str] = Query(None),
+    segment:   Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    """How many customers match the current filters, and how many have an email
+    on file — so the bulk-email UI can show the true audience size up front."""
+    db = get_client()
+    if user.is_sales_agent and not user.sales_agent_name:
+        return {"total": 0, "with_email": 0}
+    agent_name = user.sales_agent_name if user.is_sales_agent else None
+    f = _build_customer_filters(search, provider, end_from, end_to, status,
+                                city, state, zip, last_name, segment)
+    matches = collect_matching_customers(db, agent_name, f)
+    with_email = sum(1 for m in matches if (m.get("email") or "").strip() and "@" in (m.get("email") or ""))
+    return {"total": len(matches), "with_email": with_email}
 
 # ── Backfill SGP IDs ──────────────────────────────────────────────────────────
 

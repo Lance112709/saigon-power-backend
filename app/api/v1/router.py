@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from app.api.v1 import commercial_pricing, commission_payments, commission_rules, disputes as disputes_module, sgp as sgp_module, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, email as email_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre, saigonllc
+from app.api.v1 import commercial_pricing, commission_payments, commission_rules, disputes as disputes_module, sgp as sgp_module, suppliers, customers, service_points, contracts, commissions, uploads, reconciliation, dashboard, crm, leads, tasks, calllist, proposals, ai_agent, sms as sms_module, email as email_module, campaigns as campaigns_module, landing, renewals, agent_commissions, agent_portal, enrollments, customer_portal, search as search_module, giadienre, saigonllc
 from app.api.v1 import auth as auth_module, users as users_module
 
 router = APIRouter(prefix="/api/v1")
@@ -27,6 +27,7 @@ router.include_router(proposals.router, prefix="/proposals", tags=["Proposals"])
 router.include_router(ai_agent.router, prefix="/ai-agent", tags=["AI Agent"])
 router.include_router(sms_module.router, prefix="/sms", tags=["SMS"])
 router.include_router(email_module.router, prefix="/email", tags=["Email"])
+router.include_router(campaigns_module.router, prefix="/email/campaigns", tags=["Email Campaigns"])
 router.include_router(landing.router, prefix="/landing-plans", tags=["Landing"])
 router.include_router(renewals.router, prefix="/renewals", tags=["Renewals"])
 router.include_router(agent_commissions.router, prefix="/agent-commissions", tags=["Agent Commissions"])

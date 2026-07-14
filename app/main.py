@@ -67,6 +67,15 @@ def _run_email_ingest():
     except Exception:
         pass
 
+def _run_email_campaigns():
+    """Auto-drip: send the next batch of any active bulk-email campaign,
+    bounded by the Resend plan's daily cap (EMAIL_DAILY_CAP)."""
+    try:
+        from app.services.email_campaigns import process_campaigns
+        process_campaigns()
+    except Exception:
+        pass
+
 def _run_pricing_ingest():
     try:
         from app.services.pricing_email_ingest import poll_pricing_inbox
@@ -111,6 +120,10 @@ try:
     # Phase 2 pricing automation: NRG emails the matrix each business morning;
     # poll weekday mornings so agents have fresh rates by the time they log in.
     scheduler.add_job(_run_pricing_ingest, "cron", day_of_week="mon-fri", hour="6-12", minute="*/20")
+    # Bulk email auto-drip: every 30 min through the day, send the next batch of
+    # any active campaign up to the plan's daily cap. Spreads a large blast over
+    # days instead of hitting the Resend limit all at once.
+    scheduler.add_job(_run_email_campaigns, "cron", hour="8-20", minute="*/30")
     _scheduler_ok = True
 except Exception:
     _scheduler_ok = False
