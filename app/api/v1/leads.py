@@ -66,6 +66,10 @@ def _auto_promote_deals(db, deals: list) -> list:
             try:
                 db.table("lead_deals").update({"status": "Active", "updated_at": _now()}).eq("id", d["id"]).execute()
                 d["status"] = "Active"
+                # A now-Active deal makes this lead a customer — same rule as
+                # creating/editing a deal to Active.
+                if d.get("lead_id"):
+                    _try_convert(db, d["lead_id"])
             except Exception:
                 pass
     return deals
