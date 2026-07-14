@@ -424,6 +424,18 @@ def count_lead_customers(
     agent_name = user.sales_agent_name if user.is_sales_agent else None
     f = _build_customer_filters(search, provider, end_from, end_to, status,
                                 city, state, zip, last_name, segment)
+
+    # No filter (the default view) ⇒ cheap COUNT queries instead of scanning
+    # every customer, so the page loads instantly. Agent-scoped users still need
+    # the per-record scan since ownership isn't a simple column filter here.
+    if not _any_customer_filter(f) and not agent_name:
+        total = db.table("leads").select("id", count="exact") \
+            .eq("status", "converted").execute().count or 0
+        with_email = db.table("leads").select("id", count="exact") \
+            .eq("status", "converted").neq("email", "").not_.is_("email", "null") \
+            .execute().count or 0
+        return {"total": total, "with_email": with_email}
+
     matches = collect_matching_customers(db, agent_name, f)
     with_email = sum(1 for m in matches if (m.get("email") or "").strip() and "@" in (m.get("email") or ""))
     return {"total": len(matches), "with_email": with_email}
