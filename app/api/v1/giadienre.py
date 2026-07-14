@@ -864,6 +864,73 @@ def billing_card_confirm(data: dict = Body(...), user: dict = Depends(portal_use
 # We store it on the customer's subscription, surface it to staff as a task,
 # and the daily monitor (below) watches the contract end date from then on.
 
+class PortalBillOcr(BaseModel):
+    data: str                                # base64 file contents (no data: prefix)
+    mediaType: str
+
+
+_BILL_OCR_TYPES = {"application/pdf", "image/png", "image/jpeg", "image/webp", "image/gif"}
+_BILL_OCR_MAX_BASE64 = 14_000_000            # ~10MB binary
+_BILL_OCR_SYSTEM = (
+    "You are an OCR + data-extraction engine for Texas residential electricity bills. "
+    "Read the attached bill carefully and extract only what is actually present. "
+    "Never guess or fabricate a value — if a field is not clearly on the bill, return null for it. "
+    "Rates must be numeric cents per kWh (e.g. 14.2, not \"14.2¢\"). Usage must be numeric kWh. "
+    "Dates must be YYYY-MM-DD. The ESI ID is a long number (often 17 digits) identifying the meter."
+)
+_BILL_OCR_ASK = (
+    "Extract the utility fields from this electric bill. Return ONLY a JSON object with exactly "
+    "these keys: customer_name, service_address, provider (the Retail Electric Provider), esi_id, "
+    "current_rate (number, ¢/kWh), contract_end_date (YYYY-MM-DD), average_kwh (number), "
+    "tdu (Transmission/Distribution Utility, e.g. CenterPoint, Oncor), meter_number, "
+    "confidence (\"high\"|\"medium\"|\"low\"). Use null for anything not on the bill."
+)
+
+
+@router.post("/portal/bill-ocr")
+def portal_bill_ocr(body: PortalBillOcr, user: dict = Depends(portal_user)):
+    """AI reads an uploaded bill (image/PDF) and returns the extracted fields for
+    the customer to review. Falls back gracefully when the AI key isn't set —
+    the portal form then works as manual entry (same behavior as giadienre.com)."""
+    if body.mediaType not in _BILL_OCR_TYPES:
+        raise HTTPException(status_code=415, detail="Only PDF, JPG, PNG, or WEBP files are supported.")
+    if len(body.data) > _BILL_OCR_MAX_BASE64:
+        raise HTTPException(status_code=413, detail="That file is too large — please upload one under 10MB.")
+
+    key = (os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+    if not key:
+        raise HTTPException(
+            status_code=503,
+            detail="AI bill reading isn't activated yet — you can enter the details manually below, "
+                   "or call (832) 937-9999 and we'll do it for you.")
+
+    try:
+        import json as _json
+        import anthropic
+        client = anthropic.Anthropic(api_key=key)
+        block = {
+            "type": "document" if body.mediaType == "application/pdf" else "image",
+            "source": {"type": "base64", "media_type": body.mediaType, "data": body.data},
+        }
+        resp = client.messages.create(
+            model="claude-opus-4-8", max_tokens=1500, system=_BILL_OCR_SYSTEM,
+            messages=[{"role": "user", "content": [block, {"type": "text", "text": _BILL_OCR_ASK}]}])
+        text = "".join(getattr(b, "text", "") for b in resp.content)
+        m = re.search(r"\{.*\}", text, re.S)
+        extracted = _json.loads(m.group(0)) if m else {}
+        audit(get_client(), "giadienre_subscriptions", None, "portal_bill_ocr", None,
+              {"confidence": extracted.get("confidence"), "mediaType": body.mediaType},
+              reason="Portal bill read by AI", actor=f"customer:{user['phone']}")
+        return {"ok": True, "extracted": extracted}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(
+            status_code=502,
+            detail="We couldn't read that bill — you can enter the details manually, "
+                   "or try again with a clearer photo.")
+
+
 class PortalBill(BaseModel):
     customer_name: Optional[str] = Field(default=None, max_length=200)
     service_address: Optional[str] = Field(default=None, max_length=300)
