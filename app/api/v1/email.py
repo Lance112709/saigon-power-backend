@@ -57,6 +57,9 @@ MERGE_TAGS = [
     {"tag": "first_name",        "label": "First name"},
     {"tag": "last_name",         "label": "Last name"},
     {"tag": "service_address",   "label": "Service address"},
+    {"tag": "city",              "label": "City"},
+    {"tag": "state",             "label": "State"},
+    {"tag": "zip",               "label": "Zipcode"},
     {"tag": "esi_id",            "label": "ESI ID"},
     {"tag": "phone",               "label": "Phone number"},
     {"tag": "email",               "label": "Email"},
@@ -84,7 +87,8 @@ def merge_vars(
     if lead_id:
         lead = assert_lead_access(db, user, lead_id)
         deals = db.table("lead_deals").select(
-            "esiid, service_address, start_date, end_date, status"
+            "esiid, service_address, service_city, service_state, service_zip, "
+            "start_date, end_date, status"
         ).eq("lead_id", lead_id).execute().data or []
         d = _pick_deal(deals, "status", "ACTIVE")
         fn = (lead.get("first_name") or "").strip()
@@ -95,6 +99,9 @@ def merge_vars(
             "name":             f"{fn} {ln}".strip(),
             "phone":            lead.get("phone") or "",
             "email":            lead.get("email") or "",
+            "city":             d.get("service_city") or lead.get("city") or "",
+            "state":            d.get("service_state") or lead.get("state") or "",
+            "zip":              d.get("service_zip") or lead.get("zip") or "",
             "service_address":  d.get("service_address") or lead.get("address") or "",
             "esi_id":           d.get("esiid") or "",
             "contract_start_date": _fmt_date(d.get("start_date")),
@@ -103,7 +110,7 @@ def merge_vars(
     elif customer_id:
         assert_customer_access(db, user, customer_id)
         c = (db.table("crm_customers").select(
-            "full_name, first_name, last_name, email, phone"
+            "full_name, first_name, last_name, email, phone, city, state, postal_code"
         ).eq("id", customer_id).limit(1).execute().data or [{}])[0]
         deals = db.table("crm_deals").select(
             "esiid, service_address, contract_start_date, contract_end_date, deal_status"
@@ -118,6 +125,9 @@ def merge_vars(
             "name":             full or f"{fn} {ln}".strip(),
             "phone":            c.get("phone") or "",
             "email":            c.get("email") or "",
+            "city":             c.get("city") or "",
+            "state":            c.get("state") or "",
+            "zip":              c.get("postal_code") or "",
             "service_address":  d.get("service_address") or "",
             "esi_id":           d.get("esiid") or "",
             "contract_start_date": _fmt_date(d.get("contract_start_date")),
