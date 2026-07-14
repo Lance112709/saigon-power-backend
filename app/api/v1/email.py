@@ -25,6 +25,105 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _fmt_date(val) -> str:
+    """Render an ISO/date string as e.g. 'October 15, 2026'. Falls back to the raw value."""
+    if not val:
+        return ""
+    s = str(val)
+    for fmt in ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(s[:len(fmt) + 8], fmt).strftime("%B %-d, %Y")
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%B %-d, %Y")
+    except ValueError:
+        return s
+
+
+def _pick_deal(deals: list, status_key: str, active_val: str) -> dict:
+    """Prefer an active deal for sourcing ESI ID / address / end date; else the first."""
+    if not deals:
+        return {}
+    active = [d for d in deals if (d.get(status_key) or "").upper() == active_val]
+    return (active or deals)[0]
+
+
+# ── Merge variables (personalization tags) ─────────────────────────────────────
+
+# The tags operators can drop into a subject/body. Kept in one place so the
+# compose UI and the resolver never drift apart.
+MERGE_TAGS = [
+    {"tag": "first_name",        "label": "First name"},
+    {"tag": "last_name",         "label": "Last name"},
+    {"tag": "service_address",   "label": "Service address"},
+    {"tag": "esi_id",            "label": "ESI ID"},
+    {"tag": "phone",             "label": "Phone number"},
+    {"tag": "email",             "label": "Email"},
+    {"tag": "contract_end_date", "label": "Contract end date"},
+]
+
+
+@router.get("/merge-vars")
+def merge_vars(
+    lead_id:     Optional[str] = Query(None),
+    customer_id: Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    """Resolve personalization tag values for a specific lead or CRM customer.
+
+    Deal-level fields (ESI ID, service address, contract end date) come from the
+    contact's active deal when there is one. Ownership is enforced so a sales
+    agent can't pull another agent's contact data.
+    """
+    db = get_client()
+    v = {t["tag"]: "" for t in MERGE_TAGS}
+    v["name"] = ""
+
+    if lead_id:
+        lead = assert_lead_access(db, user, lead_id)
+        deals = db.table("lead_deals").select(
+            "esiid, service_address, end_date, status"
+        ).eq("lead_id", lead_id).execute().data or []
+        d = _pick_deal(deals, "status", "ACTIVE")
+        fn = (lead.get("first_name") or "").strip()
+        ln = (lead.get("last_name") or "").strip()
+        v.update({
+            "first_name":       fn,
+            "last_name":        ln,
+            "name":             f"{fn} {ln}".strip(),
+            "phone":            lead.get("phone") or "",
+            "email":            lead.get("email") or "",
+            "service_address":  d.get("service_address") or lead.get("address") or "",
+            "esi_id":           d.get("esiid") or "",
+            "contract_end_date": _fmt_date(d.get("end_date")),
+        })
+    elif customer_id:
+        assert_customer_access(db, user, customer_id)
+        c = (db.table("crm_customers").select(
+            "full_name, first_name, last_name, email, phone"
+        ).eq("id", customer_id).limit(1).execute().data or [{}])[0]
+        deals = db.table("crm_deals").select(
+            "esiid, service_address, contract_end_date, deal_status"
+        ).eq("customer_id", customer_id).execute().data or []
+        d = _pick_deal(deals, "deal_status", "ACTIVE")
+        full = (c.get("full_name") or "").strip()
+        fn = (c.get("first_name") or (full.split()[0] if full else "")).strip()
+        ln = (c.get("last_name") or (" ".join(full.split()[1:]) if full else "")).strip()
+        v.update({
+            "first_name":       fn,
+            "last_name":        ln,
+            "name":             full or f"{fn} {ln}".strip(),
+            "phone":            c.get("phone") or "",
+            "email":            c.get("email") or "",
+            "service_address":  d.get("service_address") or "",
+            "esi_id":           d.get("esiid") or "",
+            "contract_end_date": _fmt_date(d.get("contract_end_date")),
+        })
+
+    return {"variables": v, "tags": MERGE_TAGS}
+
+
 # ── Send ──────────────────────────────────────────────────────────────────────
 
 @router.post("/send")
