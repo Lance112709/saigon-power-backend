@@ -137,7 +137,8 @@ app = FastAPI(
 )
 
 _origins = [o.strip() for o in settings.frontend_url.split(",") if o.strip()]
-for _always in ["http://localhost:3000", "https://saigon-power-frontend.vercel.app"]:
+for _always in ["http://localhost:3000", "https://saigon-power-frontend.vercel.app",
+                "https://saigonpowertx.com", "https://www.saigonpowertx.com"]:
     if _always not in _origins:
         _origins.append(_always)
 
