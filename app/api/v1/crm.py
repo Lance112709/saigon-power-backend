@@ -602,22 +602,7 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         raise HTTPException(status_code=500, detail="Failed to create deal")
     return res.data[0]
 
-@router.get("/deals")
-def list_deals(
-    search: Optional[str] = Query(None),
-    provider: Optional[str] = Query(None),
-    deal_status: Optional[str] = Query(None),
-    meter_type: Optional[str] = Query(None),
-    deal_type: Optional[str] = Query(None),
-    sales_agent: Optional[str] = Query(None),
-    limit: int = Query(50),
-    offset: int = Query(0),
-    user: UserContext = Depends(get_current_user),
-):
-    db = get_client()
-    q = db.table("crm_deals").select(
-        "*, crm_customers(id, full_name, email)"
-    )
+def _apply_deal_filters(q, search, provider, deal_status, meter_type, deal_type, sales_agent):
     if provider:
         q = q.ilike("provider", f"%{provider}%")
     if deal_status:
@@ -632,6 +617,72 @@ def list_deals(
         s = sanitize_search(search)
         if s:
             q = q.or_(f"deal_name.ilike.%{s}%,esiid.ilike.%{s}%,service_address.ilike.%{s}%")
+    return q
+
+
+@router.get("/deals/export")
+def export_deals(
+    search: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    deal_status: Optional[str] = Query(None),
+    meter_type: Optional[str] = Query(None),
+    deal_type: Optional[str] = Query(None),
+    sales_agent: Optional[str] = Query(None),
+    user: UserContext = Depends(require_admin),
+):
+    """Admin-only CSV export of all deals matching the current filters."""
+    db = get_client()
+    rows, off = [], 0
+    while True:
+        q = db.table("crm_deals").select("*, crm_customers(full_name, email)")
+        q = _apply_deal_filters(q, search, provider, deal_status, meter_type, deal_type, sales_agent)
+        page = q.order("created_at", desc=True).range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    _enrich_deals(db, rows)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Deal Name", "Customer", "Email", "ESI ID", "Provider", "Status",
+                "Meter Type", "Deal Type", "Product Type", "Rate", "Adder",
+                "Contract Start", "Contract End", "Term", "Sales Agent",
+                "Service Address", "Created At"])
+    for d in rows:
+        cust = d.get("crm_customers") or {}
+        w.writerow([
+            d.get("deal_name") or "", cust.get("full_name") or "", cust.get("email") or "",
+            d.get("esiid") or "", d.get("provider") or "", d.get("deal_status") or "",
+            d.get("meter_type") or "", d.get("deal_type") or "", d.get("product_type") or "",
+            d.get("energy_rate") if d.get("energy_rate") is not None else "",
+            d.get("adder") if d.get("adder") is not None else "",
+            (d.get("contract_start_date") or "")[:10], (d.get("contract_end_date") or "")[:10],
+            d.get("contract_term") or "", d.get("sales_agent") or "",
+            d.get("service_address") or "", (d.get("created_at") or "")[:10],
+        ])
+    buf.seek(0)
+    stamp = dt.now().strftime("%Y%m%d")
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=deals_{stamp}.csv"})
+
+
+@router.get("/deals")
+def list_deals(
+    search: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    deal_status: Optional[str] = Query(None),
+    meter_type: Optional[str] = Query(None),
+    deal_type: Optional[str] = Query(None),
+    sales_agent: Optional[str] = Query(None),
+    limit: int = Query(50),
+    offset: int = Query(0),
+    user: UserContext = Depends(get_current_user),
+):
+    db = get_client()
+    q = db.table("crm_deals").select("*, crm_customers(id, full_name, email)")
+    q = _apply_deal_filters(q, search, provider, deal_status, meter_type, deal_type, sales_agent)
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     deals = res.data or []
     _enrich_deals(db, deals)

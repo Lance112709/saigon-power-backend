@@ -725,6 +725,68 @@ def list_all_lead_deals(
         })
     return results
 
+
+@router.get("/all-deals/export")
+def export_all_lead_deals(
+    search: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    supplier: Optional[str] = Query(None),
+    sales_agent: Optional[str] = Query(None),
+    product_type: Optional[str] = Query(None),
+    user: UserContext = Depends(require_admin),
+):
+    """Admin-only CSV export of lead deals matching the current filters."""
+    db = get_client()
+    rows, off = [], 0
+    while True:
+        q = db.table("lead_deals").select(
+            "*, leads(first_name, last_name, phone, sgp_customer_id, status)")
+        if status:
+            q = q.eq("status", status)
+        if supplier:
+            q = q.ilike("supplier", f"%{supplier}%")
+        if sales_agent:
+            q = q.eq("sales_agent", sales_agent)
+        if product_type:
+            q = q.eq("product_type", product_type)
+        page = q.order("created_at", desc=True).range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+
+    s = (search or "").strip().lower()
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Customer", "Phone", "SGP ID", "Lead Status", "Supplier", "Plan",
+                "Product Type", "Rate Type", "Rate", "Adder", "Est kWh", "Deal Status",
+                "Sales Agent", "ESI ID", "Service Address", "City", "State", "ZIP",
+                "Start Date", "End Date", "Contract Term"])
+    for d in rows:
+        lead = d.get("leads") or {}
+        name = f"{lead.get('first_name','')} {lead.get('last_name','')}".strip()
+        if s and not (s in name.lower() or s in (d.get("supplier") or "").lower()
+                      or s in (d.get("sales_agent") or "").lower()
+                      or s in (d.get("esiid") or "").lower()):
+            continue
+        w.writerow([
+            name, lead.get("phone") or "", lead.get("sgp_customer_id") or "",
+            lead.get("status") or "", d.get("supplier") or "", d.get("plan_name") or "",
+            d.get("product_type") or "", d.get("rate_type") or "",
+            d.get("rate") if d.get("rate") is not None else "",
+            d.get("adder") if d.get("adder") is not None else "",
+            d.get("est_kwh") if d.get("est_kwh") is not None else "",
+            d.get("status") or "", d.get("sales_agent") or "", d.get("esiid") or "",
+            d.get("service_address") or "", d.get("service_city") or "",
+            d.get("service_state") or "", d.get("service_zip") or "",
+            d.get("start_date") or "", d.get("end_date") or "", d.get("contract_term") or "",
+        ])
+    buf.seek(0)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=lead_deals_{stamp}.csv"})
+
 # ── Leads List + Create ────────────────────────────────────────────────────────
 
 @router.get("")
@@ -761,6 +823,56 @@ def list_leads(
         return {"count": len(res.data)}
     res = q.order("created_at", desc=True).range(offset, offset + limit - 1).execute()
     return [_shape_lead(lead, db) for lead in res.data]
+
+
+@router.get("/export")
+def export_leads(
+    search: Optional[str] = Query(None),
+    status: Optional[str] = Query(None),
+    created_after: Optional[str] = Query(None),
+    user: UserContext = Depends(require_admin),
+):
+    """Admin-only CSV export of leads matching the current filters."""
+    db = get_client()
+    rows, off = [], 0
+    while True:
+        q = db.table("leads").select("*, lead_deals(status)")
+        if search:
+            s = sanitize_search(search)
+            if s:
+                q = q.or_(f"first_name.ilike.%{s}%,last_name.ilike.%{s}%,"
+                          f"phone.ilike.%{s}%,address.ilike.%{s}%")
+        if status:
+            q = q.eq("status", status)
+        if created_after:
+            q = q.gt("created_at", created_after)
+        page = q.order("created_at", desc=True).range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["First Name", "Last Name", "Business Name", "Email", "Phone",
+                "Address", "City", "State", "ZIP", "Status", "Source",
+                "Sales Agent", "SGP ID", "Active Deals", "Created At"])
+    for l in rows:
+        deals = l.get("lead_deals") or []
+        active = sum(1 for d in deals if (d.get("status") or "") == "Active")
+        w.writerow([
+            l.get("first_name") or "", l.get("last_name") or "", l.get("business_name") or "",
+            l.get("email") or "", l.get("phone") or "", l.get("address") or "",
+            l.get("city") or "", l.get("state") or "", l.get("zip") or "",
+            l.get("status") or "", l.get("source") or "", l.get("sales_agent") or "",
+            l.get("sgp_customer_id") or "", active, (l.get("created_at") or "")[:10],
+        ])
+    buf.seek(0)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=leads_{stamp}.csv"})
+
 
 @router.post("")
 def create_lead(data: dict = Body(...), request: Request = None):
