@@ -207,19 +207,33 @@ def list_lead_customers(
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
-    res = (
-        db.table("lead_customers")
-        .select("id, lead_id, created_at, leads(*, lead_deals(*))")
-        .order("created_at", desc=True)
-        .range(offset, offset + limit - 1)
-        .execute()
-    )
-    results = []
     # Sales agents only see their own customers — if no agent name mapped, return nothing
     if user.is_sales_agent and not user.sales_agent_name:
         return []
     agent_name = user.sales_agent_name if user.is_sales_agent else None
-    for c in res.data:
+
+    s = (search or "").strip()
+    s_lower = s.lower()
+    s_digits = re.sub(r"\D", "", s)   # phone match ignores dashes/spaces/parens
+
+    _cols = "id, lead_id, created_at, leads(*, lead_deals(*))"
+    if s:
+        # Searching must span ALL converted customers, not just the first page —
+        # otherwise anyone beyond the fetched window is invisible to search.
+        rows, off = [], 0
+        while True:
+            page = db.table("lead_customers").select(_cols).order("created_at", desc=True) \
+                .range(off, off + 999).execute().data or []
+            rows.extend(page)
+            if len(page) < 1000:
+                break
+            off += 1000
+    else:
+        rows = db.table("lead_customers").select(_cols).order("created_at", desc=True) \
+            .range(offset, offset + limit - 1).execute().data or []
+
+    results = []
+    for c in rows:
         lead = c.get("leads") or {}
         deals = _auto_promote_deals(db, lead.pop("lead_deals", []) or [])
         if agent_name:
@@ -228,8 +242,12 @@ def list_lead_customers(
             if lead_agent != agent_name.lower() and not any(a == agent_name.lower() for a in deal_agents):
                 continue
         name = _full_name(lead)
-        if search and search.lower() not in name.lower() and search.lower() not in (lead.get("phone") or "").lower():
-            continue
+        if s:
+            phone_digits = re.sub(r"\D", "", lead.get("phone") or "")
+            name_hit = s_lower in name.lower()
+            phone_hit = bool(s_digits) and s_digits in phone_digits
+            if not name_hit and not phone_hit:
+                continue
         start_dates = [d.get("start_date") for d in deals if d.get("start_date")]
         contract_start = min(start_dates) if start_dates else None
         results.append({
@@ -248,6 +266,9 @@ def list_lead_customers(
             "deals": deals,
             "active_deal_count": sum(1 for d in deals if d.get("status") == "Active"),
         })
+    # When searching we scanned everything; page the filtered matches here.
+    if s:
+        return results[offset:offset + limit]
     return results
 
 # ── Backfill SGP IDs ──────────────────────────────────────────────────────────
