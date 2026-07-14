@@ -243,10 +243,26 @@ def list_lead_customers(
                 continue
         name = _full_name(lead)
         if s:
-            phone_digits = re.sub(r"\D", "", lead.get("phone") or "")
-            name_hit = s_lower in name.lower()
-            phone_hit = bool(s_digits) and s_digits in phone_digits
-            if not name_hit and not phone_hit:
+            # Search spans every meaningful field: name, contact info, address,
+            # SGP ID, and each deal's ESI ID / service address / provider. Phone
+            # and ESI ID also match by digits so dashes/spaces never matter.
+            deal_bits = []
+            phone_digit_pool = [re.sub(r"\D", "", lead.get("phone") or "")]
+            for d in deals:
+                deal_bits += [
+                    d.get("esiid"), d.get("service_address"), d.get("service_city"),
+                    d.get("service_state"), d.get("service_zip"), d.get("supplier"),
+                    d.get("plan_name"), d.get("product_type"),
+                ]
+                phone_digit_pool.append(re.sub(r"\D", "", d.get("esiid") or ""))
+            haystack = " ".join(str(x) for x in [
+                name, lead.get("phone"), lead.get("email"), lead.get("business_name"),
+                lead.get("sgp_customer_id"), lead.get("address"), lead.get("city"),
+                lead.get("state"), lead.get("zip"),
+            ] + deal_bits if x).lower()
+            text_hit = bool(s_lower) and s_lower in haystack
+            digit_hit = bool(s_digits) and any(s_digits in p for p in phone_digit_pool if p)
+            if not text_hit and not digit_hit:
                 continue
         start_dates = [d.get("start_date") for d in deals if d.get("start_date")]
         contract_start = min(start_dates) if start_dates else None
