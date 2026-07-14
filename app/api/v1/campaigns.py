@@ -19,16 +19,19 @@ from fastapi import APIRouter, Body, BackgroundTasks, Depends, HTTPException, Qu
 from app.db.client import get_client
 from app.auth.deps import require_manager, UserContext
 from app.services.audit import audit
-from app.services.merge_vars import lead_merge_vars
+from app.services.merge_vars import lead_merge_vars, crm_customer_merge_vars
 from app.services.email_campaigns import process_campaigns, DAILY_CAP
 from app.api.v1.leads import (
     collect_matching_customers, _build_customer_filters, _auto_promote_deals,
 )
+from app.api.v1.crm import collect_crm_recipients
 
 router = APIRouter()
 
 _FILTER_KEYS = ["search", "provider", "end_from", "end_to", "status",
                 "city", "state", "zip", "last_name", "segment"]
+_CRM_FILTER_KEYS = ["search", "provider", "deal_status", "meter_type", "source",
+                    "missing_contact", "date_from", "date_to"]
 
 
 def _now_iso() -> str:
@@ -45,9 +48,38 @@ def _pending(c: dict) -> int:
 
 
 def _resolve_recipients(db, data: dict) -> list:
-    """Return [{lead_id, email, variables}] for the requested audience."""
-    mode = data.get("mode") or ("selected" if data.get("lead_ids") else "filter")
+    """Return [{lead_id?, customer_id?, email, variables}] for the audience.
+
+    `dataset` picks the customer world: "leads" (converted lead-customers) or
+    "crm" (the full imported CRM customer base). `mode` is selected|filter.
+    """
+    dataset = data.get("dataset") or ("crm" if (data.get("customer_ids") or data.get("dataset") == "crm") else "leads")
+    mode = data.get("mode") or ("selected" if (data.get("lead_ids") or data.get("customer_ids")) else "filter")
     out = []
+
+    if dataset == "crm":
+        if mode == "selected":
+            ids = [x for x in (data.get("customer_ids") or []) if x]
+            for i in range(0, len(ids), 200):
+                chunk = ids[i:i + 200]
+                rows = db.table("crm_customers").select(
+                    "id, full_name, first_name, last_name, email, phone, city, state, postal_code, "
+                    "crm_deals(esiid, service_address, contract_start_date, contract_end_date, deal_status)"
+                ).in_("id", chunk).execute().data or []
+                for c in rows:
+                    out.append({
+                        "customer_id": c["id"],
+                        "email": (c.get("email") or "").strip(),
+                        "variables": crm_customer_merge_vars(c, c.get("crm_deals") or []),
+                    })
+        else:
+            raw = data.get("filters") or {}
+            filters = {k: raw.get(k) for k in _CRM_FILTER_KEYS}
+            for m in collect_crm_recipients(db, filters):
+                out.append(m)
+        return out
+
+    # dataset == "leads"
     if mode == "selected":
         ids = [x for x in (data.get("lead_ids") or []) if x]
         for i in range(0, len(ids), 200):
@@ -105,15 +137,16 @@ def create_campaign(background: BackgroundTasks, data: dict = Body(...),
                             detail="No recipients with a valid email match this selection.")
 
     daily_cap = data.get("daily_cap") or None
-    mode = data.get("mode") or ("selected" if data.get("lead_ids") else "filter")
+    dataset = data.get("dataset") or ("crm" if data.get("customer_ids") else "leads")
+    mode = data.get("mode") or ("selected" if (data.get("lead_ids") or data.get("customer_ids")) else "filter")
     campaign = db.table("email_campaigns").insert({
         "name": name,
         "subject": subject,
         "body": body,
         "status": "sending",
         "daily_cap": daily_cap,
-        "audience": {"mode": mode, "filters": data.get("filters") or None,
-                     "selected_count": len(data.get("lead_ids") or [])},
+        "audience": {"dataset": dataset, "mode": mode, "filters": data.get("filters") or None,
+                     "selected_count": len(data.get("lead_ids") or data.get("customer_ids") or [])},
         "total_recipients": len(valid),
         "skipped_no_email": skipped,
         "created_by": user.user_id,
@@ -122,7 +155,8 @@ def create_campaign(background: BackgroundTasks, data: dict = Body(...),
 
     rows = [{
         "campaign_id": campaign["id"],
-        "lead_id": r["lead_id"],
+        "lead_id": r.get("lead_id"),
+        "customer_id": r.get("customer_id"),
         "to_email": r["email"],
         "variables": r["variables"],
         "status": "pending",

@@ -165,36 +165,13 @@ def list_customers(
     db = get_client()
     agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
 
-    # Deal-level filters use an inner-join embed so PostgREST filters and
-    # paginates server-side (an id pre-fetch breaks past 1000 customers).
-    deal_filtered = bool(deal_status or provider or agent_name or meter_type)
-    embed = "crm_deals!inner" if deal_filtered else "crm_deals"
+    embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
     q = db.table("crm_customers").select(
         "id, full_name, first_name, last_name, email, phone, city, state, notes, created_at, "
         f"{embed}(id, deal_status, provider, sales_agent, service_address, business_name)"
     )
-    if deal_status:
-        q = q.eq("crm_deals.deal_status", deal_status.upper())
-    if provider:
-        q = q.ilike("crm_deals.provider", provider)
-    if agent_name:
-        q = q.ilike("crm_deals.sales_agent", agent_name)
-    if meter_type:
-        q = q.ilike("crm_deals.meter_type", f"%{meter_type}%")
-    if search:
-        s = sanitize_search(search)
-        if s:
-            q = q.or_(f"full_name.ilike.%{s}%,email.ilike.%{s}%,phone.ilike.%{s}%")
-    if source == "__manual__":
-        q = q.is_("notes", "null")
-    elif source:
-        q = q.eq("notes", source)
-    if missing_contact:
-        q = q.is_("phone", "null").is_("email", "null")
-    if date_from:
-        q = q.gte("created_at", date_from)
-    if date_to:
-        q = q.lte("created_at", f"{date_to}T23:59:59")
+    q = _apply_crm_customer_filters(q, search, provider, deal_status, meter_type,
+                                    source, missing_contact, date_from, date_to, agent_name)
     res = q.order("full_name").range(offset, offset + limit - 1).execute()
 
     results = []
@@ -226,6 +203,107 @@ def list_customers(
             "created_at": c.get("created_at"),
         })
     return results
+
+
+# ── Shared customer filtering (list + count + bulk-email recipient scan) ───────
+
+def _crm_deal_filtered(deal_status, provider, agent_name, meter_type) -> bool:
+    """Whether any deal-level filter is set (⇒ needs an inner-join embed so
+    PostgREST filters + paginates server-side)."""
+    return bool(deal_status or provider or agent_name or meter_type)
+
+
+def _apply_crm_customer_filters(q, search, provider, deal_status, meter_type,
+                                source, missing_contact, date_from, date_to, agent_name):
+    """Apply the Imported-Customers filters to a crm_customers query. Shared so
+    the list, the count, and the bulk-email audience all resolve identically."""
+    if deal_status:
+        q = q.eq("crm_deals.deal_status", deal_status.upper())
+    if provider:
+        q = q.ilike("crm_deals.provider", provider)
+    if agent_name:
+        q = q.ilike("crm_deals.sales_agent", agent_name)
+    if meter_type:
+        q = q.ilike("crm_deals.meter_type", f"%{meter_type}%")
+    if search:
+        s = sanitize_search(search)
+        if s:
+            q = q.or_(f"full_name.ilike.%{s}%,email.ilike.%{s}%,phone.ilike.%{s}%")
+    if source == "__manual__":
+        q = q.is_("notes", "null")
+    elif source:
+        q = q.eq("notes", source)
+    if missing_contact:
+        q = q.is_("phone", "null").is_("email", "null")
+    if date_from:
+        q = q.gte("created_at", date_from)
+    if date_to:
+        q = q.lte("created_at", f"{date_to}T23:59:59")
+    return q
+
+
+@router.get("/customers/count")
+def count_customers(
+    search: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    deal_status: Optional[str] = Query(None),
+    meter_type: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    missing_contact: Optional[bool] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    """How many imported customers match the filters, and how many have an email
+    — the bulk-email audience size. Server-side COUNT, so it stays fast at 5k+."""
+    db = get_client()
+    agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
+    embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
+
+    def _q():
+        base = db.table("crm_customers").select(f"id, {embed}(id)", count="exact")
+        return _apply_crm_customer_filters(base, search, provider, deal_status, meter_type,
+                                           source, missing_contact, date_from, date_to, agent_name)
+
+    total = _q().execute().count or 0
+    with_email = _q().not_.is_("email", "null").neq("email", "").execute().count or 0
+    return {"total": total, "with_email": with_email}
+
+
+def collect_crm_recipients(db, filters: dict) -> list:
+    """Scan ALL imported customers matching the filters → bulk-email recipients
+    ({customer_id, email, variables}). Deal-level tags come from crm_deals."""
+    from app.services.merge_vars import crm_customer_merge_vars
+    provider     = filters.get("provider")
+    deal_status  = filters.get("deal_status")
+    meter_type   = filters.get("meter_type")
+    agent_name   = filters.get("agent_name")
+    embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
+    base = db.table("crm_customers").select(
+        "id, full_name, first_name, last_name, email, phone, city, state, postal_code, "
+        f"{embed}(esiid, service_address, contract_start_date, contract_end_date, deal_status)")
+    base = _apply_crm_customer_filters(
+        base, filters.get("search"), provider, deal_status, meter_type,
+        filters.get("source"), filters.get("missing_contact"),
+        filters.get("date_from"), filters.get("date_to"), agent_name)
+
+    rows, off = [], 0
+    while True:
+        page = base.order("full_name").range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+
+    out = []
+    for c in rows:
+        deals = c.get("crm_deals") or []
+        out.append({
+            "customer_id": c["id"],
+            "email": (c.get("email") or "").strip(),
+            "variables": crm_customer_merge_vars(c, deals),
+        })
+    return out
 
 
 def source_label(notes: Optional[str]) -> str:
