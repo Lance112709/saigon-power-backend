@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 import re
 import io
+import csv
 from datetime import datetime as dt
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
@@ -304,6 +305,67 @@ def collect_crm_recipients(db, filters: dict) -> list:
             "variables": crm_customer_merge_vars(c, deals),
         })
     return out
+
+
+@router.get("/customers/export")
+def export_customers(
+    search: Optional[str] = Query(None),
+    provider: Optional[str] = Query(None),
+    deal_status: Optional[str] = Query(None),
+    meter_type: Optional[str] = Query(None),
+    source: Optional[str] = Query(None),
+    missing_contact: Optional[bool] = Query(None),
+    date_from: Optional[str] = Query(None),
+    date_to: Optional[str] = Query(None),
+    user: UserContext = Depends(require_admin),
+):
+    """Admin-only CSV export of imported customers matching the current filters
+    (one row per customer, with a deal summary)."""
+    db = get_client()
+    agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
+    embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
+
+    rows, off = [], 0
+    while True:
+        q = db.table("crm_customers").select(
+            "id, full_name, first_name, last_name, email, phone, city, state, postal_code, "
+            "notes, created_at, "
+            f"{embed}(deal_status, provider, service_address, business_name, esiid, "
+            "contract_start_date, contract_end_date, energy_rate)")
+        q = _apply_crm_customer_filters(q, search, provider, deal_status, meter_type,
+                                        source, missing_contact, date_from, date_to, agent_name)
+        page = q.order("full_name").range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Full Name", "First Name", "Last Name", "Business Name", "Email", "Phone",
+                "Service Address", "City", "State", "ZIP", "Provider", "ESI ID",
+                "Contract Start", "Contract End", "Rate", "Status",
+                "Active Deals", "Total Deals", "Source", "Created At"])
+    for c in rows:
+        deals = c.get("crm_deals") or []
+        active = [d for d in deals if (d.get("deal_status") or "").upper() == "ACTIVE"]
+        primary = (active or deals or [{}])[0]
+        biz = next((d.get("business_name") for d in deals if d.get("business_name")), "")
+        w.writerow([
+            c.get("full_name") or "", c.get("first_name") or "", c.get("last_name") or "",
+            biz or "", c.get("email") or "", c.get("phone") or "",
+            primary.get("service_address") or "", c.get("city") or "", c.get("state") or "",
+            c.get("postal_code") or "", primary.get("provider") or "", primary.get("esiid") or "",
+            primary.get("contract_start_date") or "", primary.get("contract_end_date") or "",
+            primary.get("energy_rate") if primary.get("energy_rate") is not None else "",
+            "Active" if active else "Inactive", len(active), len(deals),
+            source_label(c.get("notes")), (c.get("created_at") or "")[:10],
+        ])
+    buf.seek(0)
+    stamp = dt.now().strftime("%Y%m%d")
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=imported_customers_{stamp}.csv"})
 
 
 def source_label(notes: Optional[str]) -> str:

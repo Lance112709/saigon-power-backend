@@ -1,8 +1,12 @@
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from typing import Optional
 from datetime import date, datetime, timezone
+import io
+import csv
 from app.db.client import get_client
 from app.api.v1.auth import get_current_user, UserContext
+from app.auth.deps import require_admin
 from app.utils.deals import is_month_to_month
 
 router = APIRouter()
@@ -25,20 +29,8 @@ def get_renewal_filters(user: UserContext = Depends(get_current_user)):
         "agents": sorted(agents, key=str.upper),
     }
 
-@router.get("")
-def get_renewals(
-    start_date: Optional[str] = Query(None),
-    end_date:   Optional[str] = Query(None),
-    provider:   Optional[str] = Query(None),
-    sales_agent: Optional[str] = Query(None),
-    user: UserContext = Depends(get_current_user),
-):
-    db = get_client()
+def _collect_renewals(db, start_date, end_date, provider, sa, agent_filter):
     today = datetime.now(timezone.utc).date().isoformat()
-
-    agent_filter = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
-    sa = (sales_agent or "").strip().lower() or None
-
     results = []
 
     # ── CRM Leads deals ──────────────────────────────────────────────────────────
@@ -125,6 +117,54 @@ def get_renewals(
 
     results.sort(key=lambda x: x["end_date"] or "9999")
     return results
+
+
+@router.get("")
+def get_renewals(
+    start_date: Optional[str] = Query(None),
+    end_date:   Optional[str] = Query(None),
+    provider:   Optional[str] = Query(None),
+    sales_agent: Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    db = get_client()
+    agent_filter = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
+    sa = (sales_agent or "").strip().lower() or None
+    return _collect_renewals(db, start_date, end_date, provider, sa, agent_filter)
+
+
+@router.get("/export")
+def export_renewals(
+    start_date: Optional[str] = Query(None),
+    end_date:   Optional[str] = Query(None),
+    provider:   Optional[str] = Query(None),
+    sales_agent: Optional[str] = Query(None),
+    user: UserContext = Depends(require_admin),
+):
+    """Admin-only CSV export of the renewals list (one row per expiring contract)."""
+    db = get_client()
+    sa = (sales_agent or "").strip().lower() or None
+    rows = _collect_renewals(db, start_date, end_date, provider, sa, None)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["Customer", "Phone", "Email", "SGP ID", "Source", "Provider",
+                "Plan", "Rate", "Rate Type", "Contract Term", "Sales Agent",
+                "Contract End", "Days Left"])
+    for r in rows:
+        w.writerow([
+            r.get("full_name") or "", r.get("phone") or "", r.get("email") or "",
+            r.get("sgp_id") or "", r.get("source") or "", r.get("provider") or "",
+            r.get("plan_name") or "", r.get("rate") if r.get("rate") is not None else "",
+            r.get("rate_type") or "", r.get("contract_term") or "",
+            r.get("sales_agent") or "", r.get("end_date") or "",
+            r.get("days_left") if r.get("days_left") is not None else "",
+        ])
+    buf.seek(0)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=renewals_{stamp}.csv"})
 
 
 @router.post("/email")

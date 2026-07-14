@@ -1,7 +1,10 @@
 from fastapi import APIRouter, HTTPException, Query, Body, Depends, UploadFile, File, Request
+from fastapi.responses import StreamingResponse
 from typing import Optional
 from datetime import datetime, timezone, date
 import re
+import io
+import csv
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_lead_access
@@ -499,6 +502,51 @@ def customer_filter_options(user: UserContext = Depends(get_current_user)):
 
     return {"providers": _srt(providers), "last_names": _srt(last_names),
             "cities": _srt(cities), "zips": _srt(zips)}
+
+
+@router.get("/customers/export")
+def export_lead_customers(
+    search:    Optional[str] = Query(None),
+    provider:  Optional[str] = Query(None),
+    end_from:  Optional[str] = Query(None),
+    end_to:    Optional[str] = Query(None),
+    status:    Optional[str] = Query(None),
+    city:      Optional[str] = Query(None),
+    state:     Optional[str] = Query(None),
+    zip:       Optional[str] = Query(None),
+    last_name: Optional[str] = Query(None),
+    segment:   Optional[str] = Query(None),
+    user: UserContext = Depends(require_admin),
+):
+    """Admin-only CSV export of converted customers matching the current filters
+    (one row per customer, with a deal summary)."""
+    db = get_client()
+    f = _build_customer_filters(search, provider, end_from, end_to, status,
+                                city, state, zip, last_name, segment)
+    matches = collect_matching_customers(db, None, f)
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["SGP ID", "Full Name", "Business Name", "Email", "Phone",
+                "Address", "City", "State", "ZIP", "Active Deals",
+                "Providers", "Contract End Dates", "Customer Since"])
+    for m in matches:
+        deals = m.get("deals") or []
+        providers = sorted({(d.get("supplier") or "").strip() for d in deals if d.get("supplier")})
+        end_dates = sorted({(d.get("end_date") or "")[:10] for d in deals if d.get("end_date")})
+        w.writerow([
+            m.get("sgp_customer_id") or "", m.get("full_name") or "",
+            m.get("business_name") or "", m.get("email") or "", m.get("phone") or "",
+            m.get("address") or "", m.get("city") or "", m.get("state") or "",
+            m.get("zip") or "", m.get("active_deal_count") or 0,
+            "; ".join(providers), "; ".join(end_dates),
+            (m.get("customer_since") or "")[:10],
+        ])
+    buf.seek(0)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    return StreamingResponse(
+        iter([buf.getvalue()]), media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=customers_{stamp}.csv"})
 
 # ── Backfill SGP IDs ──────────────────────────────────────────────────────────
 
