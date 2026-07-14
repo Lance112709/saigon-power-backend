@@ -19,7 +19,7 @@ from fastapi import APIRouter, Body, BackgroundTasks, Depends, HTTPException, Qu
 from app.db.client import get_client
 from app.auth.deps import require_manager, UserContext
 from app.services.audit import audit
-from app.services.merge_vars import lead_merge_vars, crm_customer_merge_vars
+from app.services.merge_vars import lead_merge_vars, crm_customer_merge_vars, clean_email
 from app.services.email_campaigns import process_campaigns, DAILY_CAP
 from app.api.v1.leads import (
     collect_matching_customers, _build_customer_filters, _auto_promote_deals,
@@ -120,16 +120,19 @@ def create_campaign(background: BackgroundTasks, data: dict = Body(...),
     db = get_client()
     recips = _resolve_recipients(db, data)
 
-    # Drop recipients with no email, and de-dupe by address so nobody is emailed twice.
+    # Normalize each address (imported data may pack several into one field),
+    # drop those with no valid email, and de-dupe so nobody is emailed twice.
     valid, skipped, seen = [], 0, set()
     for r in recips:
-        if not _valid_email(r["email"]):
+        email = clean_email(r["email"])
+        if not email:
             skipped += 1
             continue
-        key = r["email"].lower()
+        key = email.lower()
         if key in seen:
             continue
         seen.add(key)
+        r["email"] = email
         valid.append(r)
 
     if not valid:

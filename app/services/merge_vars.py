@@ -8,7 +8,36 @@ identically everywhere.
 Deal-level tags (ESI ID, service address, city/state/zip, contract dates) come
 from the contact's ACTIVE deal when there is one; otherwise the first deal.
 """
+import re
 from datetime import datetime
+
+
+# Broker-owned domains used as placeholder emails on imported records — we'd
+# rather reach the real customer address than one of these.
+_BROKER_DOMAINS = {"saigonllc.com", "saigonpowertx.com", "saigonlending.com", "saigonpower.com"}
+
+
+def clean_email(raw) -> str:
+    """Return a single valid, sendable address from a possibly-messy field.
+
+    Imported customer records sometimes cram several addresses into one field
+    ('power@saigonllc.com;real@gmail.com') or wrap them in a display name; Resend
+    rejects anything that isn't a single 'email@example.com'. We collect the
+    valid-looking tokens and prefer a real customer address over a Saigon
+    placeholder, falling back to the first valid one."""
+    if not raw:
+        return ""
+    candidates = []
+    for part in re.split(r"[;,\s]+", str(raw).strip()):
+        p = part.strip().strip("<>").strip()
+        if "@" in p and "." in p.split("@")[-1]:
+            candidates.append(p)
+    if not candidates:
+        return ""
+    for c in candidates:
+        if c.split("@")[-1].lower() not in _BROKER_DOMAINS:
+            return c
+    return candidates[0]
 
 # The tags the compose UI offers, in display order. `tag` is what goes in
 # {{...}}; `label` is the human name shown on the chip / editor.
@@ -64,7 +93,7 @@ def lead_merge_vars(lead: dict, deals: list) -> dict:
         "last_name":         ln,
         "name":              f"{fn} {ln}".strip(),
         "phone":             lead.get("phone") or "",
-        "email":             lead.get("email") or "",
+        "email":             clean_email(lead.get("email")),
         "city":              d.get("service_city") or lead.get("city") or "",
         "state":             d.get("service_state") or lead.get("state") or "",
         "zip":               d.get("service_zip") or lead.get("zip") or "",
@@ -88,7 +117,7 @@ def crm_customer_merge_vars(c: dict, deals: list) -> dict:
         "last_name":         ln,
         "name":              full or f"{fn} {ln}".strip(),
         "phone":             c.get("phone") or "",
-        "email":             c.get("email") or "",
+        "email":             clean_email(c.get("email")),
         "city":              c.get("city") or "",
         "state":             c.get("state") or "",
         "zip":               c.get("postal_code") or "",
