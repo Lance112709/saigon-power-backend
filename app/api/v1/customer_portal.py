@@ -41,20 +41,28 @@ def _hash_code(code: str, phone: str) -> str:
 
 def _find_customer(db, p10: str) -> Optional[dict]:
     """Match a phone against leads and imported customers (any format)."""
-    for l in _fetch(db, "leads", "id, first_name, last_name, phone"):
+    for l in _fetch(db, "leads", "id, first_name, last_name, phone, email"):
         if phone10(l.get("phone")) == p10:
             return {"kind": "lead", "id": l["id"],
-                    "name": f"{l.get('first_name','')} {l.get('last_name','')}".strip()}
-    for c in _fetch(db, "crm_customers", "id, full_name, phone"):
+                    "name": f"{l.get('first_name','')} {l.get('last_name','')}".strip(),
+                    "email": (l.get("email") or "").strip()}
+    for c in _fetch(db, "crm_customers", "id, full_name, phone, email"):
         if phone10(c.get("phone")) == p10:
-            return {"kind": "customer", "id": c["id"], "name": c.get("full_name") or ""}
+            return {"kind": "customer", "id": c["id"], "name": c.get("full_name") or "",
+                    "email": (c.get("email") or "").strip()}
     try:
-        for s in _fetch(db, "giadienre_subscriptions", "id, full_name, phone_digits"):
+        for s in _fetch(db, "giadienre_subscriptions", "id, full_name, phone_digits, email"):
             if phone10(s.get("phone_digits")) == p10:
-                return {"kind": "giadienre", "id": s["id"], "name": s.get("full_name") or ""}
+                return {"kind": "giadienre", "id": s["id"], "name": s.get("full_name") or "",
+                        "email": (s.get("email") or "").strip()}
     except Exception:
         pass
     return None
+
+
+def _mask_email(e: str) -> str:
+    user, _, dom = e.partition("@")
+    return f"{user[:1]}•••@{dom}" if user else f"•••@{dom}"
 
 
 def _fetch(db, table, cols):
@@ -87,11 +95,25 @@ def request_code(data: dict = Body(...), request: Request = None):
         raise HTTPException(status_code=404,
                             detail="We couldn't find an account with that number. Call us at (832) 937-9999 and we'll get you set up.")
 
+    # Login codes go out by EMAIL only (business policy: no SMS).
+    email = (cust.get("email") or "").strip()
+    if not email:
+        raise HTTPException(status_code=404,
+                            detail="We don't have an email on file for that number. "
+                                   "Call us at (832) 937-9999 and we'll add one.")
+
     code = f"{random.SystemRandom().randint(0, 999999):06d}"
-    sent = send_sms(f"+1{p10}", f"Your Saigon Power login code is {code}. It expires in {OTP_TTL_MINUTES} minutes.")
-    if not sent.get("ok"):
+    first = (cust["name"].split() or ["there"])[0]
+    sent = _send_portal_email(
+        email, "Your Saigon Power login code",
+        f"<p>Hi {first},</p>"
+        f"<p>Your Saigon Power login code is</p>"
+        f"<p style='font-size:32px;font-weight:900;letter-spacing:6px;margin:12px 0'>{code}</p>"
+        f"<p>It expires in {OTP_TTL_MINUTES} minutes. If you didn't request this, you can ignore this email.</p>"
+        f"<p>— Saigon Power · (832) 937-9999</p>")
+    if not sent:
         raise HTTPException(status_code=503,
-                            detail="We couldn't text you right now — please call us at (832) 937-9999.")
+                            detail="We couldn't email you right now — please call us at (832) 937-9999.")
 
     challenge = jwt.encode({
         "purpose": "portal_otp",
@@ -101,8 +123,8 @@ def request_code(data: dict = Body(...), request: Request = None):
         "exp": datetime.now(timezone.utc) + timedelta(minutes=OTP_TTL_MINUTES),
     }, SECRET_KEY, algorithm=ALGORITHM)
 
-    first = (cust["name"].split() or ["there"])[0]
-    return {"ok": True, "challenge": challenge, "hint": f"Code sent to •••-•••-{p10[-4:]}", "first_name": first}
+    return {"ok": True, "challenge": challenge,
+            "hint": f"Code emailed to {_mask_email(email)}", "first_name": first}
 
 
 @router.post("/verify-code")
@@ -120,7 +142,7 @@ def verify_code(data: dict = Body(...), request: Request = None):
     if payload.get("purpose") != "portal_otp" or payload.get("phone") != p10:
         raise HTTPException(status_code=400, detail="That code expired — request a new one.")
     if _hash_code(code, p10) != payload.get("code_hash"):
-        raise HTTPException(status_code=400, detail="Wrong code — check the text message and try again.")
+        raise HTTPException(status_code=400, detail="Wrong code — check your email and try again.")
 
     token = jwt.encode({
         "role": "customer",
