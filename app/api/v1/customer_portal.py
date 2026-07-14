@@ -250,6 +250,12 @@ def me(user: dict = Depends(portal_user)):
                 "card_expiry": s.get("card_expiry"),
                 "last_payment_at": s.get("last_payment_at"),
                 "next_billing_date": s.get("next_billing_date"),
+                # tracked-contract info the member gave us (the membership promise:
+                # "we monitor your contract" — shown as their energy dashboard)
+                "current_provider": s.get("current_provider") or s.get("utility_provider"),
+                "contract_end_date": s.get("contract_end_date"),
+                "contract_days_left": _days_left(s.get("contract_end_date")),
+                "service_address": s.get("service_address"),
             }
     except Exception:
         pass  # membership table may predate this feature
