@@ -440,6 +440,66 @@ def count_lead_customers(
     with_email = sum(1 for m in matches if (m.get("email") or "").strip() and "@" in (m.get("email") or ""))
     return {"total": len(matches), "with_email": with_email}
 
+
+@router.get("/customers/filter-options")
+def customer_filter_options(user: UserContext = Depends(get_current_user)):
+    """Distinct Provider / Last name / City / ZIP values among converted
+    customers, so the Customers-tab filters can be dropdowns of real values."""
+    db = get_client()
+    if user.is_sales_agent and not user.sales_agent_name:
+        return {"providers": [], "last_names": [], "cities": [], "zips": []}
+    an = (user.sales_agent_name or "").lower() if user.is_sales_agent else None
+
+    providers, last_names, cities, zips = set(), set(), set(), set()
+    off = 0
+    while True:
+        page = db.table("lead_customers").select(
+            "leads(last_name, city, zip, sales_agent, "
+            "lead_deals(supplier, service_city, service_zip, sales_agent))"
+        ).range(off, off + 999).execute().data or []
+        for c in page:
+            lead = c.get("leads") or {}
+            deals = lead.get("lead_deals") or []
+            if an is not None:
+                lead_agent = (lead.get("sales_agent") or "").strip().lower()
+                deal_agents = [(d.get("sales_agent") or "").strip().lower() for d in deals]
+                if lead_agent != an and not any(a == an for a in deal_agents):
+                    continue
+            if lead.get("last_name"):
+                last_names.add(str(lead["last_name"]).strip())
+            if lead.get("city"):
+                cities.add(str(lead["city"]).strip())
+            if lead.get("zip"):
+                zips.add(str(lead["zip"]).strip())
+            for d in deals:
+                if d.get("supplier"):
+                    providers.add(str(d["supplier"]).strip())
+                if d.get("service_city"):
+                    cities.add(str(d["service_city"]).strip())
+                if d.get("service_zip"):
+                    zips.add(str(d["service_zip"]).strip())
+        if len(page) < 1000:
+            break
+        off += 1000
+
+    def _srt(s):
+        # Dedupe case-insensitively (filtering is case-insensitive), preferring a
+        # mixed-case display over ALL-CAPS/all-lower so 'ARLINGTON'+'Arlington'
+        # collapse to one clean option.
+        groups: dict = {}
+        for x in s:
+            x = (x or "").strip()
+            if x:
+                groups.setdefault(x.lower(), []).append(x)
+        picks = []
+        for g in groups.values():
+            mixed = [v for v in g if not v.isupper() and not v.islower()]
+            picks.append((mixed or sorted(g))[0])
+        return sorted(picks, key=lambda v: v.lower())
+
+    return {"providers": _srt(providers), "last_names": _srt(last_names),
+            "cities": _srt(cities), "zips": _srt(zips)}
+
 # ── Backfill SGP IDs ──────────────────────────────────────────────────────────
 
 @router.post("/backfill-sgp-ids")
