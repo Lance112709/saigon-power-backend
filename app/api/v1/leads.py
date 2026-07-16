@@ -997,6 +997,13 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
     if not str(data.get("status") or "").strip():
         raise HTTPException(status_code=400, detail="'status' is required")
 
+    # Block duplicate active enrollments: same ESI ID or service address can't
+    # already have an active deal anywhere in the CRM.
+    from app.api.v1.crm import find_active_deal_conflict
+    conflict = find_active_deal_conflict(db, data.get("esiid"), data.get("service_address"))
+    if conflict:
+        raise HTTPException(status_code=409, detail=conflict)
+
     payload = {"lead_id": id, **_deal_payload(data)}
 
     # For Residential deals, auto-fill adder from supplier's default_adder

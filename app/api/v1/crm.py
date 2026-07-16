@@ -559,12 +559,55 @@ def delete_crm_customer(id: str, user: UserContext = Depends(require_manager)):
 
 # ── Deals ─────────────────────────────────────────────────────────────────────
 
+def find_active_deal_conflict(db, esiid: str, service_address: str):
+    """If the ESI ID or service address already belongs to an ACTIVE deal
+    anywhere in the CRM (imported deals or lead deals), return a human message
+    explaining the conflict; otherwise None. Used to block duplicate enrollments."""
+    esiid = (esiid or "").strip()
+    addr = (service_address or "").strip()
+
+    def _crm_customer(d):
+        return (d.get("crm_customers") or {}).get("full_name") or "another customer"
+
+    def _lead_name(d):
+        l = d.get("leads") or {}
+        return f"{l.get('first_name','')} {l.get('last_name','')}".strip() or "another lead"
+
+    if esiid:
+        hit = db.table("crm_deals").select("id, crm_customers(full_name)") \
+            .eq("esiid", esiid).eq("deal_status", "ACTIVE").limit(1).execute().data
+        if hit:
+            return f"ESI ID {esiid} already has an active deal in the CRM (on {_crm_customer(hit[0])}). It can't be added again."
+        hit = db.table("lead_deals").select("id, leads(first_name, last_name)") \
+            .eq("esiid", esiid).eq("status", "Active").limit(1).execute().data
+        if hit:
+            return f"ESI ID {esiid} already has an active deal in the CRM (on {_lead_name(hit[0])}). It can't be added again."
+
+    if addr:
+        hit = db.table("crm_deals").select("id, crm_customers(full_name)") \
+            .ilike("service_address", addr).eq("deal_status", "ACTIVE").limit(1).execute().data
+        if hit:
+            return f"Service address \"{addr}\" already has an active deal in the CRM (on {_crm_customer(hit[0])}). It can't be added again."
+        hit = db.table("lead_deals").select("id, leads(first_name, last_name)") \
+            .ilike("service_address", addr).eq("status", "Active").limit(1).execute().data
+        if hit:
+            return f"Service address \"{addr}\" already has an active deal in the CRM (on {_lead_name(hit[0])}). It can't be added again."
+
+    return None
+
+
 @router.post("/customers/{id}/deals")
 def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     c = db.table("crm_customers").select("id").eq("id", id).limit(1).execute()
     if not c.data:
         raise HTTPException(status_code=404, detail="Customer not found")
+
+    # Block duplicate active enrollments: same ESI ID or service address can't
+    # already have an active deal anywhere in the CRM.
+    conflict = find_active_deal_conflict(db, data.get("esiid"), data.get("service_address"))
+    if conflict:
+        raise HTTPException(status_code=409, detail=conflict)
 
     def _f(key):
         v = data.get(key)
