@@ -15,7 +15,7 @@ Each provider gets a row in provider_integrations:
 
     {"customer": {"first": "{{first_name}}", "last": "{{last_name}}"},
      "esiid": "{{esiid}}", "plan_code": "SGP-{{term_months}}",
-     "start": "{{requested_start_date}}", "broker_id": "319010"}
+     "start": "{{requested_start_date}}", "broker_id": "BR200202"}
 
   test_mode         when true, everything is rendered and logged but the
                     HTTP call is skipped — flip off once the provider

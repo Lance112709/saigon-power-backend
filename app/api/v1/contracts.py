@@ -84,6 +84,30 @@ async def store_signed_contract(token: str, file: UploadFile = File(...), reques
             raise HTTPException(status_code=500, detail=f"Upload failed: {str(e2)}")
 
     db.table("proposals").update({"signed_contract_url": path}).eq("token", token).execute()
+
+    # Also file the signed contract under the customer's Attachments so it shows
+    # on their account (best-effort — never blocks the signing itself).
+    try:
+        pf = db.table("proposals").select("lead_id").eq("token", token).limit(1).execute().data
+        lead_id = pf[0].get("lead_id") if pf else None
+        if lead_id:
+            att_path = f"leads/{lead_id}/signed_contract_{token}.pdf"
+            db.storage.from_("crm-attachments").upload(
+                att_path, pdf_bytes, {"content-type": "application/pdf", "upsert": "true"})
+            exists = db.table("lead_attachments").select("id").eq("lead_id", lead_id) \
+                .eq("storage_path", att_path).limit(1).execute().data
+            if not exists:
+                db.table("lead_attachments").insert({
+                    "lead_id": lead_id,
+                    "file_name": "Signed Contract.pdf",
+                    "storage_path": att_path,
+                    "file_type": "application/pdf",
+                    "file_size": len(pdf_bytes),
+                    "uploaded_by": "E-Signature",
+                }).execute()
+    except Exception:
+        pass
+
     return {"path": path}
 
 @router.get("/signed-url/{token}")

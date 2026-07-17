@@ -97,7 +97,7 @@ def _build_xlsx(supplier_name: str, claims: list) -> bytes:
         "Accounts": len(claims),
         "Total Claimed $": total,
         "Prepared": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
-        "Prepared By": "Saigon Power LLC — Broker VID 319010",
+        "Prepared By": "Saigon Power LLC — Broker ID BR200202",
     }])
 
     rows = []
@@ -124,7 +124,7 @@ def _build_xlsx(supplier_name: str, claims: list) -> bytes:
 
 def _draft_email(supplier_name: str, claims: list, finding: Optional[dict],
                  months: list, total: float) -> tuple:
-    subject = (f"Commission discrepancy — Saigon Power (VID 319010) — "
+    subject = (f"Commission discrepancy — Saigon Power (ID BR200202) — "
                f"{', '.join(months)} — ${total:,.2f}")
     if finding:
         issue_line = finding.get("explanation") or finding.get("title") or ""
@@ -138,7 +138,7 @@ def _draft_email(supplier_name: str, claims: list, finding: Optional[dict],
     body = (
         f"Hello,\n\n"
         f"We reconciled the {' and '.join(months)} commission statement(s) for "
-        f"Saigon Power LLC (Broker VID 319010) and found discrepancies totaling "
+        f"Saigon Power LLC (Broker ID BR200202) and found discrepancies totaling "
         f"${total:,.2f} across {len(claims)} account(s).\n\n"
         f"{issue_line}\n\n"
         f"The attached spreadsheet lists every affected ESI ID with the amount "

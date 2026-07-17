@@ -55,7 +55,7 @@ def _shell(inner: str) -> str:
     {inner}
   </td></tr>
   <tr><td style="background:#ffffff;border:1px solid #e6e9f2;border-top:0;border-radius:0 0 16px 16px;padding:18px 28px;color:#94a3b8;font-size:12px;line-height:1.6;">
-    Saigon Power LLC · Texas Broker VID 319010 · {PHONE_DISPLAY}<br>
+    Saigon Power LLC · Texas Broker ID BR200202 · {PHONE_DISPLAY}<br>
     Questions? Just reply to this email or call us — we speak English &amp; Tiếng Việt.<br>
     © {year} Saigon Power LLC
   </td></tr>

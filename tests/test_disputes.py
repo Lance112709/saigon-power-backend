@@ -34,7 +34,7 @@ def _seed(db, cases):
 def test_draft_email_totals_and_tone():
     claims = _claims_from_cases([case(E1, 3.0), case(E2, 5.5)])
     subject, body = _draft_email("Discount Power", claims, None, ["2026-04"], 8.5)
-    assert "$8.50" in subject and "2026-04" in subject and "319010" in subject
+    assert "$8.50" in subject and "2026-04" in subject and "BR200202" in subject
     assert "2 account(s)" in body
     assert "true-up" in body
 
