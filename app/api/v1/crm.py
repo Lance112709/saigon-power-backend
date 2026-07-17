@@ -160,25 +160,43 @@ def list_customers(
     missing_contact: Optional[bool] = Query(None, description="true = no phone and no email on file"),
     date_from: Optional[str] = Query(None, description="created on/after YYYY-MM-DD"),
     date_to: Optional[str] = Query(None, description="created on/before YYYY-MM-DD"),
+    membership: Optional[str] = Query(None, description="members | non_members | (all)"),
     limit: int = Query(50),
     offset: int = Query(0),
     user: UserContext = Depends(get_current_user),
 ):
     db = get_client()
     agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
+    members = member_customer_ids(db)   # active SmartCare members (for the badge)
+    memb = (membership or "").strip()
 
     embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
-    q = db.table("crm_customers").select(
-        "id, full_name, first_name, last_name, email, phone, city, state, notes, created_at, "
-        f"{embed}(id, deal_status, provider, sales_agent, service_address, business_name)"
-    )
-    q = _apply_crm_customer_filters(q, search, provider, deal_status, meter_type,
-                                    source, missing_contact, date_from, date_to, agent_name)
-    res = q.order("full_name").range(offset, offset + limit - 1).execute()
+    cols = ("id, full_name, first_name, last_name, email, phone, city, state, notes, created_at, "
+            f"{embed}(id, deal_status, provider, sales_agent, service_address, business_name)")
 
-    members = member_customer_ids(db)   # active SmartCare members (for the badge)
+    if memb in ("members", "non_members"):
+        # Membership isn't a column, so scan all matching rows, filter, then page.
+        want = memb == "members"
+        rows, off = [], 0
+        while True:
+            q = _apply_crm_customer_filters(db.table("crm_customers").select(cols),
+                                            search, provider, deal_status, meter_type,
+                                            source, missing_contact, date_from, date_to, agent_name)
+            page = q.order("full_name").range(off, off + 999).execute().data or []
+            rows.extend(page)
+            if len(page) < 1000:
+                break
+            off += 1000
+        matched = [c for c in rows if (c["id"] in members) == want]
+        page_rows = matched[offset:offset + limit]
+    else:
+        q = _apply_crm_customer_filters(db.table("crm_customers").select(cols),
+                                        search, provider, deal_status, meter_type,
+                                        source, missing_contact, date_from, date_to, agent_name)
+        page_rows = q.order("full_name").range(offset, offset + limit - 1).execute().data or []
+
     results = []
-    for c in res.data:
+    for c in page_rows:
         deals = c.get("crm_deals", []) or []
         active_count = sum(1 for d in deals if d.get("deal_status") == "ACTIVE")
         active_deals = [d for d in deals if d.get("deal_status") == "ACTIVE"]
@@ -349,13 +367,16 @@ def export_customers(
     missing_contact: Optional[bool] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    membership: Optional[str] = Query(None),  # members | non_members | (all)
     user: UserContext = Depends(require_admin),
 ):
     """Admin-only CSV export of imported customers matching the current filters
-    (one row per customer, with a deal summary)."""
+    (one row per customer, with a deal summary + SmartCare membership)."""
     db = get_client()
     agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
     embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
+    members = member_customer_ids(db)
+    memb = (membership or "").strip()
 
     rows, off = [], 0
     while True:
@@ -372,12 +393,16 @@ def export_customers(
             break
         off += 1000
 
+    if memb in ("members", "non_members"):
+        want = memb == "members"
+        rows = [c for c in rows if (c["id"] in members) == want]
+
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(["Full Name", "First Name", "Last Name", "Business Name", "Email", "Phone",
                 "Service Address", "City", "State", "ZIP", "Provider", "ESI ID",
                 "Contract Start", "Contract End", "Rate", "Status",
-                "Active Deals", "Total Deals", "Source", "Created At"])
+                "Active Deals", "Total Deals", "SmartCare Member", "Source", "Created At"])
     for c in rows:
         deals = c.get("crm_deals") or []
         active = [d for d in deals if (d.get("deal_status") or "").upper() == "ACTIVE"]
@@ -391,6 +416,7 @@ def export_customers(
             primary.get("contract_start_date") or "", primary.get("contract_end_date") or "",
             primary.get("energy_rate") if primary.get("energy_rate") is not None else "",
             "Active" if active else "Inactive", len(active), len(deals),
+            "Yes" if c["id"] in members else "No",
             source_label(c.get("notes")), (c.get("created_at") or "")[:10],
         ])
     buf.seek(0)
