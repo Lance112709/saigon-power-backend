@@ -175,6 +175,7 @@ def list_customers(
                                     source, missing_contact, date_from, date_to, agent_name)
     res = q.order("full_name").range(offset, offset + limit - 1).execute()
 
+    members = member_customer_ids(db)   # active SmartCare members (for the badge)
     results = []
     for c in res.data:
         deals = c.get("crm_deals", []) or []
@@ -202,6 +203,7 @@ def list_customers(
             "deal_count": len(visible_deals),
             "active_deal_count": active_count,
             "created_at": c.get("created_at"),
+            "is_member": c["id"] in members,
         })
     return results
 
@@ -403,6 +405,47 @@ def list_customer_sources(user: UserContext = Depends(get_current_user)):
     return out
 
 
+# ── SmartCare / POWER PLUS membership (extra-care flag) ───────────────────────
+
+def customer_membership(db, customer_id):
+    """The active SmartCare (POWER PLUS) membership for a customer, or None.
+    A member = an ACTIVE giadienre_subscriptions row linked by crm_customer_id."""
+    if not customer_id:
+        return None
+    rows = db.table("giadienre_subscriptions").select(
+        "plan_name, plan_id, billing_cycle, status, subscribed_at, next_billing_date, last_payment_amount"
+    ).eq("crm_customer_id", customer_id).eq("status", "ACTIVE") \
+        .order("subscribed_at", desc=True).limit(1).execute().data or []
+    if not rows:
+        return None
+    s = rows[0]
+    return {
+        "active": True,
+        "plan_name": s.get("plan_name"),
+        "plan_id": s.get("plan_id"),
+        "billing_cycle": s.get("billing_cycle"),
+        "since": s.get("subscribed_at"),
+        "next_billing_date": s.get("next_billing_date"),
+        "amount": s.get("last_payment_amount"),
+    }
+
+
+def member_customer_ids(db) -> set:
+    """All crm_customer_ids with an active membership (for list badges)."""
+    ids, off = set(), 0
+    while True:
+        page = db.table("giadienre_subscriptions").select("crm_customer_id") \
+            .eq("status", "ACTIVE").not_.is_("crm_customer_id", "null") \
+            .range(off, off + 999).execute().data or []
+        for r in page:
+            if r.get("crm_customer_id"):
+                ids.add(r["crm_customer_id"])
+        if len(page) < 1000:
+            break
+        off += 1000
+    return ids
+
+
 @router.get("/customers/{id}")
 def get_customer(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
@@ -418,7 +461,7 @@ def get_customer(id: str, user: UserContext = Depends(get_current_user)):
         deals = [d for d in deals if (d.get("sales_agent") or "").lower() == agent_name]
         if not deals:
             raise HTTPException(status_code=403, detail="Access denied")
-    return {**c.data[0], "deals": deals}
+    return {**c.data[0], "deals": deals, "membership": customer_membership(db, id)}
 
 @router.get("/customers/{id}/notes")
 def get_customer_notes(id: str, user: UserContext = Depends(get_current_user)):
