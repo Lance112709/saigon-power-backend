@@ -113,10 +113,12 @@ try:
     # Day 10, after the watchdog: fold last month's provider-paid GP into SGP
     # tier progress and apply any permanently earned promotions.
     scheduler.add_job(_run_sgp_evaluation, "cron", day=10, hour=10, minute=0)
-    # Daily: providers pay through the month — pull statement emails, import,
-    # audit, and alert every morning (poll_inbox is hash-idempotent, so a
-    # statement is never processed twice).
-    scheduler.add_job(_run_email_ingest, "cron", hour=9, minute=15)
+    # Monthly: commission statements arrive once a month (providers pay by the
+    # 7th) — pull the commission@ inbox on the 8th. The 40-day lookback plus
+    # hash-idempotent poll_inbox means late statements are caught by the
+    # watchdog's own precheck poll on the 10th or by next month's run, and
+    # nothing is ever imported twice. "Check Email Now" still pulls on demand.
+    scheduler.add_job(_run_email_ingest, "cron", day=8, hour=9, minute=15)
     # Phase 2 pricing automation: NRG emails the matrix each business morning;
     # poll weekday mornings so agents have fresh rates by the time they log in.
     scheduler.add_job(_run_pricing_ingest, "cron", day_of_week="mon-fri", hour="6-12", minute="*/20")
