@@ -388,7 +388,14 @@ def _parse_heritage(xl, path_label, warnings):
     during the statement month, so the label comes from each row's Bill Paid
     Date and a premise legitimately repeats when several bills settled that
     month. The "Abel's ..." columns are the sub-agent's override split — SGP's
-    money is 'Commissions Amount'; the split stays in raw only."""
+    money is 'Commissions Amount'; the split stays in raw only.
+
+    SGP's margin with Heritage is a flat 0.007 $/kWh on EVERY account (the
+    CRM adder stores this margin). The statement's 'Affinity Rate in ($)' is
+    the gross rate (margin + Abel's mils), so the captured rate is
+    gross − Abel's mils — that is what the reconciliation rate check must
+    compare against the 0.007 adders; a Heritage cut of SGP's margin still
+    surfaces as a rate mismatch."""
     rows = []
     found = False
     for sh in xl.sheet_names:
@@ -397,6 +404,7 @@ def _parse_heritage(xl, path_label, warnings):
                 or "Affinity Rate in ($)" not in df.columns or "Affinity Amount" in df.columns:
             continue
         found = True
+        abel_col = next((c for c in df.columns if str(c).strip() == "Abel's Mils"), None)
         for _, r in df.iterrows():
             es = normalize_esiid(r.get("Premise ID"))
             amt = _f(r.get("Commissions Amount"))
@@ -404,10 +412,12 @@ def _parse_heritage(xl, path_label, warnings):
                 continue
             nm = _s(r.get("Cust Company Name")) or (_s(r.get("Cust First Name")) + " " + _s(r.get("Cust Last Name"))).strip()
             paid = _d(r.get("Bill Paid Date"))
+            gross = _f(r.get("Affinity Rate in ($)"))
+            margin = round(gross - (_f(r.get(abel_col)) or 0), 6) if gross is not None else None
             rows.append(_mk_row(
                 es, customer_name=nm,
                 address=_s(r.get("Premise Address")), city=_s(r.get("Premise City")), zip=_s(r.get("Premise Zip")),
-                usage_kwh=_f(r.get("kWh")), rate=_f(r.get("Affinity Rate in ($)")), amount=amt,
+                usage_kwh=_f(r.get("kWh")), rate=margin, amount=amt,
                 service_start=_d(r.get("Start Date")), service_end=_d(r.get("End Date")),
                 provider_status=_s(r.get("Cust Status")),
                 contract_start=_d(r.get("Cust Contract Start Date")), contract_end=_d(r.get("Cust Contract End Date")),
