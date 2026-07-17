@@ -19,15 +19,21 @@ def _notify_signed(db, p: dict) -> None:
             lead = db.table("leads").select("sales_agent").eq("id", p["lead_id"]).limit(1).execute().data
             agent_name = (lead[0].get("sales_agent") if lead else None) or None
 
+        agent_key = (agent_name or "").strip().lower()
         recipients = set()
-        for u in (db.table("users").select("email, role, sales_agent_name, status").execute().data or []):
+        for u in (db.table("users").select("email, role, first_name, last_name, sales_agent_name, status").execute().data or []):
             email = (u.get("email") or "").strip()
             if not email or "@" not in email or (u.get("status") and u.get("status") != "active"):
                 continue
             if u.get("role") == "admin":
-                recipients.add(email)
-            if agent_name and (u.get("sales_agent_name") or "").strip().lower() == agent_name.strip().lower():
-                recipients.add(email)
+                recipients.add(email)          # office/owner always hears about it
+            # Match the assigned salesperson by their agent name OR full name,
+            # since leads store the agent as a display name.
+            if agent_key:
+                full = f"{u.get('first_name','')} {u.get('last_name','')}".strip().lower()
+                san = (u.get("sales_agent_name") or "").strip().lower()
+                if agent_key in (full, san):
+                    recipients.add(email)
         if not recipients:
             return
 
