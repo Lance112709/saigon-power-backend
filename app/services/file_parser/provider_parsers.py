@@ -63,6 +63,9 @@ CRM_PROVIDER_GROUPS = {
     "nrg": "NRG Commercial", "nrg energy": "NRG Commercial",
     "discount power": "Discount Power/Cirro", "cirro energy": "Discount Power/Cirro",
     "value power": "Discount Power/Cirro",
+    # Direct Energy is an NRG brand — its residuals arrive inside the NRG
+    # residential statement (first seen Jun 2026, the ex-Budget book).
+    "direct energy": "Discount Power/Cirro",
     "reliant": "Reliant Energy", "reliant energy": "Reliant Energy",
     "tara": "Tara Energy", "tara energy": "Tara Energy",
     "apg&e": "APG&E", "apge": "APG&E",
