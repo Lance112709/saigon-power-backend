@@ -31,7 +31,7 @@ router = APIRouter()
 _FILTER_KEYS = ["search", "provider", "end_from", "end_to", "status",
                 "city", "state", "zip", "last_name", "segment"]
 _CRM_FILTER_KEYS = ["search", "provider", "deal_status", "meter_type", "source",
-                    "missing_contact", "date_from", "date_to"]
+                    "missing_contact", "date_from", "date_to", "membership"]
 
 
 def _now_iso() -> str:

@@ -9,6 +9,7 @@ from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_customer_access, assert_crm_deal_access
 from app.core.security import sanitize_search
+from app.services.audit import audit
 
 router = APIRouter()
 
@@ -255,6 +256,7 @@ def count_customers(
     missing_contact: Optional[bool] = Query(None),
     date_from: Optional[str] = Query(None),
     date_to: Optional[str] = Query(None),
+    membership: Optional[str] = Query(None),  # members | non_members | (all)
     user: UserContext = Depends(get_current_user),
 ):
     """How many imported customers match the filters, and how many have an email
@@ -263,13 +265,35 @@ def count_customers(
     agent_name = user.sales_agent_name.lower() if user.is_sales_agent and user.sales_agent_name else None
     embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
 
-    def _q():
-        base = db.table("crm_customers").select(f"id, {embed}(id)", count="exact")
-        return _apply_crm_customer_filters(base, search, provider, deal_status, meter_type,
-                                           source, missing_contact, date_from, date_to, agent_name)
+    def _base():
+        return _apply_crm_customer_filters(
+            db.table("crm_customers").select(f"id, email, {embed}(id)"),
+            search, provider, deal_status, meter_type,
+            source, missing_contact, date_from, date_to, agent_name)
 
-    total = _q().execute().count or 0
-    with_email = _q().not_.is_("email", "null").neq("email", "").execute().count or 0
+    # Membership filter isn't a column → scan matching ids and split by member set.
+    if (membership or "").strip() in ("members", "non_members"):
+        members = member_customer_ids(db)
+        rows, off = [], 0
+        while True:
+            page = _base().order("id").range(off, off + 999).execute().data or []
+            rows.extend(page)
+            if len(page) < 1000:
+                break
+            off += 1000
+        want_member = membership.strip() == "members"
+        kept = [r for r in rows if (r["id"] in members) == want_member]
+        with_email = sum(1 for r in kept if (r.get("email") or "").strip() and "@" in (r.get("email") or ""))
+        return {"total": len(kept), "with_email": with_email}
+
+    total = _apply_crm_customer_filters(
+        db.table("crm_customers").select(f"id, {embed}(id)", count="exact"),
+        search, provider, deal_status, meter_type, source, missing_contact,
+        date_from, date_to, agent_name).execute().count or 0
+    with_email = _apply_crm_customer_filters(
+        db.table("crm_customers").select(f"id, {embed}(id)", count="exact"),
+        search, provider, deal_status, meter_type, source, missing_contact,
+        date_from, date_to, agent_name).not_.is_("email", "null").neq("email", "").execute().count or 0
     return {"total": total, "with_email": with_email}
 
 
@@ -306,6 +330,12 @@ def collect_crm_recipients(db, filters: dict) -> list:
             "email": (c.get("email") or "").strip(),
             "variables": crm_customer_merge_vars(c, deals),
         })
+
+    membership = (filters.get("membership") or "").strip()
+    if membership in ("members", "non_members"):
+        members = member_customer_ids(db)
+        want = membership == "members"
+        out = [o for o in out if (o["customer_id"] in members) == want]
     return out
 
 
@@ -421,6 +451,7 @@ def customer_membership(db, customer_id):
     s = rows[0]
     return {
         "active": True,
+        "manual": s.get("plan_id") == "SMARTCARE_MANUAL",
         "plan_name": s.get("plan_name"),
         "plan_id": s.get("plan_id"),
         "billing_cycle": s.get("billing_cycle"),
@@ -462,6 +493,46 @@ def get_customer(id: str, user: UserContext = Depends(get_current_user)):
         if not deals:
             raise HTTPException(status_code=403, detail="Access denied")
     return {**c.data[0], "deals": deals, "membership": customer_membership(db, id)}
+
+
+@router.post("/customers/{id}/smartcare-badge")
+def toggle_smartcare_badge(id: str, data: dict = Body(...),
+                           user: UserContext = Depends(require_manager)):
+    """Manually add/remove the SmartCare Member badge (no billing) — recorded as
+    an ACTIVE giadienre_subscriptions row with plan SMARTCARE_MANUAL so it flows
+    through the same membership detection. Never touches real paid subscriptions."""
+    db = get_client()
+    c = db.table("crm_customers").select("*").eq("id", id).limit(1).execute().data
+    if not c:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    cust = c[0]
+    enable = bool(data.get("enabled", True))
+
+    if enable:
+        existing = db.table("giadienre_subscriptions").select("id") \
+            .eq("crm_customer_id", id).eq("plan_id", "SMARTCARE_MANUAL") \
+            .eq("status", "ACTIVE").limit(1).execute().data
+        if not existing:
+            db.table("giadienre_subscriptions").insert({
+                "crm_customer_id": id,
+                "full_name": cust.get("full_name") or "Customer",
+                "email": cust.get("email"), "phone": cust.get("phone"),
+                "city": cust.get("city"), "state": cust.get("state"),
+                "zip": cust.get("postal_code"),
+                "plan_id": "SMARTCARE_MANUAL", "plan_name": "SmartCare (Manual)",
+                "billing_cycle": "monthly", "status": "ACTIVE",
+                "form_type": "manual", "lead_source": "CRM Manual",
+            }).execute()
+        audit(db, "crm_customers", id, "smartcare_badge_added", None,
+              {"by": user.email}, reason="Manual SmartCare badge", actor=user.email or "staff")
+    else:
+        # Only remove the MANUAL flag — leave any real paid subscription intact.
+        db.table("giadienre_subscriptions").delete() \
+            .eq("crm_customer_id", id).eq("plan_id", "SMARTCARE_MANUAL").execute()
+        audit(db, "crm_customers", id, "smartcare_badge_removed", None,
+              {"by": user.email}, reason="Manual SmartCare badge removed", actor=user.email or "staff")
+
+    return {"membership": customer_membership(db, id)}
 
 @router.get("/customers/{id}/notes")
 def get_customer_notes(id: str, user: UserContext = Depends(get_current_user)):
