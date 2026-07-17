@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from typing import Optional
 from datetime import datetime, timezone
 from app.db.client import get_client
-from app.auth.deps import get_current_user, UserContext
+from app.auth.deps import get_current_user, require_manager, UserContext
 
 router = APIRouter()
 
@@ -288,3 +288,14 @@ def update_proposal(proposal_id: str, data: dict = Body(...), user: UserContext 
     if not res.data:
         raise HTTPException(status_code=404, detail="Proposal not found")
     return res.data[0]
+
+
+@router.delete("/{proposal_id}")
+def delete_proposal(proposal_id: str, user: UserContext = Depends(require_manager)):
+    """Delete a proposal (admin/manager only) — e.g. to clear out test entries."""
+    db = get_client()
+    existing = db.table("proposals").select("id").eq("id", proposal_id).limit(1).execute()
+    if not existing.data:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    db.table("proposals").delete().eq("id", proposal_id).execute()
+    return {"ok": True}
