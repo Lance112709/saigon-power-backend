@@ -45,6 +45,7 @@ PROVIDER_SUPPLIERS = {
     "Budget Power":         {"code": "BUDGET", "name": "Budget Power"},
     "CleanSky":             {"code": "CLEANSKY", "name": "CleanSky Energy"},
     "Hudson Energy":        {"code": "HUDSON", "name": "Hudson Energy"},
+    "Heritage Power":       {"code": "HERITAGE", "name": "Heritage Power"},
 }
 
 # Providers whose statements restate the FULL payment history every time —
@@ -65,6 +66,7 @@ CRM_PROVIDER_GROUPS = {
     "budget power": "Budget Power",
     "cleansky energy": "CleanSky", "cleansky": "CleanSky",
     "hudson": "Hudson Energy", "hudson energy": "Hudson Energy",
+    "heritage": "Heritage Power", "heritage power": "Heritage Power",
 }
 
 
@@ -379,6 +381,42 @@ def _parse_budget(xl, path_label, warnings):
     return rows if found else None
 
 
+def _parse_heritage(xl, path_label, warnings):
+    """Heritage Power residual report ('SGP Residual Commissions - <Month>').
+    Same Affinity-platform export as Budget Power, but the payout column is
+    'Commissions Amount' (Budget's is 'Affinity Amount'). Rows are bills PAID
+    during the statement month, so the label comes from each row's Bill Paid
+    Date and a premise legitimately repeats when several bills settled that
+    month. The "Abel's ..." columns are the sub-agent's override split — SGP's
+    money is 'Commissions Amount'; the split stays in raw only."""
+    rows = []
+    found = False
+    for sh in xl.sheet_names:
+        df = pd.read_excel(xl, sheet_name=sh, dtype=str).dropna(how="all")
+        if "Premise ID" not in df.columns or "Commissions Amount" not in df.columns \
+                or "Affinity Rate in ($)" not in df.columns or "Affinity Amount" in df.columns:
+            continue
+        found = True
+        for _, r in df.iterrows():
+            es = normalize_esiid(r.get("Premise ID"))
+            amt = _f(r.get("Commissions Amount"))
+            if not es or amt is None:
+                continue
+            nm = _s(r.get("Cust Company Name")) or (_s(r.get("Cust First Name")) + " " + _s(r.get("Cust Last Name"))).strip()
+            paid = _d(r.get("Bill Paid Date"))
+            rows.append(_mk_row(
+                es, customer_name=nm,
+                address=_s(r.get("Premise Address")), city=_s(r.get("Premise City")), zip=_s(r.get("Premise Zip")),
+                usage_kwh=_f(r.get("kWh")), rate=_f(r.get("Affinity Rate in ($)")), amount=amt,
+                service_start=_d(r.get("Start Date")), service_end=_d(r.get("End Date")),
+                provider_status=_s(r.get("Cust Status")),
+                contract_start=_d(r.get("Cust Contract Start Date")), contract_end=_d(r.get("Cust Contract End Date")),
+                statement_label=paid[:7] if paid else "",
+                raw=_clean_raw(r.to_dict()),
+            ))
+    return rows if found else None
+
+
 def _parse_cleansky(xl, path_label, warnings):
     month_re = re.compile(r"^([A-Z][a-z]+)_(\d{4})$")
     rows = []
@@ -686,6 +724,7 @@ _PARSERS = [
     ("CleanSky", _parse_cleansky),
     ("Iron Horse", _parse_iron_horse),
     ("Budget Power", _parse_budget),  # after Chariot: both use Premise ID columns
+    ("Heritage Power", _parse_heritage),  # after Budget: same Affinity export, different payout column
     ("Tara Energy", _parse_tara_xls),
     ("Reliant Energy", _parse_reliant),
     ("APG&E", _parse_apge),

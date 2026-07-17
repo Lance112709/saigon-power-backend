@@ -26,7 +26,7 @@ from typing import Optional
 
 from app.services.audit import audit
 
-TRUSTED_STATUS_GROUPS = {"Budget Power", "NRG Commercial", "Tara Energy"}
+TRUSTED_STATUS_GROUPS = {"Budget Power", "NRG Commercial", "Tara Energy", "Heritage Power"}
 
 CHURN_RELIABILITY_THRESHOLD = 0.5
 
