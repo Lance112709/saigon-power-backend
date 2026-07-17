@@ -10,8 +10,8 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 def _notify_signed(db, p: dict) -> None:
-    """Email the assigned sales agent + all admins the moment a contract is
-    signed. Best-effort — never blocks the customer's signing."""
+    """Email the assigned sales agent + all admins & managers the moment a
+    contract is signed. Best-effort — never blocks the customer's signing."""
     try:
         from app.services.customer_email import send_email
         agent_name = None
@@ -25,8 +25,8 @@ def _notify_signed(db, p: dict) -> None:
             email = (u.get("email") or "").strip()
             if not email or "@" not in email or (u.get("status") and u.get("status") != "active"):
                 continue
-            if u.get("role") == "admin":
-                recipients.add(email)          # office/owner always hears about it
+            if u.get("role") in ("admin", "manager"):
+                recipients.add(email)          # office/owner + managers always hear about it
             # Match the assigned salesperson by their agent name OR full name,
             # since leads store the agent as a display name.
             if agent_key:
