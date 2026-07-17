@@ -9,6 +9,57 @@ router = APIRouter()
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _notify_signed(db, p: dict) -> None:
+    """Email the assigned sales agent + all admins the moment a contract is
+    signed. Best-effort — never blocks the customer's signing."""
+    try:
+        from app.services.customer_email import send_email
+        agent_name = None
+        if p.get("lead_id"):
+            lead = db.table("leads").select("sales_agent").eq("id", p["lead_id"]).limit(1).execute().data
+            agent_name = (lead[0].get("sales_agent") if lead else None) or None
+
+        recipients = set()
+        for u in (db.table("users").select("email, role, sales_agent_name, status").execute().data or []):
+            email = (u.get("email") or "").strip()
+            if not email or "@" not in email or (u.get("status") and u.get("status") != "active"):
+                continue
+            if u.get("role") == "admin":
+                recipients.add(email)
+            if agent_name and (u.get("sales_agent_name") or "").strip().lower() == agent_name.strip().lower():
+                recipients.add(email)
+        if not recipients:
+            return
+
+        name = p.get("customer_name") or "A customer"
+        rate = f"${float(p['rate']):.4f}/kWh" if p.get("rate") is not None else "—"
+        term = f"{p['term_months']} months" if p.get("term_months") else "—"
+        bill = f"${float(p['est_monthly_bill']):.2f}/mo" if p.get("est_monthly_bill") is not None else "—"
+        rows = [
+            ("Customer", name), ("Phone", p.get("customer_phone") or "—"),
+            ("Email", p.get("customer_email") or "—"),
+            ("Address", p.get("customer_address") or p.get("service_address") or "—"),
+            ("Provider", p.get("rep_name") or "—"), ("Plan", p.get("plan_name") or "—"),
+            ("Rate", rate), ("Term", term), ("Est. bill", bill),
+            ("Signed", "just now"),
+        ]
+        tr = "".join(
+            f"<tr><td style='padding:6px 14px;color:#64748b;font-size:13px;'>{k}</td>"
+            f"<td style='padding:6px 14px;font-weight:600;color:#0f1d3d;font-size:13px;'>{v}</td></tr>"
+            for k, v in rows)
+        html = (
+            f"<div style='font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'>"
+            f"<h2 style='color:#0f1d3d;'>🎉 {name} just signed the contract</h2>"
+            f"<p style='color:#475569;font-size:14px;'>The enrollment is ready to submit. Details:</p>"
+            f"<table style='border-collapse:collapse;background:#f8fafc;border-radius:10px;'>{tr}</table>"
+            f"<p style='color:#94a3b8;font-size:12px;margin-top:16px;'>Open the CRM → Proposals to view the signed contract.</p></div>")
+        subject = f"🎉 Contract signed — {name}"
+        for to in recipients:
+            send_email(to, subject, html)
+    except Exception:
+        pass
+
+
 def _assert_proposal_access(db, user: UserContext, prop: dict) -> None:
     """Sales agents may only touch proposals tied to their own leads."""
     if not user.is_sales_agent:
@@ -114,6 +165,9 @@ def accept_proposal(token: str, data: dict = Body(...)):
         "deal_id":      deal_id,
         "updated_at":   _now(),
     }).eq("token", token).execute()
+
+    # Instantly notify the assigned agent + admins that the customer signed.
+    _notify_signed(db, p)
 
     return {"ok": True, "deal_id": deal_id}
 
