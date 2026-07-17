@@ -53,6 +53,11 @@ PROVIDER_SUPPLIERS = {
 # upload pipeline replaces (not merges) prior rows for those months.
 CUMULATIVE_GROUPS = {"CleanSky"}
 
+# Providers that pay commission on bills PAID during the statement month —
+# a row's month is the payment month even when the service period is old, so
+# back-pay rows must NOT be relabeled into their service months.
+PAID_MONTH_GROUPS = {"Heritage Power"}
+
 # CRM provider spellings -> provider group (used to select deals to reconcile)
 CRM_PROVIDER_GROUPS = {
     "nrg": "NRG Commercial", "nrg energy": "NRG Commercial",
@@ -786,7 +791,8 @@ def detect_and_parse(file_bytes: bytes, filename: str):
         for r in rows:
             if not r["statement_label"]:
                 r["statement_label"] = file_label or fallback or date.today().strftime("%Y-%m")
-        _relabel_far_rows(rows)
+        if group not in PAID_MONTH_GROUPS:
+            _relabel_far_rows(rows)
 
         bad = [r for r in rows if r["row_type"] != "bonus" and not is_valid_esiid(r["esiid"])]
         if bad:
