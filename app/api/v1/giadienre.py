@@ -149,6 +149,7 @@ def _upsert_crm_customer(db, body: PublicSubscription, email: str,
         "state": (body.state or "TX").strip()[:2].upper(),
         "postal_code": _digits(body.zip)[:10] or None,
         "notes": source_label,   # source label shown as a badge in the CRM
+        "created_by": f"Online signup ({source_label})",
     }
     res = db.table("crm_customers").insert(new_cust).execute()
     return res.data[0]["id"] if res.data else None

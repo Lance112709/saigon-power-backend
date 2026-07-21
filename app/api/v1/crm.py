@@ -779,6 +779,7 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         "flag_special_deal":     bool(data.get("flag_special_deal", False)),
         "flag_promo_10":         bool(data.get("flag_promo_10", False)),
         "flag_delinked":         bool(data.get("flag_delinked", False)),
+        "created_by":            user.name,
     }
     res = db.table("crm_deals").insert(payload).execute()
     if not res.data:
@@ -1013,6 +1014,7 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
         "anxh":                 orig.get("anxh"),
         "business_name":        orig.get("business_name"),
         "deal_name":            data.get("deal_name") or orig.get("deal_name"),
+        "created_by":           user.name,
     }
     res = db.table("crm_deals").insert(new_deal).execute()
     return res.data[0]
@@ -1146,6 +1148,7 @@ def import_deals(file_path: str = Body(..., embed=True), user: UserContext = Dep
                 "city": city,
                 "state": state[:2] if state else "TX",
                 "postal_code": postal,
+                "created_by": user.name,
             }
             cres = db.table("crm_customers").insert(new_cust).execute()
             customer_id = cres.data[0]["id"]
@@ -1182,6 +1185,7 @@ def import_deals(file_path: str = Body(..., embed=True), user: UserContext = Dep
             "deal_owner": deal_owner,
             "sales_agent": sales_agent,
             "anxh": anxh,
+            "created_by": user.name,
         }
         if esiid and esiid in existing_esiids:
             deals_skipped += 1
@@ -1428,6 +1432,7 @@ async def import_upload(
                 "city":            _norm_str(get_col(row, "City")),
                 "state":           state_val[:2].upper() if state_val else "TX",
                 "postal_code":     _norm_str(get_col(row, "Zip Code", "Postal Code", "ZIP")),
+                "created_by":      user.name,
             }
             cres = db.table("crm_customers").insert(new_cust).execute()
             customer_id = cres.data[0]["id"]
@@ -1465,6 +1470,7 @@ async def import_upload(
             "anxh":                 _norm_str(get_col(row, "ANXH", "anxh")),
             "business_name":        _norm_str(get_col(row, "Business Name")),
             "deal_name":            _norm_str(get_col(row, "Deal Name")),
+            "created_by":           user.name,
         }
         db.table("crm_deals").insert(deal).execute()
         existing_esiids.add(esiid)
