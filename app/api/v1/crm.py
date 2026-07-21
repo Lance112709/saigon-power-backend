@@ -137,7 +137,7 @@ def _enrich_deals(db, deals: list) -> None:
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
-def get_crm_stats(user: UserContext = Depends(get_current_user)):
+def get_crm_stats(user: UserContext = Depends(require_admin)):
     db = get_client()
     customers = db.table("crm_customers").select("id", count="exact").execute()
     active = db.table("crm_deals").select("id", count="exact").eq("deal_status", "ACTIVE").execute()
