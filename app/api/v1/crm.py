@@ -699,6 +699,31 @@ def delete_crm_customer(id: str, user: UserContext = Depends(require_manager)):
 
 # ── Deals ─────────────────────────────────────────────────────────────────────
 
+def _fetch_all_rows(db, table: str, cols: str) -> list:
+    """Paginate past PostgREST's 1000-row cap. A plain .select().execute()
+    silently truncates, which is how import dedupe sets ended up incomplete."""
+    out, off = [], 0
+    while True:
+        r = db.table(table).select(cols).range(off, off + 999).execute().data or []
+        out.extend(r)
+        if len(r) < 1000:
+            break
+        off += 1000
+    return out
+
+
+def _all_known_esiids(db) -> set:
+    """Every ESI ID already present on any deal (crm_deals or lead_deals),
+    regardless of status. Imports must never create a second deal for a meter
+    the CRM already knows — link or update the existing one instead."""
+    esiids = {(r.get("esiid") or "").strip()
+              for r in _fetch_all_rows(db, "crm_deals", "esiid")}
+    esiids |= {(r.get("esiid") or "").strip()
+               for r in _fetch_all_rows(db, "lead_deals", "esiid")}
+    esiids.discard("")
+    return esiids
+
+
 def find_active_deal_conflict(db, esiid: str, service_address: str):
     """If the ESI ID or service address already belongs to an ACTIVE deal
     anywhere in the CRM (imported deals or lead deals), return a human message
@@ -1065,13 +1090,13 @@ def import_deals(file_path: str = Body(..., embed=True), user: UserContext = Dep
     sup_res = db.table("suppliers").select("id, code").execute()
     supplier_map = {s["code"]: s["id"] for s in sup_res.data}
 
-    # Load existing customers by email (idempotency)
-    existing_res = db.table("crm_customers").select("id, email").execute()
-    customer_by_email: dict = {c["email"]: c["id"] for c in existing_res.data if c.get("email")}
+    # Load existing customers by email (idempotency) — paginated, the plain
+    # select() caps at 1000 rows and silently missed most of the base
+    existing = _fetch_all_rows(db, "crm_customers", "id, email")
+    customer_by_email: dict = {c["email"]: c["id"] for c in existing if c.get("email")}
 
-    # Load existing ESIIDs to prevent duplicate deals
-    esiid_res = db.table("crm_deals").select("esiid").execute()
-    existing_esiids = {r["esiid"] for r in (esiid_res.data or []) if r.get("esiid")}
+    # Load existing ESIIDs (crm_deals + lead_deals) to prevent duplicate deals
+    existing_esiids = _all_known_esiids(db)
 
     wb = openpyxl.load_workbook(file_path, read_only=True, data_only=True)
     ws = wb.active
@@ -1368,10 +1393,11 @@ async def import_upload(
     sup_res = db.table("suppliers").select("id, code").execute()
     supplier_id_map = {s["code"]: s["id"] for s in (sup_res.data or [])}
 
-    # Load existing customer emails for dedup
-    existing_res = db.table("crm_customers").select("id, email, first_name, last_name").execute()
+    # Load existing customer emails for dedup — paginated, the plain select()
+    # caps at 1000 rows and silently missed most of the base
+    existing = _fetch_all_rows(db, "crm_customers", "id, email, first_name, last_name")
     customer_by_key: dict = {}
-    for c in (existing_res.data or []):
+    for c in existing:
         if c.get("email"):
             customer_by_key[c["email"].lower()] = c["id"]
         else:
@@ -1379,9 +1405,8 @@ async def import_upload(
             if name_key:
                 customer_by_key[name_key] = c["id"]
 
-    # Load existing ESIIDs for dedup
-    esiid_res = db.table("crm_deals").select("esiid").execute()
-    existing_esiids = {r["esiid"] for r in (esiid_res.data or []) if r.get("esiid")}
+    # Load existing ESIIDs (crm_deals + lead_deals) for dedup
+    existing_esiids = _all_known_esiids(db)
 
     customers_created = 0
     customers_reused  = 0
