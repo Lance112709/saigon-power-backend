@@ -578,6 +578,24 @@ def create_customer_note(id: str, data: dict = Body(...), user: UserContext = De
     res = db.table("crm_customer_notes").insert({"crm_customer_id": id, "content": content, "author_name": author}).execute()
     return res.data[0]
 
+@router.patch("/customers/{id}/notes/{note_id}")
+def update_customer_note(id: str, note_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    assert_customer_access(db, user, id)
+    note = db.table("crm_customer_notes").select("author_name").eq("id", note_id).eq("crm_customer_id", id).limit(1).execute()
+    if not note.data:
+        raise HTTPException(status_code=404, detail="Note not found")
+    # Only the author or admin/manager can edit
+    author = (note.data[0].get("author_name") or "").strip().lower()
+    requester = (user.name or "").strip().lower()
+    if not user.is_manager and author != requester:
+        raise HTTPException(status_code=403, detail="You can only edit your own notes")
+    content = str(data.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Content required")
+    res = db.table("crm_customer_notes").update({"content": content}).eq("id", note_id).execute()
+    return res.data[0] if res.data else {}
+
 @router.delete("/customers/{id}/notes/{note_id}")
 def delete_customer_note(id: str, note_id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
@@ -1010,6 +1028,24 @@ def create_deal_note(id: str, data: dict = Body(...), user: UserContext = Depend
     assert_crm_deal_access(db, user, id)
     res = db.table("crm_deal_notes").insert({"crm_deal_id": id, "content": content, "author_name": author}).execute()
     return res.data[0]
+
+@router.patch("/deals/{id}/notes/{note_id}")
+def update_deal_note(id: str, note_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    assert_crm_deal_access(db, user, id)
+    note = db.table("crm_deal_notes").select("author_name").eq("id", note_id).eq("crm_deal_id", id).limit(1).execute()
+    if not note.data:
+        raise HTTPException(status_code=404, detail="Note not found")
+    # Only the author or admin/manager can edit
+    author = (note.data[0].get("author_name") or "").strip().lower()
+    requester = (user.name or "").strip().lower()
+    if not user.is_manager and author != requester:
+        raise HTTPException(status_code=403, detail="You can only edit your own notes")
+    content = str(data.get("content") or "").strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Content required")
+    res = db.table("crm_deal_notes").update({"content": content}).eq("id", note_id).execute()
+    return res.data[0] if res.data else {}
 
 @router.post("/deals/{id}/renew")
 def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
