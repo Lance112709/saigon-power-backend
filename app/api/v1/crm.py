@@ -1064,11 +1064,13 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
     allowed = {"deal_status", "deal_name", "provider", "adder", "energy_rate", "deal_owner",
                "sales_agent", "contract_start_date", "contract_end_date", "contract_signed_date",
                "contract_term", "notes", "service_address", "meter_type", "deal_type",
-               "business_name", "anxh", "esiid", "product_type",
+               "business_name", "anxh", "esiid", "product_type", "terminated_date",
                "flag_tos", "flag_toao", "flag_deposit", "flag_special_deal", "flag_promo_10", "flag_delinked"}
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    if payload.get("deal_status") == "ACTIVE":
+        payload.setdefault("terminated_date", None)
     from datetime import datetime, timezone
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     res = db.table("crm_deals").update(payload).eq("id", id).execute()

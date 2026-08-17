@@ -1167,11 +1167,13 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
         "status", "supplier", "plan_name", "product_type", "rate_type", "contract_term",
         "rate", "adder", "est_kwh", "expected_close_date", "start_date", "end_date",
         "service_address", "service_city", "service_state", "service_zip", "esiid",
-        "sales_agent", "deal_type", "service_order_type", "notes",
+        "sales_agent", "deal_type", "service_order_type", "notes", "terminated_date",
     }
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    if payload.get("status") == "Active":
+        payload.setdefault("terminated_date", None)
     payload["updated_at"] = _now()
     res = db.table("lead_deals").update(payload).eq("id", deal_id).eq("lead_id", id).execute()
     if not res.data:
