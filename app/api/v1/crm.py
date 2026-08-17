@@ -105,8 +105,23 @@ def _to_float(val) -> Optional[float]:
     except Exception:
         return None
 
+def _promote_future_deals(db, deals: list) -> None:
+    """Flip FUTURE deals (e.g. renewals signed ahead of time) to ACTIVE once
+    their contract start date has passed. Same rule lead deals use."""
+    from datetime import date
+    today = date.today().isoformat()
+    for d in deals:
+        start = (d.get("contract_start_date") or "")[:10]
+        if d.get("deal_status") == "FUTURE" and start and start <= today:
+            try:
+                db.table("crm_deals").update({"deal_status": "ACTIVE"}).eq("id", d["id"]).execute()
+                d["deal_status"] = "ACTIVE"
+            except Exception:
+                pass  # duplicate-active-ESIID guard may block; leave as FUTURE
+
 def _enrich_deals(db, deals: list) -> None:
     """Backfill energy_rate and sales_agent from actual_commissions by ESIID."""
+    _promote_future_deals(db, deals)
     missing_rate  = [d["esiid"] for d in deals if not d.get("energy_rate") and d.get("esiid")]
     missing_agent = [d["esiid"] for d in deals if not d.get("sales_agent") and d.get("esiid")]
     esiids_needed = list(set(missing_rate + missing_agent))
@@ -1056,14 +1071,20 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
     db.table("crm_deals").update({"deal_status": "RENEWED"}).eq("id", id).execute()
 
     # Build new deal — inherit ESIID/address/meter from original, override with form data
+    status = str(data.get("deal_status") or "ACTIVE").upper()
+    if status not in ("FUTURE", "ACTIVE", "INACTIVE"):
+        status = "ACTIVE"
     new_deal = {
         "customer_id":          orig["customer_id"],
-        "esiid":                orig.get("esiid"),
+        "esiid":                data.get("esiid") or orig.get("esiid"),
         "provider":             data.get("provider") or orig.get("provider"),
-        "deal_status":          "ACTIVE",
+        "deal_status":          status,
         "sales_agent":          data.get("sales_agent") or orig.get("sales_agent"),
         "deal_owner":           data.get("deal_owner") or orig.get("deal_owner"),
-        "service_address":      orig.get("service_address"),
+        "service_address":      data.get("service_address") or orig.get("service_address"),
+        "service_city":         data.get("service_city") or None,
+        "service_state":        data.get("service_state") or None,
+        "service_zip":          data.get("service_zip") or None,
         "contract_start_date":  data.get("contract_start_date") or None,
         "contract_end_date":    data.get("contract_end_date") or None,
         "contract_signed_date": data.get("contract_signed_date") or None,
@@ -1072,6 +1093,11 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
         "adder":                data.get("adder") or None,
         "product_type":         data.get("product_type") or orig.get("product_type"),
         "meter_type":           data.get("meter_type") or orig.get("meter_type"),
+        "plan_name":            data.get("plan_name") or None,
+        "rate_type":            data.get("rate_type") or None,
+        "deal_type":            data.get("deal_type") or None,
+        "service_order_type":   data.get("service_order_type") or None,
+        "est_kwh":              data.get("est_kwh") or None,
         "anxh":                 orig.get("anxh"),
         "business_name":        orig.get("business_name"),
         "deal_name":            data.get("deal_name") or orig.get("deal_name"),
@@ -1101,6 +1127,8 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
                "sales_agent", "contract_start_date", "contract_end_date", "contract_signed_date",
                "contract_term", "notes", "service_address", "meter_type", "deal_type",
                "business_name", "anxh", "esiid", "product_type", "terminated_date",
+               "plan_name", "rate_type", "service_order_type", "est_kwh",
+               "service_city", "service_state", "service_zip",
                "flag_tos", "flag_toao", "flag_deposit", "flag_special_deal", "flag_promo_10", "flag_delinked"}
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
