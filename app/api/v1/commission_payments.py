@@ -11,7 +11,8 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
-from app.auth.deps import UserContext, require_admin
+from app.auth.deps import UserContext, require_admin, get_current_user
+from app.auth.ownership import assert_customer_access, assert_crm_deal_access, assert_lead_access
 from app.db.client import get_client
 
 router = APIRouter()
@@ -184,3 +185,62 @@ def unmatched_payments(limit: int = Query(50), user: UserContext = Depends(requi
     for g in out:
         g["supplier"] = sups.get(g.pop("supplier_id"))
     return {"count": len(groups), "orphans": out}
+
+
+@router.get("/usage")
+def usage(
+    customer_id: Optional[str] = Query(None),
+    deal_id: Optional[str] = Query(None),
+    lead_id: Optional[str] = Query(None),
+    user: UserContext = Depends(get_current_user),
+):
+    """Metered kWh history for a customer/deal/lead, visible to every CRM user.
+    Deliberately excludes dollar amounts, rates, and payment statuses — those
+    stay on the admin-only payments endpoint."""
+    if not (customer_id or deal_id or lead_id):
+        raise HTTPException(status_code=400, detail="Pass customer_id, deal_id, or lead_id")
+    db = get_client()
+
+    # Same per-record scoping the CRM pages enforce (sales agents see only their own).
+    if customer_id:
+        assert_customer_access(db, user, customer_id)
+    elif lead_id:
+        assert_lead_access(db, user, lead_id)
+    elif deal_id:
+        crm_hit = db.table("crm_deals").select("id").eq("id", deal_id).limit(1).execute().data
+        if crm_hit:
+            assert_crm_deal_access(db, user, deal_id)
+        else:
+            ld = db.table("lead_deals").select("lead_id").eq("id", deal_id).limit(1).execute().data
+            if not ld:
+                raise HTTPException(status_code=404, detail="Deal not found")
+            assert_lead_access(db, user, ld[0]["lead_id"])
+
+    esiids = _esiids_for(db, customer_id, deal_id, lead_id)
+    if not esiids:
+        return {"esi_ids": [], "payments": []}
+
+    rows = _fetch(db, "actual_commissions",
+                  "id,raw_esiid,resolved_esiid,billing_month,raw_kwh,supplier_id,raw_row_data",
+                  lambda q: q.in_("raw_esiid", esiids))
+
+    sup_ids = sorted({r["supplier_id"] for r in rows if r.get("supplier_id")})
+    sups = {}
+    if sup_ids:
+        sups = {s["id"]: s["name"] for s in
+                db.table("suppliers").select("id,name").in_("id", sup_ids).execute().data}
+
+    payments = []
+    for r in sorted(rows, key=lambda x: (x.get("billing_month") or ""), reverse=True):
+        norm = (r.get("raw_row_data") or {}).get("_norm") or {}
+        payments.append({
+            "id": r["id"],
+            "esi_id": norm_es(r.get("resolved_esiid") or r.get("raw_esiid")),
+            "payment_date": r.get("billing_month"),
+            "kwh": r.get("raw_kwh"),
+            "supplier": sups.get(r.get("supplier_id")),
+            "service_start": norm.get("service_start"),
+            "service_end": norm.get("service_end"),
+        })
+
+    return {"esi_ids": esiids, "payments": payments}
