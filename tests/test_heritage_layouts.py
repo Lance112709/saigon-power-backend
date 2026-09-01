@@ -16,7 +16,7 @@ ESI = "1008901023812452220102"
 BASE = {"Premise ID": ESI, "Premise Address": "1 Main St", "Premise City": "Houston", "Premise Zip": "77036",
         "Cust First Name": "Yenni", "Cust Last Name": "Nguyen", "Cust Company Name": "",
         "Cust Status": "Active", "Start Date": "2026-05-01", "End Date": "2026-05-31",
-        "Bill Paid Date": "2026-06-12"}
+        "Bill Paid Date": "2026-06-12", "Trans Date": "2026-07-01"}
 
 LAYOUTS = {
     # classic (Jun 2026 and Nov 2025–Apr 2026): gross rate + Abel's mils, SGP money = Commissions Amount
@@ -100,3 +100,15 @@ def test_exact_duplicate_rows_collapse_but_distinct_bills_stay():
                               "SGP Residual Commissions - June 2026.xlsx")
     assert len(parsed["rows"]) == 2
     assert any("duplicate" in w for w in parsed["warnings"])
+
+
+def test_statement_month_comes_from_trans_date_not_paid_date():
+    """Trans Date is Heritage's payment-run date (1st of the following month).
+    Initial-load / re-paid bills carry stale Bill Paid Dates — the run wins."""
+    row = {**LAYOUTS["classic"], "Bill Paid Date": "2022-08-15", "Trans Date": "2025-02-01"}
+    parsed = detect_and_parse(_xlsx(row), "Heritage Power Commissions - Jan 2025 - October 2025.xlsx")
+    assert parsed["rows"][0]["statement_label"] == "2025-01"
+    row = {**LAYOUTS["classic"], "Bill Paid Date": "2026-06-12", "Trans Date": "2026-01-01"}
+    assert detect_and_parse(_xlsx(row), "x.xlsx")["rows"][0]["statement_label"] == "2025-12"
+    row = {k: v for k, v in LAYOUTS["classic"].items() if k != "Trans Date"}
+    assert detect_and_parse(_xlsx(row), "x.xlsx")["rows"][0]["statement_label"] == "2026-06"

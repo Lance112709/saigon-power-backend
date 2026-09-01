@@ -417,9 +417,15 @@ def _heritage_columns(df):
         "net": low.get("saigon mils"),                      # Mar 2026 only: SGP's net rate spelled out
         "usage": low.get("kwh") or low.get("metered points"),
         "paid": low.get("bill paid date"),
+        "trans": low.get("trans date"),                     # payment-run date = month AFTER the statement month
         "bill_no": low.get("bill no"),
         "bill_date": low.get("bill date"),
     }
+
+
+def _prev_month_label(d: str) -> str:
+    y, m = int(d[:4]), int(d[5:7])
+    return f"{y - 1}-12" if m == 1 else f"{y}-{m - 1:02d}"
 
 
 def _rate_dollars(v):
@@ -475,6 +481,11 @@ def _parse_heritage(xl, path_label, warnings):
             if not es or amt is None:
                 continue
             paid = _d(r.get(cols["paid"])) if cols["paid"] else None
+            trans = _d(r.get(cols["trans"])) if cols["trans"] else None
+            # Heritage runs payment on the 1st for the previous month's paid
+            # bills: Trans Date − 1 month is the statement month. Bill Paid Date
+            # normally agrees but drifts on re-paid / initial-load bills.
+            label = _prev_month_label(trans) if trans else (paid[:7] if paid else "")
             key = (es, _s(r.get(cols["bill_no"])) if cols["bill_no"] else _d(r.get(cols["bill_date"])) if cols["bill_date"] else None,
                    paid, round(amt, 4))
             if key[1] and key in seen:
@@ -506,7 +517,7 @@ def _parse_heritage(xl, path_label, warnings):
                 service_start=_d(r.get("Start Date")), service_end=_d(r.get("End Date")),
                 provider_status=_s(r.get("Cust Status")),
                 contract_start=_d(r.get("Cust Contract Start Date")), contract_end=_d(r.get("Cust Contract End Date")),
-                statement_label=paid[:7] if paid else "",
+                statement_label=label,
                 raw=_clean_raw(r.to_dict()),
             ))
     if dups:

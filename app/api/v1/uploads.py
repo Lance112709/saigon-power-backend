@@ -10,6 +10,7 @@ for that flow are staged in Supabase Storage (not process memory), so a
 backend restart between upload and confirm no longer strands the batch.
 """
 import json
+import re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -80,22 +81,24 @@ def _to_month(val) -> Optional[str]:
 
 def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id: str,
                   rows: list, amount_received: Optional[float], actor: str,
-                  warnings: list, going_final: list, trust_status: bool = False) -> dict:
+                  warnings: list, going_final: list, trust_status: bool = False, sync_deals: bool = True) -> dict:
     """Shared pipeline: match rows to deals, backfill ESIIDs, insert
     actual_commissions, sync provider-reported statuses, reconcile each month."""
     deals = load_deals(db, provider_group) if provider_group else {"by_esiid": {}, "no_esiid": [], "addr_index": {}}
 
-    backfilled = backfill_esiids(db, deals, rows, actor) if provider_group else []
+    # sync_deals=False imports the ledger only: no ESIID/end-date backfill and
+    # no provider-status sync touch the deals (history loads, user-requested).
+    backfilled = backfill_esiids(db, deals, rows, actor) if (provider_group and sync_deals) else []
 
     # Auto-update deal statuses from the provider's status column (trusted sources only)
     status_sync = None
-    if provider_group in ABSENCE_SYNC_GROUPS:
+    if provider_group in ABSENCE_SYNC_GROUPS and sync_deals:
         absence = absence_sync(db, supplier_id, provider_group, deals, actor,
                                current_esiids={r["esiid"] for r in rows if r.get("esiid")})
         if absence.get("deactivated"):
             warnings.append(f"{absence['deactivated']} deal(s) deactivated — absent from the "
                             f"last 3 {provider_group} statements.")
-    if provider_group and (trust_status or provider_group in TRUSTED_STATUS_GROUPS):
+    if provider_group and sync_deals and (trust_status or provider_group in TRUSTED_STATUS_GROUPS):
         batch_meta = db.table("upload_batches").select("original_filename").eq("id", batch_id).limit(1).execute().data
         source = f"{provider_group} — {(batch_meta[0]['original_filename'] if batch_meta else batch_id)}"
         status_sync = sync_statuses(db, rows, deals, source, actor)
@@ -121,7 +124,7 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
         }
         # Self-healing: statements carry the contract stop date — fill it onto
         # deals that don't have one so renewals/call list/forecast stay accurate.
-        if deal and r.get("contract_end") and not deal.get("end"):
+        if sync_deals and deal and r.get("contract_end") and not deal.get("end"):
             end_col = "contract_end_date" if deal["source"] == "crm_deals" else "end_date"
             end_val = str(r["contract_end"])[:10]
             try:
@@ -487,9 +490,12 @@ def poll_email(lookback_days: Optional[int] = None, sender: Optional[str] = None
 
 
 @router.post("/{id}/reimport")
-def reimport_batch(id: str, user: UserContext = Depends(require_admin)):
+def reimport_batch(id: str, sync_deals: bool = True, clamp_before: Optional[str] = None,
+                   user: UserContext = Depends(require_admin)):
     """Re-parse a stored statement with the current parsers and rebuild its
-    rows + reconciliation in place (same batch id). Use after a parser fix."""
+    rows + reconciliation in place (same batch id). Use after a parser fix.
+    sync_deals=false imports the ledger only (no deal status/ESIID/date writes).
+    clamp_before=YYYY-MM relabels stray rows older than that month onto it."""
     from app.services.file_parser.provider_parsers import detect_and_parse
     db = get_client()
     res = db.table("upload_batches").select("*").eq("id", id).limit(1).execute().data
@@ -507,6 +513,17 @@ def reimport_batch(id: str, user: UserContext = Depends(require_admin)):
     if not parsed:
         raise HTTPException(status_code=400, detail="Stored file no longer fingerprints as a known provider format")
 
+    if clamp_before:
+        if not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", clamp_before):
+            raise HTTPException(status_code=400, detail="clamp_before must be YYYY-MM")
+        clamped = [r for r in parsed["rows"] if r.get("statement_label") and r["statement_label"] < clamp_before]
+        for r in clamped:
+            r["statement_label"] = clamp_before
+        if clamped:
+            parsed["warnings"].append(f"{len(clamped)} row(s) dated before {clamp_before} relabeled to {clamp_before} "
+                                      f"(${sum(r['amount'] for r in clamped):,.2f})")
+        parsed["labels"] = sorted({r["statement_label"] for r in parsed["rows"] if r.get("statement_label")})
+        parsed["statement_label"] = max(parsed["labels"]) if parsed["labels"] else parsed["statement_label"]
     sup_id = batch.get("supplier_id") or get_or_create_supplier(db, parsed["supplier"])
     old_meta = batch.get("ai_column_mapping") or {}
     months = sorted({f"{l}-01" for l in (old_meta.get("labels") or []) + parsed["labels"]})
@@ -526,11 +543,13 @@ def reimport_batch(id: str, user: UserContext = Depends(require_admin)):
                               "statement_label": parsed["statement_label"], "labels": parsed["labels"],
                               "detector": "fingerprint-v1",
                               "reimported": {"at": datetime.now(timezone.utc).isoformat(),
-                                             "by": user.email, "rows_removed": removed}},
+                                             "by": user.email, "rows_removed": removed,
+                                             "sync_deals": sync_deals, "clamp_before": clamp_before}},
     }).eq("id", id).execute()
     actor = user.email or "admin"
     result = _process_rows(db, id, parsed["provider_group"], sup_id, parsed["rows"],
-                           batch.get("amount_received"), actor, parsed["warnings"], parsed["going_final"])
+                           batch.get("amount_received"), actor, parsed["warnings"], parsed["going_final"],
+                           sync_deals=sync_deals)
     audit(db, "upload_batches", id, "reimport",
           {"rows_imported": batch.get("rows_imported"), "total": batch.get("total_affinity_amount")},
           {"rows_imported": result["rows_imported"], "total": result["total_affinity_amount"], "rows_removed": removed},
