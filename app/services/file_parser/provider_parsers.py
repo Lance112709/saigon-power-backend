@@ -455,11 +455,17 @@ def _parse_heritage(xl, path_label, warnings):
     if not sheets:
         return None
     if len(sheets) > 1:
-        sgp_only = [t for t in sheets if "abe" not in t[0].lower()]
-        if sgp_only and len(sgp_only) < len(sheets):
-            warnings.append("Heritage: ignored Abel's copy sheet(s) "
-                            + ", ".join(t[0] for t in sheets if t not in sgp_only))
-            sheets = sgp_only
+        # Nov 2025: "SGP Commissions" + "Abel's Commissions" restate the SAME
+        # bills; only Abel's copy carries his mils. When the sheets cover the
+        # same bills keep just one — the one that shows Abel's split, else SGP's.
+        def bills(t):
+            _, df, cols = t
+            return set(df[cols["bill_no"]].dropna().astype(str)) if cols["bill_no"] else set()
+        if all(bills(t) == bills(sheets[0]) for t in sheets[1:]) and bills(sheets[0]):
+            ranked = sorted(sheets, key=lambda t: (t[2]["abel"] is None, "abe" in t[0].lower()))
+            warnings.append(f"Heritage: sheets restate the same bills — read '{ranked[0][0]}', ignored "
+                            + ", ".join(f"'{t[0]}'" for t in ranked[1:]))
+            sheets = ranked[:1]
 
     rows, seen, dups, disagree = [], set(), 0, 0
     for sh, df, cols in sheets:

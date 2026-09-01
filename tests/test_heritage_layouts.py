@@ -79,7 +79,18 @@ def test_abels_copy_sheet_is_ignored():
     parsed = detect_and_parse(blob, "SGP Commissions - November 2025.xlsx")
     assert parsed["provider_group"] == "Heritage Power"
     assert len(parsed["rows"]) == 1
-    assert any("Abel's copy" in w for w in parsed["warnings"])
+    assert any("restate the same bills" in w for w in parsed["warnings"])
+
+
+def test_abels_sheet_supplies_the_split_when_sgp_sheet_lacks_it():
+    """Real Nov 2025 shape: SGP's sheet has only the gross rate; Abel's copy of
+    the same bills carries his mils — the net rate must come from there."""
+    sgp = {**BASE, "kWh": "1000", "Bill No": "B1", "Affinity Rate in ($)": "0.009", "Commissions Amount": "9.00"}
+    abel = {**sgp, "Abe'ls Mils ": "0.002", "Abel's Commission Amount ": "2.00"}
+    blob = _xlsx_sheets({"SGP Commissions - Nov 2025": [sgp], "Abel's Commissions": [abel]})
+    parsed = detect_and_parse(blob, "SGP Commissions - November 2025.xlsx")
+    (r,) = parsed["rows"]
+    assert r["rate"] == pytest.approx(0.007) and r["amount"] == 9.0
 
 
 def test_exact_duplicate_rows_collapse_but_distinct_bills_stay():
