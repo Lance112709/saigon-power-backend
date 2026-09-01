@@ -400,20 +400,25 @@ def _heritage_columns(df):
     def find(pred):
         return next((c for n, c in low.items() if pred(n)), None)
 
-    amount = find(lambda n: ("commission" in n and "amount" in n and "abe" not in n)
+    amount = find(lambda n: ("commission" in n and "amount" in n and not n.startswith("abe"))
                   or n == "commissions amount" or n == "saigon commissions amount")
     if amount is None:
         return None
     return {
         "premise": low["premise id"],
-        "amount": amount,
-        # SGP's own rate column, when Abel breaks the split out explicitly
-        "sgp_rate": find(lambda n: (n.startswith("saigon") or n.startswith("sg ")) and ("mil" in n or "rate" in n)),
-        # otherwise gross rate minus Abel's override
-        "gross": find(lambda n: n == "affinity rate in ($)"),
+        "amount": amount,                                   # gross paid to SGP (Abel's cut comes out of it)
+        # gross rate: 'Affinity Rate in ($)' or Abel's 'SG Affinity Rate in ($) Mils'
+        "gross": find(lambda n: n == "affinity rate in ($)"
+                      or ((n.startswith("saigon") or n.startswith("sg ")) and "rate" in n)),
+        # Abel's override in $/kWh (or mils): "Abel's Mils", "Abe's Mils", "Abe'ls Mils",
+        # "Abel's Affinity Rate in ($) Mils"
         "abel": find(lambda n: n.startswith("abe") and "mil" in n),
+        "abel_amount": find(lambda n: n.startswith("abe") and "commission" in n),
+        "net": low.get("saigon mils"),                      # Mar 2026 only: SGP's net rate spelled out
         "usage": low.get("kwh") or low.get("metered points"),
         "paid": low.get("bill paid date"),
+        "bill_no": low.get("bill no"),
+        "bill_date": low.get("bill date"),
     }
 
 
@@ -435,36 +440,59 @@ def _parse_heritage(xl, path_label, warnings):
     money is the Saigon commissions column; the split stays in raw only.
 
     SGP's margin with Heritage is a flat 0.007 $/kWh on EVERY account (the
-    CRM adder stores this margin). When the sheet only carries the gross
-    'Affinity Rate in ($)' (margin + Abel's mils), the captured rate is
-    gross − Abel's mils; when Abel breaks out a Saigon rate column that is
-    used directly. Column names vary month to month — see _heritage_columns."""
-    rows = []
-    found = False
+    CRM adder stores this margin). The sheet's rate column is GROSS (margin +
+    Abel's mils) whatever Abel names it, so the captured rate is gross − Abel's
+    mils; 'Saigon Mils' (when present) is already net. Column names vary
+    month to month — see _heritage_columns. Some workbooks carry a second
+    "Abel's Commissions" sheet restating the same rows — only SGP's sheet is
+    read, and exact duplicate rows are collapsed as a backstop."""
+    sheets = []
     for sh in xl.sheet_names:
         df = pd.read_excel(xl, sheet_name=sh, dtype=str).dropna(how="all")
         cols = _heritage_columns(df)
-        if cols is None:
-            continue
-        found = True
+        if cols is not None:
+            sheets.append((sh, df, cols))
+    if not sheets:
+        return None
+    if len(sheets) > 1:
+        sgp_only = [t for t in sheets if "abe" not in t[0].lower()]
+        if sgp_only and len(sgp_only) < len(sheets):
+            warnings.append("Heritage: ignored Abel's copy sheet(s) "
+                            + ", ".join(t[0] for t in sheets if t not in sgp_only))
+            sheets = sgp_only
+
+    rows, seen, dups, disagree = [], set(), 0, 0
+    for sh, df, cols in sheets:
         for _, r in df.iterrows():
             es = normalize_esiid(r.get(cols["premise"]))
             amt = _f(r.get(cols["amount"]))
             if not es or amt is None:
                 continue
-            nm = _s(r.get("Cust Company Name")) or (_s(r.get("Cust First Name")) + " " + _s(r.get("Cust Last Name"))).strip()
             paid = _d(r.get(cols["paid"])) if cols["paid"] else None
+            key = (es, _s(r.get(cols["bill_no"])) if cols["bill_no"] else _d(r.get(cols["bill_date"])) if cols["bill_date"] else None,
+                   paid, round(amt, 4))
+            if key[1] and key in seen:
+                dups += 1
+                continue
+            seen.add(key)
+
+            nm = _s(r.get("Cust Company Name")) or (_s(r.get("Cust First Name")) + " " + _s(r.get("Cust Last Name"))).strip()
             usage = _f(r.get(cols["usage"])) if cols["usage"] else None
-            if cols["sgp_rate"] and _f(r.get(cols["sgp_rate"])) is not None:
-                margin = _rate_dollars(_f(r.get(cols["sgp_rate"])))
-            elif cols["gross"] and _f(r.get(cols["gross"])) is not None:
-                gross = _rate_dollars(_f(r.get(cols["gross"])))
-                abel = _rate_dollars(_f(r.get(cols["abel"]))) if cols["abel"] else None
+            gross = _rate_dollars(_f(r.get(cols["gross"]))) if cols["gross"] else None
+            abel = _rate_dollars(_f(r.get(cols["abel"]))) if cols["abel"] else None
+            abel_amt = _f(r.get(cols["abel_amount"])) if cols["abel_amount"] else None
+            if gross is not None:
                 margin = round(gross - (abel or 0), 6)
+            elif cols["net"] and _f(r.get(cols["net"])) is not None:
+                margin = _rate_dollars(_f(r.get(cols["net"])))
             elif usage:
-                margin = round(amt / usage, 6)
+                margin = round((amt - (abel_amt or 0)) / usage, 6)
             else:
                 margin = None
+            # the money must agree with the rate columns (catches the next relabel)
+            if margin is not None and usage and abel_amt is not None:
+                if abs((amt - abel_amt) / usage - margin) > 0.0006:
+                    disagree += 1
             rows.append(_mk_row(
                 es, customer_name=nm,
                 address=_s(r.get("Premise Address")), city=_s(r.get("Premise City")), zip=_s(r.get("Premise Zip")),
@@ -475,7 +503,12 @@ def _parse_heritage(xl, path_label, warnings):
                 statement_label=paid[:7] if paid else "",
                 raw=_clean_raw(r.to_dict()),
             ))
-    return rows if found else None
+    if dups:
+        warnings.append(f"Heritage: {dups} exact duplicate row(s) collapsed")
+    if disagree:
+        warnings.append(f"Heritage: {disagree} row(s) where (amount − Abel's amount) ÷ kWh disagrees "
+                        f"with the rate columns — check whether Abel relabeled the rate columns again")
+    return rows
 
 
 def _parse_cleansky(xl, path_label, warnings):

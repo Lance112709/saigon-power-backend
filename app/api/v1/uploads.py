@@ -486,6 +486,59 @@ def poll_email(lookback_days: Optional[int] = None, sender: Optional[str] = None
                       lookback_days=lookback_days, from_filter=sender, mailbox=mailbox)
 
 
+@router.post("/{id}/reimport")
+def reimport_batch(id: str, user: UserContext = Depends(require_admin)):
+    """Re-parse a stored statement with the current parsers and rebuild its
+    rows + reconciliation in place (same batch id). Use after a parser fix."""
+    from app.services.file_parser.provider_parsers import detect_and_parse
+    db = get_client()
+    res = db.table("upload_batches").select("*").eq("id", id).limit(1).execute().data
+    if not res:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    batch = res[0]
+    path = (batch.get("storage_path") or "").split("/", 1)[-1]
+    if not path:
+        raise HTTPException(status_code=400, detail="Batch has no stored file")
+    try:
+        blob = db.storage.from_(STATEMENTS_BUCKET).download(path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read stored file: {str(e)[:150]}")
+    parsed = detect_and_parse(blob, batch.get("original_filename") or path)
+    if not parsed:
+        raise HTTPException(status_code=400, detail="Stored file no longer fingerprints as a known provider format")
+
+    sup_id = batch.get("supplier_id") or get_or_create_supplier(db, parsed["supplier"])
+    old_meta = batch.get("ai_column_mapping") or {}
+    months = sorted({f"{l}-01" for l in (old_meta.get("labels") or []) + parsed["labels"]})
+    removed = 0
+    for month in months:
+        while True:
+            stale = db.table("actual_commissions").select("id").eq("supplier_id", sup_id) \
+                .eq("billing_month", month).eq("upload_batch_id", id).order("id").limit(500).execute().data
+            if not stale:
+                break
+            db.table("actual_commissions").delete().in_("id", [s["id"] for s in stale]).execute()
+            removed += len(stale)
+
+    db.table("upload_batches").update({
+        "status": "parsing", "rows_parsed": parsed["row_count"],
+        "ai_column_mapping": {**old_meta, "auto": True, "provider_group": parsed["provider_group"],
+                              "statement_label": parsed["statement_label"], "labels": parsed["labels"],
+                              "detector": "fingerprint-v1",
+                              "reimported": {"at": datetime.now(timezone.utc).isoformat(),
+                                             "by": user.email, "rows_removed": removed}},
+    }).eq("id", id).execute()
+    actor = user.email or "admin"
+    result = _process_rows(db, id, parsed["provider_group"], sup_id, parsed["rows"],
+                           batch.get("amount_received"), actor, parsed["warnings"], parsed["going_final"])
+    audit(db, "upload_batches", id, "reimport",
+          {"rows_imported": batch.get("rows_imported"), "total": batch.get("total_affinity_amount")},
+          {"rows_imported": result["rows_imported"], "total": result["total_affinity_amount"], "rows_removed": removed},
+          reason="Statement re-parsed with current parsers", actor=actor)
+    result["rows_removed"] = removed
+    return result
+
+
 @router.post("/{id}/apply-statuses")
 def apply_statuses(id: str, user: UserContext = Depends(require_admin)):
     """Force-apply the provider-reported status changes from a batch whose
