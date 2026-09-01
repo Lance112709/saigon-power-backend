@@ -34,21 +34,32 @@ LABEL = "CRM-Imported"
 MAX_ATTACHMENTS_PER_RUN = 25
 
 
-def _config():
-    return (os.environ.get("GMAIL_USER", "").strip(),
-            os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "").strip())
+MAILBOXES = {
+    # name -> (user env, app-password env). "pricing" is the lance@ inbox that
+    # Heritage (Abel) and Hudson mail statements to; its creds already exist on
+    # Railway for the pricing-matrix ingest.
+    "statements": ("GMAIL_USER", "GMAIL_APP_PASSWORD"),
+    "pricing": ("PRICING_GMAIL_USER", "PRICING_GMAIL_APP_PASSWORD"),
+}
+
+
+def _config(mailbox: str = None):
+    user_env, pw_env = MAILBOXES.get(mailbox or "statements", MAILBOXES["statements"])
+    return (os.environ.get(user_env, "").strip(),
+            os.environ.get(pw_env, "").replace(" ", "").strip())
 
 
 def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
-               from_filter: str = None) -> dict:
+               from_filter: str = None, mailbox: str = None) -> dict:
     """Scan the mailbox for commission statements. The scheduled run uses the
     defaults (INBOX, INGEST_LOOKBACK_DAYS). A targeted backfill can pass
     from_filter (sender address) + lookback_days; sender-filtered runs search
     All Mail so archived statements are found too."""
-    user, password = _config()
+    user, password = _config(mailbox)
     if not user or not password:
+        user_env, pw_env = MAILBOXES.get(mailbox or "statements", MAILBOXES["statements"])
         return {"ok": False,
-                "error": "Email ingest isn't configured — set GMAIL_USER and GMAIL_APP_PASSWORD in Railway."}
+                "error": f"Email ingest isn't configured — set {user_env} and {pw_env} in Railway."}
 
     lookback = int(lookback_days or os.environ.get("INGEST_LOOKBACK_DAYS", "40"))
     since = (datetime.now(timezone.utc) - timedelta(days=lookback)).strftime("%d-%b-%Y")
@@ -169,6 +180,6 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
         except Exception:
             pass
 
-    return {"ok": True, "imported": imported, "already_imported": skipped_known,
+    return {"ok": True, "mailbox": user, "imported": imported, "already_imported": skipped_known,
             "unrecognized": unrecognized[:10], "errors": errors[:5],
             "checked_messages": len(ids) if 'ids' in dir() else 0}

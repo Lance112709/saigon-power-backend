@@ -72,7 +72,7 @@ def load_deals(db, provider_group: str) -> dict:
 
     for d in fetch_all(db, "lead_deals",
                        "id,lead_id,status,supplier,esiid,adder,est_kwh,start_date,end_date,provider_status,"
-                       "service_address,service_zip,sales_agent,leads(first_name,last_name,phone)"):
+                       "provider_status_date,service_address,service_zip,sales_agent,leads(first_name,last_name,phone)"):
         if (d.get("supplier") or "").strip().lower() not in wanted:
             continue
         lead = d.get("leads") or {}
@@ -87,13 +87,14 @@ def load_deals(db, provider_group: str) -> dict:
             "phone": lead.get("phone"), "agent": d.get("sales_agent") or "",
             "addr_n": norm_addr(d.get("service_address")), "zip5": zip5(d.get("service_zip")),
             "provider_status": d.get("provider_status"),
+            "provider_status_date": d.get("provider_status_date"),
         }
         _index_deal(by_esiid, no_esiid, deal)
 
     for d in fetch_all(db, "crm_deals",
                        "id,customer_id,deal_status,provider,esiid,adder,meter_type,contract_start_date,"
                        "contract_end_date,service_address,sales_agent,business_name,provider_status,"
-                       "crm_customers(full_name,phone,postal_code)"):
+                       "provider_status_date,crm_customers(full_name,phone,postal_code)"):
         if (d.get("provider") or "").strip().lower() not in wanted:
             continue
         cust = d.get("crm_customers") or {}
@@ -108,6 +109,7 @@ def load_deals(db, provider_group: str) -> dict:
             "phone": cust.get("phone"), "agent": d.get("sales_agent") or "",
             "addr_n": norm_addr(d.get("service_address")), "zip5": zip5(cust.get("postal_code")),
             "provider_status": d.get("provider_status"),
+            "provider_status_date": d.get("provider_status_date"),
         }
         _index_deal(by_esiid, no_esiid, deal)
 

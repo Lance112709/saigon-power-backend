@@ -124,3 +124,19 @@ def test_unchanged_status_skips_write():
                       deals_of(deal(E1, provider_status="Active")), "test", "tester")
     assert db.updates == []
     assert s["confirmed_active"] == 1
+
+
+def test_older_statement_does_not_overwrite_newer_status():
+    """Back-filling Nov 2025 after Jun 2026 was already applied must not flip
+    a deal Jun 2026 marked Inactive back to Active (and vice versa)."""
+    db = FakeDB()
+    d1 = dict(deal(E1, active=False, provider_status="Inactive"), provider_status_date="2026-06-01")
+    d2 = dict(deal(E2, active=True, provider_status="Active"), provider_status_date="2026-06-01")
+    d3 = dict(deal(E3, active=True, provider_status="Active"), provider_status_date="2026-06-01")
+    res = sync_statuses(db, [row(E1, "Active", "2025-11"), row(E2, "Inactive", "2025-11"),
+                             row(E3, "Inactive", "2026-07")],
+                        deals_of(d1, d2, d3), "Heritage — old.xls", "test", force=True)
+    assert res["stale_skipped"] == 2
+    assert res["deactivated"] == 1
+    assert [u[1] for u in db.updates] == [f"d-{E3}"]
+    assert d1["active"] is False and d2["active"] is True

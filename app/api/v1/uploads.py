@@ -473,14 +473,17 @@ def get_upload(id: str, user: UserContext = Depends(require_admin)):
 
 @router.post("/poll-email")
 def poll_email(lookback_days: Optional[int] = None, sender: Optional[str] = None,
-               user: UserContext = Depends(require_admin)):
+               mailbox: Optional[str] = None, user: UserContext = Depends(require_admin)):
     """Check the inbox for new commission statements right now. Optional
-    lookback_days + sender run a targeted backfill (searches All Mail)."""
-    from app.services.email_ingest import poll_inbox
+    lookback_days + sender run a targeted backfill (searches All Mail).
+    mailbox="pricing" reads the lance@ inbox (Heritage / Hudson statements)."""
+    from app.services.email_ingest import poll_inbox, MAILBOXES
     if lookback_days is not None and not (1 <= lookback_days <= 3660):
         raise HTTPException(status_code=400, detail="lookback_days must be 1-3660")
+    if mailbox is not None and mailbox not in MAILBOXES:
+        raise HTTPException(status_code=400, detail=f"mailbox must be one of {sorted(MAILBOXES)}")
     return poll_inbox(actor=user.email or "admin",
-                      lookback_days=lookback_days, from_filter=sender)
+                      lookback_days=lookback_days, from_filter=sender, mailbox=mailbox)
 
 
 @router.post("/{id}/apply-statuses")

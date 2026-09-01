@@ -75,6 +75,7 @@ def sync_statuses(db, rows: list, deals: dict, source: str, actor: str,
         "churn_ratio": round(ratio, 3),
         "confirmed_active": 0, "reactivated": 0, "deactivated": 0,
         "going_final": 0, "unmatched": 0, "applied": 0, "pending": False,
+        "stale_skipped": 0,
     }
 
     if ratio > CHURN_RELIABILITY_THRESHOLD and not force:
@@ -94,6 +95,13 @@ def sync_statuses(db, rows: list, deals: dict, source: str, actor: str,
         deal = deals["by_esiid"].get(es)
         if deal is None:
             summary["unmatched"] += 1
+            continue
+
+        # Back-filling history: never let an older statement overwrite a status
+        # the CRM already holds from a newer one.
+        have = str(deal.get("provider_status_date") or "")[:10]
+        if label and have and f"{label}-01" < have:
+            summary["stale_skipped"] += 1
             continue
 
         display = DISPLAY[mapped]
