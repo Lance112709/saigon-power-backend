@@ -22,6 +22,7 @@ import email
 import email.utils
 import imaplib
 import os
+import re
 from datetime import datetime, timedelta, timezone
 
 from app.db.client import get_client
@@ -41,6 +42,25 @@ MAILBOXES = {
     "statements": ("GMAIL_USER", "GMAIL_APP_PASSWORD"),
     "pricing": ("PRICING_GMAIL_USER", "PRICING_GMAIL_APP_PASSWORD"),
 }
+
+
+def _peek(blob: bytes, fname: str) -> dict:
+    """Why didn't a workbook fingerprint? Sheet names + header cells so an
+    unrecognized statement can be diagnosed from the poll result alone."""
+    ext = fname.rsplit(".", 1)[-1].lower()
+    if ext not in ("xls", "xlsx"):
+        return {}
+    try:
+        import io
+        import pandas as pd
+        xl = pd.ExcelFile(io.BytesIO(blob), engine="xlrd" if ext == "xls" else None)
+        out = {"sheets": xl.sheet_names[:12], "headers": {}}
+        for sh in xl.sheet_names[:6]:
+            df = pd.read_excel(xl, sheet_name=sh, nrows=3, dtype=str)
+            out["headers"][sh] = [str(c)[:40] for c in df.columns[:30]]
+        return out
+    except Exception as e:
+        return {"error": str(e)[:150]}
 
 
 def _config(mailbox: str = None):
@@ -100,6 +120,7 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
                     if not fname:
                         continue
                     fname = str(email.header.make_header(email.header.decode_header(fname)))
+                    fname = re.sub(r"\s+", " ", fname).strip()  # folded MIME headers leave "\r\n "
                     if not fname.lower().endswith((".xlsx", ".xls", ".pdf")):
                         continue
                     blob = part.get_payload(decode=True)
@@ -109,7 +130,8 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
 
                     parsed = detect_and_parse(blob, fname)
                     if not parsed:
-                        unrecognized.append({"file": fname, "from": sender, "subject": subject})
+                        unrecognized.append({"file": fname, "from": sender, "subject": subject,
+                                             "peek": _peek(blob, fname)})
                         continue
 
                     # already imported? (hash-level idempotency)
