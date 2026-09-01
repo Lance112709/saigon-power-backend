@@ -129,7 +129,18 @@ def sync_statuses(db, rows: list, deals: dict, source: str, actor: str,
             change = "confirmed_active"
 
         if updates:
-            db.table(deal["source"]).update(updates).eq("id", deal["id"]).execute()
+            try:
+                db.table(deal["source"]).update(updates).eq("id", deal["id"]).execute()
+            except Exception as e:
+                # The duplicate-ESIID guard refuses to reactivate a deal whose
+                # ESIID is still ACTIVE under another provider (a switch the
+                # CRM hasn't caught up with). Record it and keep syncing.
+                summary["blocked"] = summary.get("blocked", 0) + 1
+                audit(db, deal["source"], deal["id"], "status_sync_blocked",
+                      {"active": deal["active"]},
+                      {"provider_status": display, "attempted": change, "error": str(e)[:200]},
+                      reason=f"Provider statement: {source}", actor=actor)
+                continue
             if change in ("deactivated", "reactivated"):
                 audit(db, deal["source"], deal["id"], f"status_{change}",
                       {"active": deal["active"]},

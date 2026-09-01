@@ -140,3 +140,24 @@ def test_older_statement_does_not_overwrite_newer_status():
     assert res["deactivated"] == 1
     assert [u[1] for u in db.updates] == [f"d-{E3}"]
     assert d1["active"] is False and d2["active"] is True
+
+
+def test_guard_rejection_does_not_abort_sync(monkeypatch):
+    """crm_deals' duplicate-ESIID trigger rejecting a reactivation must be
+    recorded and skipped, not raise out of the whole import."""
+    class BoomDB(FakeDB):
+        def table(self, name):
+            q = FQ(self, name)
+            if name == "crm_deals":
+                def boom():
+                    raise RuntimeError("ESI ID already has an active deal in crm_deals")
+                q.execute = boom
+            return q
+    monkeypatch.setattr("app.services.status_sync.audit", lambda *a, **k: None)
+    db = BoomDB()
+    blocked = deal(E1, source="crm_deals", active=False, provider_status="Inactive")
+    fine = deal(E2, active=False, provider_status="Inactive")
+    res = sync_statuses(db, [row(E1, "Active"), row(E2, "Active")], deals_of(blocked, fine), "src", "test")
+    assert res["blocked"] == 1
+    assert res["reactivated"] == 1
+    assert blocked["active"] is False and fine["active"] is True
