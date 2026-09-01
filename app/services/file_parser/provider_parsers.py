@@ -389,6 +389,42 @@ def _parse_budget(xl, path_label, warnings):
     return rows if found else None
 
 
+def _heritage_columns(df):
+    """Abel re-labels the Affinity export almost every month. Resolve the
+    columns we need by pattern; returns None when the sheet isn't Heritage."""
+    names = {str(c).strip(): c for c in df.columns}
+    low = {n.lower(): c for n, c in names.items()}
+    if "premise id" not in low or "affinity amount" in low:      # 'Affinity Amount' = Budget Power
+        return None
+
+    def find(pred):
+        return next((c for n, c in low.items() if pred(n)), None)
+
+    amount = find(lambda n: ("commission" in n and "amount" in n and "abe" not in n)
+                  or n == "commissions amount" or n == "saigon commissions amount")
+    if amount is None:
+        return None
+    return {
+        "premise": low["premise id"],
+        "amount": amount,
+        # SGP's own rate column, when Abel breaks the split out explicitly
+        "sgp_rate": find(lambda n: (n.startswith("saigon") or n.startswith("sg ")) and ("mil" in n or "rate" in n)),
+        # otherwise gross rate minus Abel's override
+        "gross": find(lambda n: n == "affinity rate in ($)"),
+        "abel": find(lambda n: n.startswith("abe") and "mil" in n),
+        "usage": low.get("kwh") or low.get("metered points"),
+        "paid": low.get("bill paid date"),
+    }
+
+
+def _rate_dollars(v):
+    """Heritage rates are $/kWh (0.003–0.017) but some months Abel types them
+    as mils (3–17). Anything above 0.5 can only be mils."""
+    if v is None:
+        return None
+    return round(v / 1000, 6) if v > 0.5 else v
+
+
 def _parse_heritage(xl, path_label, warnings):
     """Heritage Power residual report ('SGP Residual Commissions - <Month>').
     Same Affinity-platform export as Budget Power, but the payout column is
@@ -396,36 +432,43 @@ def _parse_heritage(xl, path_label, warnings):
     during the statement month, so the label comes from each row's Bill Paid
     Date and a premise legitimately repeats when several bills settled that
     month. The "Abel's ..." columns are the sub-agent's override split — SGP's
-    money is 'Commissions Amount'; the split stays in raw only.
+    money is the Saigon commissions column; the split stays in raw only.
 
     SGP's margin with Heritage is a flat 0.007 $/kWh on EVERY account (the
-    CRM adder stores this margin). The statement's 'Affinity Rate in ($)' is
-    the gross rate (margin + Abel's mils), so the captured rate is
-    gross − Abel's mils — that is what the reconciliation rate check must
-    compare against the 0.007 adders; a Heritage cut of SGP's margin still
-    surfaces as a rate mismatch."""
+    CRM adder stores this margin). When the sheet only carries the gross
+    'Affinity Rate in ($)' (margin + Abel's mils), the captured rate is
+    gross − Abel's mils; when Abel breaks out a Saigon rate column that is
+    used directly. Column names vary month to month — see _heritage_columns."""
     rows = []
     found = False
     for sh in xl.sheet_names:
         df = pd.read_excel(xl, sheet_name=sh, dtype=str).dropna(how="all")
-        if "Premise ID" not in df.columns or "Commissions Amount" not in df.columns \
-                or "Affinity Rate in ($)" not in df.columns or "Affinity Amount" in df.columns:
+        cols = _heritage_columns(df)
+        if cols is None:
             continue
         found = True
-        abel_col = next((c for c in df.columns if str(c).strip() == "Abel's Mils"), None)
         for _, r in df.iterrows():
-            es = normalize_esiid(r.get("Premise ID"))
-            amt = _f(r.get("Commissions Amount"))
+            es = normalize_esiid(r.get(cols["premise"]))
+            amt = _f(r.get(cols["amount"]))
             if not es or amt is None:
                 continue
             nm = _s(r.get("Cust Company Name")) or (_s(r.get("Cust First Name")) + " " + _s(r.get("Cust Last Name"))).strip()
-            paid = _d(r.get("Bill Paid Date"))
-            gross = _f(r.get("Affinity Rate in ($)"))
-            margin = round(gross - (_f(r.get(abel_col)) or 0), 6) if gross is not None else None
+            paid = _d(r.get(cols["paid"])) if cols["paid"] else None
+            usage = _f(r.get(cols["usage"])) if cols["usage"] else None
+            if cols["sgp_rate"] and _f(r.get(cols["sgp_rate"])) is not None:
+                margin = _rate_dollars(_f(r.get(cols["sgp_rate"])))
+            elif cols["gross"] and _f(r.get(cols["gross"])) is not None:
+                gross = _rate_dollars(_f(r.get(cols["gross"])))
+                abel = _rate_dollars(_f(r.get(cols["abel"]))) if cols["abel"] else None
+                margin = round(gross - (abel or 0), 6)
+            elif usage:
+                margin = round(amt / usage, 6)
+            else:
+                margin = None
             rows.append(_mk_row(
                 es, customer_name=nm,
                 address=_s(r.get("Premise Address")), city=_s(r.get("Premise City")), zip=_s(r.get("Premise Zip")),
-                usage_kwh=_f(r.get("kWh")), rate=margin, amount=amt,
+                usage_kwh=usage, rate=margin, amount=amt,
                 service_start=_d(r.get("Start Date")), service_end=_d(r.get("End Date")),
                 provider_status=_s(r.get("Cust Status")),
                 contract_start=_d(r.get("Cust Contract Start Date")), contract_end=_d(r.get("Cust Contract End Date")),
