@@ -226,3 +226,26 @@ def test_no_rule_behavior_unchanged():
     assert out["short_paid"] == 1
     snap = db.tables["expected_commission_snapshots"][0]
     assert snap["rule_id"] is None and snap["calc_method"] == "adder"
+
+
+def test_backfill_skips_deal_when_esiid_guard_rejects_link(monkeypatch):
+    """Migration 012's duplicate-ESIID trigger must not abort the whole import."""
+    from app.services import reconciliation_v2 as rv2
+
+    class Boom:
+        def update(self, *_): return self
+        def eq(self, *_): return self
+        def execute(self): raise RuntimeError("ESI ID 1008901023814475000103 already has an active deal in crm_deals")
+
+    class DB:
+        def table(self, name): return Boom()
+
+    audits = []
+    monkeypatch.setattr("app.services.audit.audit", lambda *a, **k: audits.append(a[3]))
+    deal = {"source": "crm_deals", "id": "d1", "name": "X", "zip5": "77036", "esiid": ""}
+    deals = {"by_esiid": {}, "no_esiid": [deal], "addr_index": {rv2.norm_addr("1 Main St"): [deal]}}
+    rows = [{"esiid": "1008901023814475000103", "address": "1 Main St", "zip": "77036"}]
+    filled = rv2.backfill_esiids(DB(), deals, rows, "test")
+    assert filled == []
+    assert audits == ["esiid_backfill_blocked"]
+    assert "1008901023814475000103" not in deals["by_esiid"]

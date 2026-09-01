@@ -150,7 +150,18 @@ def backfill_esiids(db, deals: dict, rows: list, actor: str) -> list:
         if deal["zip5"] and zip5(r.get("zip")) and deal["zip5"] != zip5(r.get("zip")):
             continue
         table = deal["source"]
-        db.table(table).update({"esiid": r["esiid"]}).eq("id", deal["id"]).execute()
+        try:
+            db.table(table).update({"esiid": r["esiid"]}).eq("id", deal["id"]).execute()
+        except Exception as e:
+            # The duplicate-ESIID guard (migration 012) refuses the link when
+            # another provider's active deal already owns this ESIID — a churn
+            # the CRM hasn't caught up with. Leave the deal ESIID-less and
+            # keep importing; the audit row makes the conflict reviewable.
+            audit(db, table, deal["id"], "esiid_backfill_blocked", {"esiid": None},
+                  {"esiid": r["esiid"], "error": str(e)[:200]},
+                  reason=f"Statement address match: {addr}", actor=actor)
+            deals["addr_index"].pop(addr, None)
+            continue
         audit(db, table, deal["id"], "esiid_backfill", {"esiid": None}, {"esiid": r["esiid"]},
               reason=f"Statement address match: {addr}", actor=actor)
         deal["esiid"] = r["esiid"]
