@@ -244,9 +244,11 @@ def _duplicate_of(deal: dict, same_addr: list):
     for o in same_addr:
         if o["id"] == deal["id"] or not o["start"]:
             continue
-        if o["start"] > deal["start"]:
+        # the earlier contract is the one that gets paid; on identical start
+        # dates the lower id wins so exactly one of the pair is held
+        if (o["start"], o["id"]) > (deal["start"], deal["id"]):
             continue
-        if o["start"][:7] == deal["start"][:7] and o["id"] != deal["id"]:
+        if o["start"][:7] == deal["start"][:7]:
             return o, "same service address, contract also started this month"
         if o["end"]:
             if o["end"] > _plus_days(deal["start"], 30):

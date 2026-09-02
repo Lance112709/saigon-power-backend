@@ -248,3 +248,11 @@ def test_imported_and_transferred_deals_never_earn_enrollment_bonus():
                       cdeal("i2", "Nga Nguyen", "2026-08-01", "2027-08-01", "4 Cedar", owner="budget-direct-transfer")]) \
         ["agents"].get("Nga Nguyen")
     assert nga is None or nga["enrolled"] == 0
+
+
+def test_identical_start_dates_hold_exactly_one_of_the_pair():
+    a = cdeal("aaa", "Nga Nguyen", "2026-08-03", "2029-08-03", "2727 Pecan Ridge Dr")
+    b = cdeal("bbb", "Nga Nguyen", "2026-08-03", "2029-08-03", "2727 Pecan Ridge Dr")
+    nga = run_enroll([b, a])["agents"]["Nga Nguyen"]
+    assert nga["enrolled"] == 2 and nga["held"] == 1 and nga["total"] == 5.0
+    assert [d["deal_id"] for d in nga["deals"] if d["held"]] == ["bbb"]
