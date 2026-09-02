@@ -67,6 +67,122 @@ def trigger_reconciliation(billing_month: str, supplier_id: Optional[str] = None
                             detail=f"No imported statement rows for {label}. Upload the statements first.")
     return {"billing_month": label, "runs": results}
 
+# ── Payments received (REP → SGP) ─────────────────────────────────────────────
+
+_MONTH_RE = r"20\d{2}-(0[1-9]|1[0-2])"
+
+
+def _payments_received(db, month_from: Optional[str], month_to: Optional[str],
+                       providers: Optional[str]):
+    """Provider payments to SGP by month, from the reconciliation ledger
+    (reconciliation_runs.total_actual = every statement row imported for that
+    supplier+month). Filters: month_from/month_to = YYYY-MM inclusive,
+    providers = comma-separated supplier names."""
+    import re
+    for v in (month_from, month_to):
+        if v and not re.fullmatch(_MONTH_RE, v):
+            raise HTTPException(status_code=400, detail="months must be YYYY-MM")
+    runs = db.table("reconciliation_runs").select(
+        "billing_month,total_actual,total_expected,matched_count,suppliers(name,code)"
+    ).order("billing_month").execute().data or []
+    wanted = {p.strip() for p in providers.split(",") if p.strip()} if providers else None
+    first = runs[0]["billing_month"][:7] if runs else None
+    last = runs[-1]["billing_month"][:7] if runs else None
+
+    cells: dict = {}
+    for r in runs:
+        m = r["billing_month"][:7]
+        if month_from and m < month_from:
+            continue
+        if month_to and m > month_to:
+            continue
+        name = (r.get("suppliers") or {}).get("name") or "Unknown"
+        if wanted and name not in wanted:
+            continue
+        c = cells.setdefault((m, name), {"month": m, "provider": name, "paid": 0.0, "expected": 0.0, "accounts": 0})
+        c["paid"] += r.get("total_actual") or 0
+        c["expected"] += r.get("total_expected") or 0
+        c["accounts"] += r.get("matched_count") or 0
+
+    months = sorted({k[0] for k in cells})
+    by_provider: dict = {}
+    for c in cells.values():
+        p = by_provider.setdefault(c["provider"], {"provider": c["provider"], "paid": 0.0, "expected": 0.0, "months": 0})
+        p["paid"] += c["paid"]; p["expected"] += c["expected"]; p["months"] += 1
+    prov_list = sorted(by_provider.values(), key=lambda x: -x["paid"])
+    for p in prov_list:
+        p["paid"] = round(p["paid"], 2); p["expected"] = round(p["expected"], 2)
+    by_month = []
+    for m in months:
+        row = {"month": m, "total": 0.0, "expected": 0.0}
+        for c in cells.values():
+            if c["month"] == m:
+                row[c["provider"]] = round(c["paid"], 2)
+                row["total"] += c["paid"]; row["expected"] += c["expected"]
+        row["total"] = round(row["total"], 2); row["expected"] = round(row["expected"], 2)
+        by_month.append(row)
+    total = round(sum(p["paid"] for p in prov_list), 2)
+    return {
+        "range": {"from": month_from or first, "to": month_to or last},
+        "available": {"first": first, "last": last,
+                      "providers": sorted({(r.get("suppliers") or {}).get("name") or "Unknown" for r in runs})},
+        "total_paid": total,
+        "total_expected": round(sum(p["expected"] for p in prov_list), 2),
+        "months": months,
+        "avg_per_month": round(total / len(months), 2) if months else 0,
+        "by_provider": prov_list,
+        "by_month": by_month,
+        "cells": [{**c, "paid": round(c["paid"], 2), "expected": round(c["expected"], 2)} for c in sorted(cells.values(), key=lambda c: (c["month"], c["provider"]))],
+    }
+
+
+@router.get("/payments-received")
+def payments_received(month_from: Optional[str] = Query(None, alias="from"),
+                      month_to: Optional[str] = Query(None, alias="to"),
+                      providers: Optional[str] = Query(None),
+                      user: UserContext = Depends(require_admin)):
+    """Total $ each REP paid SGP, by month and provider, for any month range."""
+    return _payments_received(get_client(), month_from, month_to, providers)
+
+
+@router.get("/payments-received/export")
+def payments_received_export(month_from: Optional[str] = Query(None, alias="from"),
+                             month_to: Optional[str] = Query(None, alias="to"),
+                             providers: Optional[str] = Query(None),
+                             user: UserContext = Depends(require_admin)):
+    """Excel: Summary (by provider), By Month (month × provider matrix), Detail."""
+    import io
+    import pandas as pd
+    from fastapi.responses import StreamingResponse
+    data = _payments_received(get_client(), month_from, month_to, providers)
+    rng = f"{data['range']['from'] or ''} to {data['range']['to'] or ''}"
+    summary = pd.DataFrame([{"Provider": p["provider"], "Paid to SGP $": p["paid"], "Expected $": p["expected"],
+                             "Months with payments": p["months"]} for p in data["by_provider"]]
+                           + [{"Provider": "TOTAL", "Paid to SGP $": data["total_paid"], "Expected $": data["total_expected"],
+                               "Months with payments": len(data["months"])}])
+    prov_names = [p["provider"] for p in data["by_provider"]]
+    matrix = pd.DataFrame([{"Month": r["month"], **{p: r.get(p, 0.0) for p in prov_names},
+                            "Total": r["total"]} for r in data["by_month"]]
+                          + ([{"Month": "TOTAL", **{p["provider"]: p["paid"] for p in data["by_provider"]},
+                               "Total": data["total_paid"]}] if data["by_month"] else []))
+    detail = pd.DataFrame([{"Month": c["month"], "Provider": c["provider"], "Paid to SGP $": c["paid"],
+                            "Expected $": c["expected"], "Accounts paid": c["accounts"]} for c in data["cells"]])
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        pd.DataFrame([{"Payments received by SGP": rng, "Total": data["total_paid"]}]).to_excel(w, sheet_name="Summary", index=False, startrow=0)
+        summary.to_excel(w, sheet_name="Summary", index=False, startrow=3)
+        (matrix if len(matrix) else pd.DataFrame(columns=["Month"])).to_excel(w, sheet_name="By Month", index=False)
+        (detail if len(detail) else pd.DataFrame(columns=["Month"])).to_excel(w, sheet_name="Detail", index=False)
+        for ws in w.book.worksheets:
+            for col in ws.columns:
+                ws.column_dimensions[col[0].column_letter].width = min(28, max(12, max((len(str(c.value)) if c.value is not None else 0) for c in col) + 2))
+            ws.freeze_panes = "A2" if ws.title != "Summary" else "A5"
+    buf.seek(0)
+    fname = f"payments-received_{(data['range']['from'] or 'all')}_{(data['range']['to'] or 'all')}.xlsx"
+    return StreamingResponse(buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
 @router.get("/runs")
 def list_runs(billing_month: Optional[str] = Query(None), user: UserContext = Depends(require_admin)):
     db = get_client()
