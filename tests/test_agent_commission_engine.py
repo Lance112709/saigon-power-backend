@@ -185,3 +185,66 @@ def test_split_rows_for_one_esiid_counted_once():
     assert a["deals_paid"] == 1
     assert a["residual"] == 1.0     # 0.001 × (600+400)
     assert a["bonuses"] == 20.0
+
+
+# ── flat_per_enrollment: paid at contract start, once per service address ────
+
+def cdeal(id, agent_name, start, end, address, zipc="77036", owner=None, status="ACTIVE", supplier="Heritage Power"):
+    return {"id": id, "deal_status": status, "provider": supplier, "esiid": "", "adder": 0.007,
+            "product_type": "Fixed Rate", "contract_term": "12", "sales_agent": agent_name, "business_name": None,
+            "deal_owner": owner, "contract_start_date": start, "contract_end_date": end,
+            "service_address": address, "service_zip": zipc, "created_at": start,
+            "crm_customers": {"full_name": f"Cust {id}", "postal_code": zipc}}
+
+
+def run_enroll(deals, payments=(), audit=()):
+    db = FakeDB({"sales_agents": [agent("Nga Nguyen", {"components": [{"type": "flat_per_enrollment", "amount": 5}]})],
+                 "lead_deals": [], "crm_deals": list(deals), "actual_commissions": list(payments),
+                 "audit_log": list(audit)})
+    return calculate_month(db, 2026, 8)
+
+
+def test_enrollment_bonus_pays_in_contract_start_month_without_provider_payment():
+    r = run_enroll([cdeal("d1", "Nga Nguyen", "2026-08-10", "2027-08-10", "1 Main St"),
+                    cdeal("d2", "Nga Nguyen", "2026-07-10", "2027-07-10", "2 Oak St")])
+    nga = r["agents"]["Nga Nguyen"]
+    assert nga["total"] == 5.0 and nga["enrolled"] == 1 and nga["held"] == 0
+    assert r["rows"] == 0  # no provider rows needed
+
+
+def test_renewal_at_contract_end_is_paid_not_held():
+    old = cdeal("old", "Nga Nguyen", "2025-08-01", "2026-08-01", "5 Elm St", status="RENEWED")
+    new = cdeal("new", "Nga Nguyen", "2026-08-01", "2027-08-01", "5 Elm St")
+    nga = run_enroll([old, new])["agents"]["Nga Nguyen"]
+    assert nga["total"] == 5.0 and nga["held"] == 0
+
+
+def test_same_address_with_running_contract_is_held_until_released():
+    first = cdeal("a1", "Nga Nguyen", "2026-05-01", "2027-05-01", "9 Pine St")
+    dup = cdeal("a2", "Nga Nguyen", "2026-08-15", "2027-08-15", "9 Pine St")
+    r = run_enroll([first, dup])
+    nga = r["agents"]["Nga Nguyen"]
+    assert nga["held"] == 1 and nga["total"] == 0.0
+    d = nga["deals"][0]
+    assert d["held"] and "HELD" in d["applied"] and d["duplicate_of"]["id"] == "a1"
+    assert any("HELD for review" in w for w in r["warnings"])
+    # admin releases it → paid next calculation
+    r2 = run_enroll([first, dup], audit=[{"record_id": "a2", "action": "enrollment_bonus_release", "created_at": "2026-09-01"}])
+    assert r2["agents"]["Nga Nguyen"]["total"] == 5.0 and r2["agents"]["Nga Nguyen"]["held"] == 0
+    # admin rejects it → stays $0
+    r3 = run_enroll([first, dup], audit=[{"record_id": "a2", "action": "enrollment_bonus_reject", "created_at": "2026-09-01"}])
+    assert r3["agents"]["Nga Nguyen"]["total"] == 0.0 and r3["agents"]["Nga Nguyen"]["deals"][0]["hold_reason"] == "rejected"
+
+
+def test_two_deals_same_address_same_month_hold_the_second():
+    a = cdeal("m1", "Nga Nguyen", "2026-08-03", "2027-08-03", "12 Birch Ln")
+    b = cdeal("m2", "Nga Nguyen", "2026-08-20", "2027-08-20", "12 Birch Ln")
+    nga = run_enroll([a, b])["agents"]["Nga Nguyen"]
+    assert nga["enrolled"] == 2 and nga["held"] == 1 and nga["total"] == 5.0
+
+
+def test_imported_and_transferred_deals_never_earn_enrollment_bonus():
+    nga = run_enroll([cdeal("i1", "Nga Nguyen", "2026-08-01", "2027-08-01", "3 Cedar", owner="heritage-book-import"),
+                      cdeal("i2", "Nga Nguyen", "2026-08-01", "2027-08-01", "4 Cedar", owner="budget-direct-transfer")]) \
+        ["agents"].get("Nga Nguyen")
+    assert nga is None or nga["enrolled"] == 0

@@ -68,7 +68,7 @@ def calculate_commissions(
     now   = datetime.now(timezone.utc).isoformat()
 
     result = calculate_month(db, year, month)
-    if result["rows"] == 0:
+    if result["rows"] == 0 and not result["agents"]:
         raise HTTPException(
             status_code=400,
             detail=f"No provider payments imported for {year}-{month:02d}. "
@@ -88,6 +88,9 @@ def calculate_commissions(
             "residual": vals["residual"],
             "bonuses": vals["bonuses"],
             "flat_monthly": vals["flat_monthly"],
+            "enrollment_bonuses": vals.get("enrollment_bonuses", 0),
+            "enrolled": vals.get("enrolled", 0),
+            "held": vals.get("held", 0),
             "excluded_deals": vals["excluded_deals"],
         })
 
@@ -97,7 +100,7 @@ def calculate_commissions(
                 locked.append(agent)
                 continue
             db.table("agent_commissions").update({
-                "total_deals":      vals["deals_paid"],
+                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
                 "total_commission": vals["total"],
                 "status":           "calculated",
                 "notes":            summary_note,
@@ -109,7 +112,7 @@ def calculate_commissions(
                 "agent_name":       agent,
                 "month":            month,
                 "year":             year,
-                "total_deals":      vals["deals_paid"],
+                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
                 "total_commission": vals["total"],
                 "status":           "calculated",
                 "notes":            summary_note,
@@ -125,7 +128,9 @@ def calculate_commissions(
             "agent_name":    agent,
             "month":         month,
             "year":          year,
-            "notes":         f"{vals['deals_paid']} paid deals · gross ${vals['gross_received']} · payout ${vals['total']}",
+            "notes":         f"{vals['deals_paid']} paid deals · {vals.get('enrolled', 0)} enrolled"
+                             f"{' (' + str(vals['held']) + ' held)' if vals.get('held') else ''}"
+                             f" · gross ${vals['gross_received']} · payout ${vals['total']}",
             "created_at":    now,
         }).execute()
         saved.append({"agent_name": agent, "total_commission": vals["total"],
@@ -197,6 +202,27 @@ def mark_paid(id: str, data: dict = Body(default={}), user: UserContext = Depend
 
 
 # ── Deal Breakdown (recomputed live from actual payments) ─────────────────────
+
+@router.post("/held/{source}/{deal_id}/{decision}")
+def decide_held_enrollment(source: str, deal_id: str, decision: str, data: dict = Body(default={}),
+                           user: UserContext = Depends(require_admin)):
+    """Admin decision on an enrollment bonus HELD for a duplicate service
+    address: 'release' pays it on the next calculation, 'reject' keeps it at
+    $0 for good. Recorded in audit_log (the engine reads the latest decision)."""
+    from app.services.audit import audit
+    from app.services.agent_commission_engine import HOLD_RELEASE, HOLD_REJECT
+    if source not in ("crm_deals", "lead_deals") or decision not in ("release", "reject"):
+        raise HTTPException(status_code=400, detail="source must be crm_deals|lead_deals and decision release|reject")
+    db = get_client()
+    exists = db.table(source).select("id").eq("id", deal_id).limit(1).execute().data
+    if not exists:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    audit(db, source, deal_id, HOLD_RELEASE if decision == "release" else HOLD_REJECT, None,
+          {"decision": decision, "reason": (data.get("reason") or "")[:300], "month": data.get("month")},
+          reason="Enrollment bonus duplicate-address review", actor=user.email or user.name or "admin")
+    return {"ok": True, "deal_id": deal_id, "decision": decision,
+            "next": "Recalculate the month to apply this decision."}
+
 
 def _load_record(db, id: str) -> dict:
     row = db.table("agent_commissions").select("*").eq("id", id).limit(1).execute().data
