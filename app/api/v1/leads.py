@@ -11,6 +11,10 @@ from app.auth.ownership import assert_lead_access
 from app.core.security import sanitize_search, rate_limit
 from app.services.merge_vars import lead_merge_vars
 from app.api.v1.tasks import create_lead_tasks
+from app.services.lead_conversion import next_sgp_id, try_convert_lead, heal_stuck_leads
+import logging
+
+logger = logging.getLogger("saigon.leads")
 
 router = APIRouter()
 
@@ -27,28 +31,13 @@ def _full_name(lead: dict) -> str:
     return f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip()
 
 def _next_sgp_id(db) -> str:
-    res = db.table("leads").select("sgp_customer_id").not_.is_("sgp_customer_id", "null").order("sgp_customer_id", desc=True).limit(1).execute()
-    num = 1
-    if res.data:
-        try:
-            num = int(res.data[0]["sgp_customer_id"].split("-")[1][4:]) + 1
-        except Exception:
-            pass
-    return f"SGP-2026{num:06d}"
+    return next_sgp_id(db)
 
-def _try_convert(db, lead_id: str) -> None:
-    active = db.table("lead_deals").select("id").eq("lead_id", lead_id).eq("status", "Active").execute()
-    if not active.data:
-        return
-    existing = db.table("lead_customers").select("id").eq("lead_id", lead_id).execute()
-    if not existing.data:
-        db.table("lead_customers").insert({"lead_id": lead_id}).execute()
-    # Assign SGP customer ID if not already set
-    lead_row = db.table("leads").select("sgp_customer_id").eq("id", lead_id).execute()
-    if lead_row.data and not lead_row.data[0].get("sgp_customer_id"):
-        db.table("leads").update({"sgp_customer_id": _next_sgp_id(db), "status": "converted", "updated_at": _now()}).eq("id", lead_id).execute()
-    else:
-        db.table("leads").update({"status": "converted", "updated_at": _now()}).eq("id", lead_id).execute()
+def _try_convert(db, lead_id: str) -> dict:
+    """Convert a lead once it has an Active deal. Never raises; the result's
+    "reason" carries any error so callers can surface it (see
+    app.services.lead_conversion)."""
+    return try_convert_lead(db, lead_id)
 
 def _auto_promote_deals(db, deals: list) -> list:
     """Promote 'Future' deals to 'Active' once start_date has passed.
@@ -75,7 +64,7 @@ def _auto_promote_deals(db, deals: list) -> list:
                 if d.get("lead_id"):
                     _try_convert(db, d["lead_id"])
             except Exception:
-                pass
+                logger.exception("auto-promote failed for lead_deal %s", d.get("id"))
     return deals
 
 def _shape_lead(lead: dict, db=None) -> dict:
@@ -132,6 +121,12 @@ def _deal_payload(data: dict) -> dict:
     }
 
 # ── Sales Agents (declared BEFORE /{id}) ──────────────────────────────────────
+
+@router.post("/admin/heal-conversions")
+def admin_heal_conversions(user: UserContext = Depends(require_admin)):
+    """Convert every lead that has an Active deal but is still marked 'lead'.
+    Same routine the nightly scheduler runs; idempotent."""
+    return heal_stuck_leads(get_client())
 
 @router.get("/agents/lookup")
 def lookup_agent(code: str = Query(...)):
@@ -1023,7 +1018,9 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
     deal = res.data[0]
 
     if deal["status"] == "Active":
-        _try_convert(db, id)
+        conv = _try_convert(db, id)
+        if not conv["converted"]:
+            raise HTTPException(status_code=500, detail=f"Deal saved, but converting the lead to a customer failed: {conv['reason']}")
 
     return deal
 
@@ -1180,6 +1177,8 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
         raise HTTPException(status_code=404, detail="Deal not found")
 
     if payload.get("status") == "Active":
-        _try_convert(db, id)
+        conv = _try_convert(db, id)
+        if not conv["converted"]:
+            raise HTTPException(status_code=500, detail=f"Deal saved, but converting the lead to a customer failed: {conv['reason']}")
 
     return res.data[0]

@@ -241,7 +241,9 @@ def update_enrollment(id: str, data: dict = Body(...), user: UserContext = Depen
         if enr.get("deal_id"):
             db.table("lead_deals").update({"status": "Active"}).eq("id", enr["deal_id"]).execute()
         if enr.get("lead_id"):
-            db.table("leads").update({"status": "converted"}).eq("id", enr["lead_id"]).execute()
+            # full conversion (lead_customers row + SGP ID), not just the status flag
+            from app.services.lead_conversion import try_convert_lead
+            try_convert_lead(db, enr["lead_id"])
     return res.data[0]
 
 

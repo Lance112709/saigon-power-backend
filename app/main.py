@@ -94,6 +94,17 @@ def _run_statement_watchdog():
         pass
 
 
+def _run_lead_conversion_heal():
+    """Nightly: any lead with an Active deal that is still marked 'lead'
+    (conversion step failed silently) gets converted + an SGP ID."""
+    try:
+        from app.services.lead_conversion import heal_stuck_leads
+        heal_stuck_leads()
+    except Exception:
+        import logging
+        logging.getLogger("saigon.lead_conversion").exception("nightly lead self-heal crashed")
+
+
 def _run_sgp_evaluation():
     """Fold last month's provider-paid GP into SGP tier progress and apply
     any permanently earned promotions (idempotent)."""
@@ -113,6 +124,7 @@ try:
     # Day 10, after the watchdog: fold last month's provider-paid GP into SGP
     # tier progress and apply any permanently earned promotions.
     scheduler.add_job(_run_sgp_evaluation, "cron", day=10, hour=10, minute=0)
+    scheduler.add_job(_run_lead_conversion_heal, "cron", hour=5, minute=30)
     # Monthly: commission statements arrive once a month (providers pay by the
     # 7th) — pull the commission@ inbox on the 8th. The 40-day lookback plus
     # hash-idempotent poll_inbox means late statements are caught by the
