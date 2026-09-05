@@ -235,6 +235,26 @@ def _plus_days(iso: str, days: int) -> str:
         return iso
 
 
+def _prior_contract(deal: dict, by_esiid: dict, by_addr: dict):
+    """The most recent contract on file for this meter / service address that
+    started in an EARLIER month than `deal` — present means the customer was
+    already ours and this enrollment is a renewal (same or different provider);
+    absent means a brand-new customer. Matches by ESI ID first, then by the
+    normalized service address for deals without one."""
+    cands = []
+    if deal["esiid"]:
+        cands += by_esiid.get(deal["esiid"], [])
+    if deal["addr_key"]:
+        cands += by_addr.get(deal["addr_key"], [])
+    best = None
+    for o in cands:
+        if o["id"] == deal["id"] or not o["start"] or o["start"][:7] >= deal["start"][:7]:
+            continue
+        if best is None or o["start"] > best["start"]:
+            best = o
+    return best
+
+
 def _duplicate_of(deal: dict, same_addr: list):
     """Another contract at this service address that makes this one look like
     a second payment for the same enrollment: it started earlier (or the same
@@ -265,9 +285,12 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
     book = book if book is not None else load_enrollment_book(db)
     decisions = decisions if decisions is not None else load_hold_decisions(db)
     by_addr: dict = {}
+    by_esiid: dict = {}
     for d in book:
         if d["addr_key"]:
             by_addr.setdefault(d["addr_key"], []).append(d)
+        if d["esiid"]:
+            by_esiid.setdefault(d["esiid"], []).append(d)
 
     out: dict = {}
     for d in book:
@@ -285,6 +308,11 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
         excluded = _excluded(d["plan_type"], plan["rules"])
         amount = 0.0 if excluded else sum(float(c.get("amount") or 0) for c in comps)
 
+        prior = _prior_contract(d, by_esiid, by_addr)
+        enrollment_type = "renewal" if prior else "new"
+        type_txt = (f"renewal — prior {prior['supplier'] or 'contract'} from {prior['start']}"
+                    + (f" ended {prior['end']}" if prior and prior["end"] else "")) if prior else "brand-new customer"
+
         dup, why = (None, "")
         if d["addr_key"]:
             dup, why = _duplicate_of(d, by_addr.get(d["addr_key"], []))
@@ -300,13 +328,17 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
             commission, applied = 0.0, "excluded plan type"
         else:
             commission = amount
-            applied = f"enrollment bonus ${amount:.2f} (contract start {d['start']})" + \
+            applied = f"enrollment bonus ${amount:.2f} (contract start {d['start']}) · {type_txt}" + \
                       (" — released by admin" if dup and decision == "release" else "")
         out.setdefault(plan["name"], []).append({
             "kind": "enrollment", "esiid": d["esiid"], "customer": d["customer"], "supplier": d["supplier"],
             "deal_source": d["source"], "deal_id": d["id"], "address": d["address"],
             "contract_start": d["start"], "kwh_paid": 0, "gross_received": 0,
             "first_payment": False, "excluded": excluded, "plan_type": d["plan_type"],
+            "enrollment_type": enrollment_type,
+            "prior_contract": {"source": prior["source"], "id": prior["id"], "customer": prior["customer"],
+                               "supplier": prior["supplier"], "agent": prior["agent"],
+                               "contract_start": prior["start"], "contract_end": prior["end"]} if prior else None,
             "held": held, "hold_reason": why if held and not rejected else ("rejected" if rejected else ""),
             "duplicate_of": {"source": dup["source"], "id": dup["id"], "customer": dup["customer"],
                              "contract_start": dup["start"], "contract_end": dup["end"], "agent": dup["agent"]} if dup else None,
@@ -375,6 +407,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
         return agents.setdefault(display_name, {
             "total": 0.0, "residual": 0.0, "bonuses": 0.0, "flat_monthly": 0.0,
             "enrollment_bonuses": 0.0, "enrolled": 0, "held": 0,
+            "new_enrollments": 0, "renewals": 0,  # enrolled split: brand-new customers vs renewals
             "deals_paid": 0, "gross_received": 0.0, "excluded_deals": 0,
             "deals": [],  # per-deal detail for breakdowns
         })
@@ -384,6 +417,10 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
         b = agent_bucket(display_name)
         for d in deals:
             b["enrolled"] += 1
+            if d.get("enrollment_type") == "renewal":
+                b["renewals"] += 1
+            else:
+                b["new_enrollments"] += 1
             if d["held"]:
                 b["held"] += 1
             b["enrollment_bonuses"] += d["commission"]
@@ -535,6 +572,8 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "enrollment_bonuses": vals.get("enrollment_bonuses", 0),
             "enrolled": vals.get("enrolled", 0),
             "held": vals.get("held", 0),
+            "new_enrollments": vals.get("new_enrollments", 0),
+            "renewals": vals.get("renewals", 0),
             "excluded_deals": vals["excluded_deals"],
         })
 
@@ -573,7 +612,8 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "month":         month,
             "year":          year,
             "notes":         f"{vals['deals_paid']} paid deals · {vals.get('enrolled', 0)} enrolled"
-                             f"{' (' + str(vals['held']) + ' held)' if vals.get('held') else ''}"
+                             f" ({vals.get('new_enrollments', 0)} new · {vals.get('renewals', 0)} renewals"
+                             f"{' · ' + str(vals['held']) + ' held' if vals.get('held') else ''})"
                              f" · gross ${vals['gross_received']} · payout ${vals['total']}",
             "created_at":    now,
         }).execute()

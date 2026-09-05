@@ -204,6 +204,8 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
         "New-deal bonuses": (match or {}).get("bonuses", 0),
         "Flat monthly": (match or {}).get("flat_monthly", 0),
         "Enrolled customers": (match or {}).get("enrolled", 0),
+        "  of which brand-new": (match or {}).get("new_enrollments", 0),
+        "  of which renewals": (match or {}).get("renewals", 0),
         "Enrollment bonuses": (match or {}).get("enrollment_bonuses", 0),
         "Held for review": (match or {}).get("held", 0),
         "TOTAL PAYOUT": (match or {}).get("total", rec.get("total_commission", 0)),
@@ -213,7 +215,8 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
     # accounts; within each group the rows that pay the most come first.
     ordered = sorted(deals, key=lambda d: (0 if d.get("kind") == "enrollment" else 1, -float(d.get("commission") or 0)))
     detail = pd.DataFrame([{
-        "Type": "Enrollment" if d.get("kind") == "enrollment" else "Provider payment",
+        "Type": ("Enrollment — renewal" if d.get("enrollment_type") == "renewal" else "Enrollment — new customer")
+                if d.get("kind") == "enrollment" else "Provider payment",
         "Customer": d["customer"], "ESI ID": d["esiid"], "Provider": d["supplier"],
         "Service address": d.get("address", ""),
         "Contract start": d.get("contract_start", ""),

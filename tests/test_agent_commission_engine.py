@@ -256,3 +256,32 @@ def test_identical_start_dates_hold_exactly_one_of_the_pair():
     nga = run_enroll([b, a])["agents"]["Nga Nguyen"]
     assert nga["enrolled"] == 2 and nga["held"] == 1 and nga["total"] == 5.0
     assert [d["deal_id"] for d in nga["deals"] if d["held"]] == ["bbb"]
+
+
+# ── enrollment type: brand-new customer vs renewal ───────────────────────────
+
+def test_enrollment_split_new_vs_renewal():
+    old = cdeal("old", "Jennie Duong", "2025-08-01", "2026-08-01", "5 Elm St", status="RENEWED", supplier="Iron Horse")
+    ren = cdeal("ren", "Nga Nguyen", "2026-08-01", "2027-08-01", "5 Elm St")          # same address → renewal
+    new = cdeal("new", "Nga Nguyen", "2026-08-12", "2027-08-12", "77 Fresh Ave")      # nothing on file → new
+    nga = run_enroll([old, ren, new])["agents"]["Nga Nguyen"]
+    assert nga["enrolled"] == 2 and nga["new_enrollments"] == 1 and nga["renewals"] == 1
+    by = {d["deal_id"]: d for d in nga["deals"]}
+    assert by["ren"]["enrollment_type"] == "renewal" and by["ren"]["prior_contract"]["id"] == "old"
+    assert "renewal — prior Iron Horse from 2025-08-01" in by["ren"]["applied"]
+    assert by["new"]["enrollment_type"] == "new" and by["new"]["prior_contract"] is None
+    assert "brand-new customer" in by["new"]["applied"]
+
+
+def test_enrollment_type_matches_by_esiid_when_address_differs():
+    old = cdeal("old", "Nga Nguyen", "2025-06-01", "2026-06-01", "1 Old Way")
+    old["esiid"] = "1008901000000000000001"
+    new = cdeal("new", "Nga Nguyen", "2026-08-01", "2027-08-01", "1 Old Way, Houston TX")
+    new["esiid"] = "1008901000000000000001"
+    nga = run_enroll([old, new])["agents"]["Nga Nguyen"]
+    assert nga["renewals"] == 1 and nga["new_enrollments"] == 0
+    # a contract that started the SAME month is a duplicate/hold question, not a renewal
+    a = cdeal("m1", "Nga Nguyen", "2026-08-03", "2027-08-03", "12 Birch Ln")
+    b = cdeal("m2", "Nga Nguyen", "2026-08-20", "2027-08-20", "12 Birch Ln")
+    nga2 = run_enroll([a, b])["agents"]["Nga Nguyen"]
+    assert nga2["new_enrollments"] == 2 and nga2["renewals"] == 0
