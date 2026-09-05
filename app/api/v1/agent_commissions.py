@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, Body, HTTPException, Query
 
 from app.db.client import get_client
 from app.auth.deps import require_admin, UserContext
-from app.services.agent_commission_engine import calculate_month, norm_name
+from app.services.agent_commission_engine import calculate_month, save_month_results, norm_name
 
 router = APIRouter()
 
@@ -65,7 +65,6 @@ def calculate_commissions(
     month = int(data.get("month") or datetime.now(timezone.utc).month)
     year  = int(data.get("year")  or datetime.now(timezone.utc).year)
     db    = get_client()
-    now   = datetime.now(timezone.utc).isoformat()
 
     result = calculate_month(db, year, month)
     if result["rows"] == 0 and not result["agents"]:
@@ -74,68 +73,7 @@ def calculate_commissions(
             detail=f"No provider payments imported for {year}-{month:02d}. "
                    f"Upload the commission statements first — agents are paid from received dollars.")
 
-    saved, locked = [], []
-    for agent, vals in result["agents"].items():
-        existing = (
-            db.table("agent_commissions")
-            .select("id, status")
-            .eq("agent_name", agent).eq("month", month).eq("year", year)
-            .limit(1).execute().data
-        )
-        summary_note = json.dumps({
-            "engine": "actuals-v1",
-            "gross_received": vals["gross_received"],
-            "residual": vals["residual"],
-            "bonuses": vals["bonuses"],
-            "flat_monthly": vals["flat_monthly"],
-            "enrollment_bonuses": vals.get("enrollment_bonuses", 0),
-            "enrolled": vals.get("enrolled", 0),
-            "held": vals.get("held", 0),
-            "excluded_deals": vals["excluded_deals"],
-        })
-
-        if existing:
-            rec = existing[0]
-            if rec["status"] in ("approved", "closed_out", "paid"):
-                locked.append(agent)
-                continue
-            db.table("agent_commissions").update({
-                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
-                "total_commission": vals["total"],
-                "status":           "calculated",
-                "notes":            summary_note,
-                "updated_at":       now,
-            }).eq("id", rec["id"]).execute()
-            rec_id = rec["id"]
-        else:
-            ins = db.table("agent_commissions").insert({
-                "agent_name":       agent,
-                "month":            month,
-                "year":             year,
-                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
-                "total_commission": vals["total"],
-                "status":           "calculated",
-                "notes":            summary_note,
-                "created_at":       now,
-                "updated_at":       now,
-            }).execute().data
-            rec_id = ins[0]["id"] if ins else None
-
-        db.table("commission_logs").insert({
-            "commission_id": rec_id,
-            "action":        "recalculated",
-            "performed_by":  user.name or user.email,
-            "agent_name":    agent,
-            "month":         month,
-            "year":          year,
-            "notes":         f"{vals['deals_paid']} paid deals · {vals.get('enrolled', 0)} enrolled"
-                             f"{' (' + str(vals['held']) + ' held)' if vals.get('held') else ''}"
-                             f" · gross ${vals['gross_received']} · payout ${vals['total']}",
-            "created_at":    now,
-        }).execute()
-        saved.append({"agent_name": agent, "total_commission": vals["total"],
-                      "deals_paid": vals["deals_paid"], "gross_received": vals["gross_received"]})
-
+    saved, locked = save_month_results(db, year, month, result, performed_by=user.name or user.email)
     return {
         "ok": True,
         "month": month, "year": year,
@@ -266,16 +204,27 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
         "Residuals": (match or {}).get("residual", 0),
         "New-deal bonuses": (match or {}).get("bonuses", 0),
         "Flat monthly": (match or {}).get("flat_monthly", 0),
+        "Enrolled customers": (match or {}).get("enrolled", 0),
+        "Enrollment bonuses": (match or {}).get("enrollment_bonuses", 0),
+        "Held for review": (match or {}).get("held", 0),
         "TOTAL PAYOUT": (match or {}).get("total", rec.get("total_commission", 0)),
         "Status": rec.get("status"),
     }])
+    # Enrollment bonuses (paid at contract start) first, then provider-paid
+    # accounts; within each group the rows that pay the most come first.
+    ordered = sorted(deals, key=lambda d: (0 if d.get("kind") == "enrollment" else 1, -float(d.get("commission") or 0)))
     detail = pd.DataFrame([{
+        "Type": "Enrollment" if d.get("kind") == "enrollment" else "Provider payment",
         "Customer": d["customer"], "ESI ID": d["esiid"], "Provider": d["supplier"],
+        "Service address": d.get("address", ""),
+        "Contract start": d.get("contract_start", ""),
         "Plan type": d["plan_type"], "kWh paid": d["kwh_paid"],
         "Gross received $": d["gross_received"],
         "New deal": "Yes" if d["first_payment"] else "",
+        "Status": "HELD — needs review" if d.get("held") and d.get("hold_reason") != "rejected"
+                  else ("Rejected (duplicate)" if d.get("hold_reason") == "rejected" else ""),
         "How calculated": d["applied"], "Commission $": d["commission"],
-    } for d in deals])
+    } for d in ordered])
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:

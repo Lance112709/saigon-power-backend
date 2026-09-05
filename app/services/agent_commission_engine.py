@@ -509,3 +509,74 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
     return {"agents": agents, "unassigned": unassigned, "warnings": warnings,
             "rows": len(rows), "label": label,
             "gross_total": round(sum(float(r.get("raw_amount") or 0) for r in rows), 2)}
+
+
+def save_month_results(db, year: int, month: int, result: dict, performed_by: str):
+    """Persist a calculate_month() result as agent_commissions rows (one per
+    agent-month) with a 'recalculated' log line each. Rows already approved,
+    closed out or paid are locked and left untouched. Returns (saved, locked)."""
+    import json
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc).isoformat()
+    saved, locked = [], []
+    for agent, vals in result["agents"].items():
+        existing = (
+            db.table("agent_commissions")
+            .select("id, status")
+            .eq("agent_name", agent).eq("month", month).eq("year", year)
+            .limit(1).execute().data
+        )
+        summary_note = json.dumps({
+            "engine": "actuals-v1",
+            "gross_received": vals["gross_received"],
+            "residual": vals["residual"],
+            "bonuses": vals["bonuses"],
+            "flat_monthly": vals["flat_monthly"],
+            "enrollment_bonuses": vals.get("enrollment_bonuses", 0),
+            "enrolled": vals.get("enrolled", 0),
+            "held": vals.get("held", 0),
+            "excluded_deals": vals["excluded_deals"],
+        })
+
+        if existing:
+            rec = existing[0]
+            if rec["status"] in ("approved", "closed_out", "paid"):
+                locked.append(agent)
+                continue
+            db.table("agent_commissions").update({
+                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
+                "total_commission": vals["total"],
+                "status":           "calculated",
+                "notes":            summary_note,
+                "updated_at":       now,
+            }).eq("id", rec["id"]).execute()
+            rec_id = rec["id"]
+        else:
+            ins = db.table("agent_commissions").insert({
+                "agent_name":       agent,
+                "month":            month,
+                "year":             year,
+                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
+                "total_commission": vals["total"],
+                "status":           "calculated",
+                "notes":            summary_note,
+                "created_at":       now,
+                "updated_at":       now,
+            }).execute().data
+            rec_id = ins[0]["id"] if ins else None
+
+        db.table("commission_logs").insert({
+            "commission_id": rec_id,
+            "action":        "recalculated",
+            "performed_by":  performed_by,
+            "agent_name":    agent,
+            "month":         month,
+            "year":          year,
+            "notes":         f"{vals['deals_paid']} paid deals · {vals.get('enrolled', 0)} enrolled"
+                             f"{' (' + str(vals['held']) + ' held)' if vals.get('held') else ''}"
+                             f" · gross ${vals['gross_received']} · payout ${vals['total']}",
+            "created_at":    now,
+        }).execute()
+        saved.append({"agent_name": agent, "total_commission": vals["total"],
+                      "deals_paid": vals["deals_paid"], "gross_received": vals["gross_received"]})
+    return saved, locked
