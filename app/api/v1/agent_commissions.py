@@ -5,7 +5,6 @@ agent's custom plan (sales_agents.commission_rules) — see
 app/services/agent_commission_engine.py. Workflow per agent per month:
 calculated → approved → closed_out → paid, with an action log.
 """
-import json
 from datetime import datetime, timezone, date
 from typing import Optional
 
