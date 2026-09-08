@@ -25,6 +25,7 @@ import os
 import re
 from datetime import datetime, timedelta, timezone
 
+from app.services.deposits import statement_figures
 from app.db.client import get_client
 from app.services.audit import audit
 from app.services.file_parser.provider_parsers import detect_and_parse
@@ -155,6 +156,7 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
                                               "email_ingest": {"from": sender, "subject": subject,
                                                                "date": msg.get("Date", "")[:40]}},
                         "rows_parsed": parsed["row_count"],
+                        **statement_figures(parsed),
                     }).execute().data[0]
 
                     result = _process_rows(db, batch["id"], parsed["provider_group"], sup_id,

@@ -319,14 +319,19 @@ def _parse_nrg_business(xl, path_label, warnings):
                 row_type="delinquent", statement_label=label,
                 raw=_clean_raw(r.to_dict()),
             ))
+    summary = {}
     try:
         paid = _f(kv.get("Total Paid"))
         total = round(sum(r["amount"] or 0 for r in rows if r["row_type"] in ("commission", "bonus")), 2)
         if paid is not None and abs(total - paid) > 0.02:
             warnings.append(f"NRG summary says Total Paid ${paid:,.2f} but rows sum to ${total:,.2f}")
+        # Statement-level figures used by the bank-deposit check: NRG deposits
+        # Total Paid minus Total Withheld, on the Pay Date.
+        summary = {"total_paid": paid, "total_withheld": _f(kv.get("Total Withheld")),
+                   "pay_date": _d(kv.get("Pay Date")), "payment_batch_id": _s(kv.get("Payment Batch ID"))}
     except Exception:
         pass
-    return rows
+    return rows, summary
 
 
 def _parse_chariot(xl, path_label, warnings):
@@ -870,8 +875,13 @@ def detect_and_parse(file_bytes: bytes, filename: str):
         candidates = _PARSERS
 
     for group, parser in candidates:
+        summary = {}
         try:
             rows = parser(xl, file_label, warnings)
+            # a parser may return (rows, summary) to pass statement-level
+            # figures (total withheld, pay date) out alongside the rows
+            if isinstance(rows, tuple):
+                rows, summary = rows[0], (rows[1] or {})
         except Exception as e:
             warnings.append(f"{group} parser error: {e}")
             rows = None
@@ -917,5 +927,8 @@ def detect_and_parse(file_bytes: bytes, filename: str):
             "row_count": len(rows),
             "total_amount": round(sum(r["amount"] or 0 for r in rows if r["row_type"] == "commission"), 2),
             "going_final": going_final,
+            "summary": summary,
+            "total_withheld": summary.get("total_withheld"),
+            "expected_pay_date": summary.get("pay_date"),
         }
     return None

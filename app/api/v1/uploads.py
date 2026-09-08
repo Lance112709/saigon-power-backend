@@ -14,7 +14,7 @@ import re
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Body, Depends
+from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Body, Depends, Query
 
 from app.db.client import get_client
 from app.services.file_parser.excel_parser import parse_excel, parse_csv
@@ -33,6 +33,7 @@ from app.services.audit_detections import run_extended_audit
 from app.services.audit_notifications import notify_big_findings
 from app.services.commission_rules import get_rule_for_month
 from app.services.exception_cases import upsert_cases_from_run
+from app.services.deposits import deposit_status, list_deposits, statement_figures
 from app.auth.deps import require_admin, UserContext
 
 router = APIRouter()
@@ -309,6 +310,7 @@ async def upload_file(
                                   "statement_label": parsed_auto["statement_label"],
                                   "labels": parsed_auto["labels"], "detector": "fingerprint-v1"},
             "rows_parsed": parsed_auto["row_count"],
+            **statement_figures(parsed_auto),
         }).execute().data[0]
 
         result = _process_rows(
@@ -462,7 +464,25 @@ def list_uploads(supplier_id: Optional[str] = None, user: UserContext = Depends(
     q = db.table("upload_batches").select("*, suppliers(name, code)").order("created_at", desc=True)
     if supplier_id:
         q = q.eq("supplier_id", supplier_id)
-    return q.execute().data
+    rows = q.execute().data or []
+    for r in rows:
+        if r.get("status") == "confirmed":
+            r["deposit"] = deposit_status(r)
+    return rows
+
+
+@router.get("/deposits")
+def deposits(month_from: Optional[str] = Query(None, alias="from"),
+             month_to: Optional[str] = Query(None, alias="to"),
+             only: Optional[str] = Query(None, description="needs_attention | open"),
+             user: UserContext = Depends(require_admin)):
+    """Bank-deposit check: every confirmed statement in the month range with the
+    deposit recorded against it and a status (paid_in_full / explained_withholding /
+    short_paid / over_paid / awaiting / overdue)."""
+    for m in (month_from, month_to):
+        if m and not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", m):
+            raise HTTPException(status_code=400, detail="from/to must be YYYY-MM")
+    return list_deposits(get_client(), month_from, month_to, only)
 
 
 @router.get("/{id}")
@@ -471,7 +491,52 @@ def get_upload(id: str, user: UserContext = Depends(require_admin)):
     res = db.table("upload_batches").select("*, suppliers(name, code)").eq("id", id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Upload not found")
-    return res.data
+    data = res.data
+    data["deposit"] = deposit_status(data)
+    return data
+
+
+@router.put("/{id}/received")
+def record_received(id: str, data: dict = Body(...), user: UserContext = Depends(require_admin)):
+    """Record (or clear) the bank deposit for a statement after it lands.
+    Body: {amount_received: number|null, received_at: YYYY-MM-DD|null, notes: str|null}.
+    amount_received=null clears the deposit."""
+    db = get_client()
+    cur = db.table("upload_batches").select("*").eq("id", id).limit(1).execute().data
+    if not cur:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    batch = cur[0]
+    amount = data.get("amount_received")
+    if amount is not None:
+        try:
+            amount = round(float(amount), 2)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="amount_received must be a number")
+        if amount < 0:
+            raise HTTPException(status_code=400, detail="amount_received cannot be negative")
+    received_at = data.get("received_at") or None
+    if received_at and not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", str(received_at)):
+        raise HTTPException(status_code=400, detail="received_at must be YYYY-MM-DD")
+    notes = (data.get("notes") or "").strip()[:500] or None
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "amount_received": amount,
+        "received_at": received_at if amount is not None else None,
+        "received_notes": notes if amount is not None else None,
+        "received_by": (user.email or "admin") if amount is not None else None,
+        "received_recorded_at": now if amount is not None else None,
+    }
+    res = db.table("upload_batches").update(payload).eq("id", id).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    updated = res.data[0]
+    dep = deposit_status(updated)
+    audit(db, "upload_batches", id, "deposit_recorded" if amount is not None else "deposit_cleared",
+          {k: batch.get(k) for k in ("amount_received", "received_at", "received_notes")},
+          {**payload, "status": dep["status"], "difference": dep["difference"]},
+          reason=dep["explanation"], actor=user.email or "admin")
+    updated["deposit"] = dep
+    return updated
 
 
 @router.post("/poll-email")
@@ -539,6 +604,7 @@ def reimport_batch(id: str, sync_deals: bool = True, clamp_before: Optional[str]
 
     db.table("upload_batches").update({
         "status": "parsing", "rows_parsed": parsed["row_count"],
+        **statement_figures(parsed),
         "ai_column_mapping": {**old_meta, "auto": True, "provider_group": parsed["provider_group"],
                               "statement_label": parsed["statement_label"], "labels": parsed["labels"],
                               "detector": "fingerprint-v1",
