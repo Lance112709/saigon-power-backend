@@ -8,7 +8,9 @@ list of components that can be freely combined:
       {"type": "per_kwh", "rate": 0.001, "supplier": "Budget"},    # monthly, on ACTUAL kWh the provider paid on
       {"type": "percent_of_commission", "percent": 30},            # monthly, % of gross commission RECEIVED
       {"type": "flat_monthly", "amount": 250},                     # fixed monthly (only in months with paid deals)
-      {"type": "flat_per_enrollment", "amount": 5}                 # one-time, in the month the deal's CONTRACT STARTS
+      {"type": "flat_per_enrollment", "amount": 5},                # one-time, in the month the deal's CONTRACT STARTS
+      {"type": "statement_column", "supplier": "Heritage",         # monthly, sum of a column the PROVIDER's own
+       "column_pattern": "abe.*comm"}                              #   statement lists per account (sub-agent splits)
    ],
    "exclude_plan_types": ["Month-Month"]}
 
@@ -28,6 +30,13 @@ in the month the deal's contract starts (new deals and renewals alike), once
 per service address. A deal whose address already carries another contract
 that is still running is HELD (paid $0, listed for review) until an admin
 releases or rejects it — see enrollment_bonuses().
+
+statement_column pays an agent whatever the provider's statement itself says
+is theirs: every row of that supplier's statement for the month is scanned for
+a column whose header matches `column_pattern` (case-insensitive regex; the
+header text drifts month to month) and the values are summed. It does not
+depend on which agent the CRM credits the deal to — used for Heritage's
+sub-agent Abel, whose per-account split is printed on Abel's own report.
 """
 import re
 from datetime import date
@@ -351,6 +360,59 @@ def _month_label(year: int, month: int) -> str:
     return f"{year}-{month:02d}"
 
 
+def _column_value(raw: dict, pattern) -> tuple:
+    """(value, header) for the first raw_row_data column whose header matches."""
+    for k, v in (raw or {}).items():
+        if k == "_norm" or not pattern.search(str(k)):
+            continue
+        try:
+            return float(str(v).replace("$", "").replace(",", "").strip() or 0), k
+        except (TypeError, ValueError):
+            return 0.0, k
+    return None, None
+
+
+def statement_shares(db, label: str, plans: dict) -> dict:
+    """statement_column components: {agent_display_name: [deal dicts]}.
+
+    One entry per statement row that carries a value in the matched column."""
+    wanted = [(plan, c) for plan in plans.values() if isinstance(plan, dict)
+              for c in plan.get("components") or [] if c.get("type") == "statement_column"]
+    if not wanted:
+        return {}
+    suppliers = fetch_all(db, "suppliers", "id,name,code")
+    out: dict = {}
+    for plan, c in wanted:
+        try:
+            pattern = re.compile(c.get("column_pattern") or "", re.I)
+        except re.error:
+            continue
+        if not c.get("column_pattern"):
+            continue
+        sup_ids = [sp["id"] for sp in suppliers if _supplier_matches(c, sp.get("name"), sp.get("code"), "")]
+        if not sup_ids:
+            continue
+        for sid in sup_ids:
+            sup = next(sp for sp in suppliers if sp["id"] == sid)
+            rows = fetch_all(db, "actual_commissions",
+                             "raw_esiid,raw_customer_name,raw_amount,raw_kwh,raw_row_data",
+                             filters=[("eq", ("billing_month", f"{label}-01")), ("eq", ("supplier_id", sid))])
+            for r in rows:
+                val, header = _column_value(r.get("raw_row_data"), pattern)
+                if val is None or not val:
+                    continue
+                out.setdefault(plan["name"], []).append({
+                    "kind": "statement", "esiid": r.get("raw_esiid") or "", "customer": r.get("raw_customer_name") or "",
+                    "supplier": sup.get("name") or "", "deal_source": "statement", "deal_id": None,
+                    "kwh_paid": round(float(r.get("raw_kwh") or 0), 2),
+                    "gross_received": round(float(r.get("raw_amount") or 0), 2),
+                    "first_payment": False, "excluded": False, "plan_type": "",
+                    "commission": round(val, 4),
+                    "applied": f"{sup.get('name')} statement column \"{str(header).strip()}\" = ${val:.2f}",
+                })
+    return out
+
+
 def _paid_rows(db, label: str) -> list:
     return fetch_all(
         db, "actual_commissions",
@@ -386,7 +448,8 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
 
     rows = _paid_rows(db, label)
     enrolled = enrollment_bonuses(db, label, plans)
-    if not rows and not enrolled:
+    shares = statement_shares(db, label, plans)
+    if not rows and not enrolled and not shares:
         return {"agents": {}, "unassigned": {}, "warnings": [
             f"No provider payments imported for {label} — upload the statements first."], "rows": 0}
 
@@ -407,6 +470,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
         return agents.setdefault(display_name, {
             "total": 0.0, "residual": 0.0, "bonuses": 0.0, "flat_monthly": 0.0,
             "enrollment_bonuses": 0.0, "enrolled": 0, "held": 0,
+            "statement_share": 0.0, "statement_rows": 0,  # sub-agent split printed on the provider's statement
             "new_enrollments": 0, "renewals": 0,  # enrolled split: brand-new customers vs renewals
             "deals_paid": 0, "gross_received": 0.0, "excluded_deals": 0,
             "deals": [],  # per-deal detail for breakdowns
@@ -424,6 +488,15 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
             if d["held"]:
                 b["held"] += 1
             b["enrollment_bonuses"] += d["commission"]
+            b["total"] += d["commission"]
+            b["deals"].append(d)
+
+    # provider-statement shares — the statement itself says what the agent gets
+    for display_name, items in shares.items():
+        b = agent_bucket(display_name)
+        for d in items:
+            b["statement_rows"] += 1
+            b["statement_share"] += d["commission"]
             b["total"] += d["commission"]
             b["deals"].append(d)
 
@@ -536,7 +609,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
                             f"until you set their plan.")
 
     for b in agents.values():
-        for k in ("total", "residual", "bonuses", "flat_monthly", "gross_received", "enrollment_bonuses"):
+        for k in ("total", "residual", "bonuses", "flat_monthly", "gross_received", "enrollment_bonuses", "statement_share"):
             b[k] = round(b[k], 2)
         b["deals"].sort(key=lambda d: -d["commission"])
 
@@ -548,15 +621,18 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
             "gross_total": round(sum(float(r.get("raw_amount") or 0) for r in rows), 2)}
 
 
-def save_month_results(db, year: int, month: int, result: dict, performed_by: str):
+def save_month_results(db, year: int, month: int, result: dict, performed_by: str, only_agent: str = None):
     """Persist a calculate_month() result as agent_commissions rows (one per
     agent-month) with a 'recalculated' log line each. Rows already approved,
-    closed out or paid are locked and left untouched. Returns (saved, locked)."""
+    closed out or paid are locked and left untouched. Returns (saved, locked).
+    only_agent limits the save to one agent (history backfills)."""
     import json
     from datetime import datetime, timezone
     now = datetime.now(timezone.utc).isoformat()
     saved, locked = [], []
     for agent, vals in result["agents"].items():
+        if only_agent and norm_name(agent) != norm_name(only_agent):
+            continue
         existing = (
             db.table("agent_commissions")
             .select("id, status")
@@ -574,6 +650,8 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "held": vals.get("held", 0),
             "new_enrollments": vals.get("new_enrollments", 0),
             "renewals": vals.get("renewals", 0),
+            "statement_share": vals.get("statement_share", 0),
+            "statement_rows": vals.get("statement_rows", 0),
             "excluded_deals": vals["excluded_deals"],
         })
 
@@ -583,7 +661,7 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
                 locked.append(agent)
                 continue
             db.table("agent_commissions").update({
-                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
+                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0) + vals.get("statement_rows", 0),
                 "total_commission": vals["total"],
                 "status":           "calculated",
                 "notes":            summary_note,
@@ -595,7 +673,7 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
                 "agent_name":       agent,
                 "month":            month,
                 "year":             year,
-                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0),
+                "total_deals":      vals["deals_paid"] + vals.get("enrolled", 0) + vals.get("statement_rows", 0),
                 "total_commission": vals["total"],
                 "status":           "calculated",
                 "notes":            summary_note,
@@ -614,6 +692,7 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "notes":         f"{vals['deals_paid']} paid deals · {vals.get('enrolled', 0)} enrolled"
                              f" ({vals.get('new_enrollments', 0)} new · {vals.get('renewals', 0)} renewals"
                              f"{' · ' + str(vals['held']) + ' held' if vals.get('held') else ''})"
+                             f"{' · ' + str(vals['statement_rows']) + ' statement rows $' + str(vals['statement_share']) if vals.get('statement_rows') else ''}"
                              f" · gross ${vals['gross_received']} · payout ${vals['total']}",
             "created_at":    now,
         }).execute()

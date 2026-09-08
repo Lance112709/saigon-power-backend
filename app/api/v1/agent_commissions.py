@@ -65,6 +65,7 @@ def calculate_commissions(
     year  = int(data.get("year")  or datetime.now(timezone.utc).year)
     db    = get_client()
 
+    only_agent = (data.get("agent") or "").strip() or None  # history backfill for one agent
     result = calculate_month(db, year, month)
     if result["rows"] == 0 and not result["agents"]:
         raise HTTPException(
@@ -72,7 +73,8 @@ def calculate_commissions(
             detail=f"No provider payments imported for {year}-{month:02d}. "
                    f"Upload the commission statements first — agents are paid from received dollars.")
 
-    saved, locked = save_month_results(db, year, month, result, performed_by=user.name or user.email)
+    saved, locked = save_month_results(db, year, month, result, performed_by=user.name or user.email,
+                                       only_agent=only_agent)
     return {
         "ok": True,
         "month": month, "year": year,
@@ -136,6 +138,39 @@ def close_out(id: str, data: dict = Body(default={}), user: UserContext = Depend
 @router.patch("/{id}/mark-paid")
 def mark_paid(id: str, data: dict = Body(default={}), user: UserContext = Depends(require_admin)):
     return _transition(id, "mark_paid", user, data.get("notes"))
+
+
+@router.patch("/{id}/record-payment")
+def record_payment(id: str, data: dict = Body(default={}), user: UserContext = Depends(require_admin)):
+    """Record a payment that already happened (history backfill / paid outside
+    the approve → close out → pay flow). Jumps the record straight to 'paid'
+    with the real payment date; the skipped steps are stamped now.
+    Body: {paid_at: YYYY-MM-DD, notes: str}."""
+    import re as _re
+    db  = get_client()
+    rec = _load_record(db, id)
+    if rec["status"] == "paid":
+        raise HTTPException(status_code=400, detail="Already marked paid")
+    paid_at = str(data.get("paid_at") or "").strip()
+    if not _re.fullmatch(r"20\d{2}-\d{2}-\d{2}", paid_at):
+        raise HTTPException(status_code=400, detail="paid_at must be YYYY-MM-DD")
+    who = user.name or user.email
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {"status": "paid", "paid_at": f"{paid_at}T12:00:00+00:00", "paid_by": who, "updated_at": now}
+    if not rec.get("approved_at"):
+        payload.update({"approved_at": now, "approved_by": who})
+    if not rec.get("closed_out_at"):
+        payload.update({"closed_out_at": now, "closed_out_by": who})
+    db.table("agent_commissions").update(payload).eq("id", id).execute()
+    month_str = date(rec["year"], rec["month"], 1).strftime("%B %Y")
+    db.table("commission_logs").insert({
+        "commission_id": id, "action": "mark_paid", "performed_by": who,
+        "agent_name": rec["agent_name"], "month": rec["month"], "year": rec["year"],
+        "notes": f"Payment recorded (paid {paid_at}) | {rec['agent_name']} — {month_str}"
+                 + (f" | {data.get('notes')}" if data.get("notes") else ""),
+        "created_at": now,
+    }).execute()
+    return {"ok": True, "new_status": "paid", "paid_at": paid_at}
 
 
 # ── Deal Breakdown (recomputed live from actual payments) ─────────────────────
@@ -208,6 +243,8 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
         "  of which renewals": (match or {}).get("renewals", 0),
         "Enrollment bonuses": (match or {}).get("enrollment_bonuses", 0),
         "Held for review": (match or {}).get("held", 0),
+        "Provider statement rows": (match or {}).get("statement_rows", 0),
+        "Provider statement share": (match or {}).get("statement_share", 0),
         "TOTAL PAYOUT": (match or {}).get("total", rec.get("total_commission", 0)),
         "Status": rec.get("status"),
     }])
@@ -216,7 +253,7 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
     ordered = sorted(deals, key=lambda d: (0 if d.get("kind") == "enrollment" else 1, -float(d.get("commission") or 0)))
     detail = pd.DataFrame([{
         "Type": ("Enrollment — renewal" if d.get("enrollment_type") == "renewal" else "Enrollment — new customer")
-                if d.get("kind") == "enrollment" else "Provider payment",
+                if d.get("kind") == "enrollment" else ("Provider statement share" if d.get("kind") == "statement" else "Provider payment"),
         "Customer": d["customer"], "ESI ID": d["esiid"], "Provider": d["supplier"],
         "Service address": d.get("address", ""),
         "Contract start": d.get("contract_start", ""),
