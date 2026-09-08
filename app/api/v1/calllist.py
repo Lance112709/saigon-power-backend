@@ -108,13 +108,9 @@ def _score_customer(lead: dict, deals: list) -> tuple[int, list[str], str]:
     return min(score, 100), reasons, action
 
 
-@router.get("")
-def get_call_list(
-    priority_filter: Optional[str] = Query(None),
-    limit:           int           = Query(50),
-    user: UserContext = Depends(get_current_user),
-):
-    db = get_client()
+def _build_entries(db, user: UserContext) -> list:
+    """Every customer that scores > 0, scoped to the caller. Resolved cycles are
+    NOT removed here so the Resolved tab can reuse the same rows."""
     results = []
 
     # Fetch all converted customers via lead_customers
@@ -239,6 +235,18 @@ def get_call_list(
             "entity_url":      f"/crm/customers/{customer_id}" if customer_id else "/crm/deals",
         })
 
+    return results
+
+
+@router.get("")
+def get_call_list(
+    priority_filter: Optional[str] = Query(None),
+    limit:           int           = Query(50),
+    user: UserContext = Depends(get_current_user),
+):
+    db = get_client()
+    results = _build_entries(db, user)
+
     # Drop entries the team already marked RESOLVED for this contract cycle
     results = _drop_resolved(results, _load_resolved(db))
 
@@ -248,6 +256,92 @@ def get_call_list(
         results = [r for r in results if r["priority_score"] >= 75]
 
     return results[:limit]
+
+
+def _lookup_names(db, entity_keys: list[str]) -> dict[str, dict]:
+    """Name/phone/agent for resolved entities that are no longer on the live
+    list (renewed, deactivated). Batched per entity type."""
+    out: dict[str, dict] = {}
+    lead_ids = [k.split(":", 1)[1] for k in entity_keys if k.startswith("lead:")]
+    cust_ids = [k.split(":", 1)[1] for k in entity_keys if k.startswith("crm:")]
+    deal_ids = [k.split(":", 1)[1] for k in entity_keys if k.startswith("crmdeal:")]
+    try:
+        for i in range(0, len(lead_ids), 200):
+            for r in (db.table("leads").select("id, first_name, last_name, phone, sales_agent, sgp_customer_id")
+                      .in_("id", lead_ids[i:i + 200]).execute().data or []):
+                out[f"lead:{r['id']}"] = {
+                    "name": f"{r.get('first_name') or ''} {r.get('last_name') or ''}".strip() or "Unknown",
+                    "phone": r.get("phone") or "—", "sales_agent": r.get("sales_agent"),
+                    "sgp_customer_id": r.get("sgp_customer_id"),
+                    "entity_url": f"/crm/leads/{r['id']}",
+                }
+        for i in range(0, len(cust_ids), 200):
+            for r in (db.table("crm_customers").select("id, full_name, phone")
+                      .in_("id", cust_ids[i:i + 200]).execute().data or []):
+                out[f"crm:{r['id']}"] = {
+                    "name": r.get("full_name") or "Unknown", "phone": r.get("phone") or "—",
+                    "sales_agent": None, "sgp_customer_id": None,
+                    "entity_url": f"/crm/customers/{r['id']}",
+                }
+        for i in range(0, len(deal_ids), 200):
+            for r in (db.table("crm_deals").select("id, business_name, deal_name, sales_agent")
+                      .in_("id", deal_ids[i:i + 200]).execute().data or []):
+                out[f"crmdeal:{r['id']}"] = {
+                    "name": r.get("business_name") or r.get("deal_name") or "Unknown", "phone": "—",
+                    "sales_agent": r.get("sales_agent"), "sgp_customer_id": None,
+                    "entity_url": "/crm/deals",
+                }
+    except Exception as e:  # pragma: no cover
+        log.warning("resolved-list name lookup failed: %s", e)
+    return out
+
+
+@router.get("/resolved")
+def get_resolved_list(limit: int = Query(200), user: UserContext = Depends(get_current_user)):
+    """Customers marked RESOLVED, newest first. Rows still on the live list carry
+    their full call-list details; renewed/deactivated ones fall back to a name lookup."""
+    db = get_client()
+    try:
+        rows = (db.table("call_list_resolutions")
+                .select("id, entity_key, end_date, resolved_by_name, resolved_at, note")
+                .order("resolved_at", desc=True).range(0, max(limit, 1) - 1).execute().data or [])
+    except Exception as e:
+        log.warning("call_list_resolutions unavailable: %s", e)
+        return []
+    if not rows:
+        return []
+
+    live = {_cycle_key(e["entity_key"], e.get("end_date")): e for e in _build_entries(db, user)}
+    missing = [r["entity_key"] for r in rows
+               if _cycle_key(r["entity_key"], r.get("end_date")) not in live]
+    names = _lookup_names(db, list(dict.fromkeys(missing))) if missing else {}
+
+    agent_name = user.sales_agent_name if user.is_sales_agent else None
+    out = []
+    for r in rows:
+        key = _cycle_key(r["entity_key"], r.get("end_date"))
+        base = live.get(key)
+        if base is None:
+            info = names.get(r["entity_key"])
+            if info is None:
+                continue  # entity no longer exists
+            if agent_name and (info.get("sales_agent") or "").lower() != agent_name.lower():
+                continue  # sales agents only see their own customers
+            base = {**info, "supplier": None, "plan_name": None,
+                    "days_left": _days_until(r.get("end_date")), "priority_score": 0,
+                    "reason": "No longer on the call list (renewed or deactivated)", "action": "",
+                    "lead_id": r["entity_key"].split(":", 1)[1] if r["entity_key"].startswith("lead:") else None,
+                    "still_due": False}
+        else:
+            base = {**base, "still_due": True}
+        out.append({**base,
+                    "entity_key":       r["entity_key"],
+                    "end_date":         r.get("end_date"),
+                    "resolution_id":    r["id"],
+                    "resolved_by_name": r.get("resolved_by_name"),
+                    "resolved_at":      r.get("resolved_at"),
+                    "note":             r.get("note")})
+    return out
 
 
 # ── RESOLVED button ──────────────────────────────────────────────────────────
