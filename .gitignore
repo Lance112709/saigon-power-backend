@@ -7,3 +7,5 @@ venv/
 dist/
 .DS_Store
 .vercel
+venv311/
+venv*/
