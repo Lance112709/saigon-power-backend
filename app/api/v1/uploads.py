@@ -467,7 +467,7 @@ def list_uploads(supplier_id: Optional[str] = None, user: UserContext = Depends(
     rows = q.execute().data or []
     for r in rows:
         if r.get("status") == "confirmed":
-            r["deposit"] = deposit_status(r)
+            r["deposit"] = deposit_status(r, db=db)
     return rows
 
 
@@ -492,7 +492,7 @@ def get_upload(id: str, user: UserContext = Depends(require_admin)):
     if not res.data:
         raise HTTPException(status_code=404, detail="Upload not found")
     data = res.data
-    data["deposit"] = deposit_status(data)
+    data["deposit"] = deposit_status(data, db=db)
     return data
 
 
@@ -530,7 +530,7 @@ def record_received(id: str, data: dict = Body(...), user: UserContext = Depends
     if not res.data:
         raise HTTPException(status_code=404, detail="Upload not found")
     updated = res.data[0]
-    dep = deposit_status(updated)
+    dep = deposit_status(updated, db=db)
     audit(db, "upload_batches", id, "deposit_recorded" if amount is not None else "deposit_cleared",
           {k: batch.get(k) for k in ("amount_received", "received_at", "received_notes")},
           {**payload, "status": dep["status"], "difference": dep["difference"]},

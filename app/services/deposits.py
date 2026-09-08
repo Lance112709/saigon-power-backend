@@ -18,6 +18,8 @@ emailed on or around the day the REP pays).
 from datetime import date, datetime, timedelta
 from typing import Optional
 
+from app.services.file_parser.provider_parsers import CUMULATIVE_GROUPS
+
 TOLERANCE = 0.02
 GRACE_AFTER_PAY_DATE = 7
 GRACE_AFTER_IMPORT = 14
@@ -52,11 +54,37 @@ def _to_date(v) -> Optional[date]:
             return None
 
 
-def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[str] = None) -> dict:
+def provider_group(batch: dict) -> Optional[str]:
+    meta = batch.get("ai_column_mapping") or {}
+    return meta.get("provider_group") if isinstance(meta, dict) else None
+
+
+def batch_month_total(db, batch_id: str, month: str) -> Optional[float]:
+    """Sum of one batch's rows for one statement month (paginated)."""
+    total, off, seen = 0.0, 0, False
+    while True:
+        page = db.table("actual_commissions").select("raw_amount").eq("upload_batch_id", batch_id) \
+            .eq("billing_month", f"{month}-01").order("id").range(off, off + 999).execute().data or []
+        seen = seen or bool(page)
+        total += sum(float(r.get("raw_amount") or 0) for r in page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    return round(total, 2) if seen else None
+
+
+def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[str] = None, db=None) -> dict:
     today = today or date.today()
     month = month or statement_month(batch)
     total = batch.get("total_affinity_amount")
     total = float(total) if total is not None else None
+    cumulative = provider_group(batch) in CUMULATIVE_GROUPS
+    if cumulative and db is not None and month:
+        # Cumulative account summaries (CleanSky) restate the whole history;
+        # the REP's deposit is only the newest month's commissions.
+        mt = batch_month_total(db, batch["id"], month)
+        if mt is not None:
+            total = mt
     withheld = float(batch.get("total_withheld") or 0)
     received = batch.get("amount_received")
     received = float(received) if received is not None else None
@@ -76,6 +104,7 @@ def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[st
         "received_at": batch.get("received_at"),
         "received_notes": batch.get("received_notes"),
         "received_by": batch.get("received_by"),
+        "cumulative": cumulative,
         "difference": None,            # received - statement total
         "difference_vs_expected": None,  # received - (total - withheld)
         "status": "awaiting",
@@ -85,6 +114,8 @@ def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[st
         out["status"] = "unknown"
         out["explanation"] = "Statement total not available."
         return out
+    note = (" This provider sends a cumulative account summary, so the expected deposit is "
+            f"the {month} rows only." if cumulative else "")
 
     if received is None:
         if month and month < TRACKING_FROM_MONTH:
@@ -97,6 +128,7 @@ def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[st
         else:
             out["status"] = "awaiting"
             out["explanation"] = f"Deposit expected by {due.isoformat()}." if due else "Deposit not recorded yet."
+        out["explanation"] += note
         return out
 
     diff = round(received - total, 2)
@@ -117,17 +149,21 @@ def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[st
         out["status"] = "over_paid"
         out["explanation"] = f"Deposit is ${diff:,.2f} more than the statement total."
     out["needs_attention"] = out["status"] in NEEDS_ATTENTION
+    out["explanation"] += note
     return out
 
 
 def statement_month(batch: dict) -> Optional[str]:
+    # The rows' latest month is the statement month. The top-level
+    # statement_label can come from the filename, which for NRG/Tara names
+    # the month AFTER the commissions it covers.
     meta = batch.get("ai_column_mapping") or {}
     if isinstance(meta, dict):
-        if meta.get("statement_label"):
-            return meta["statement_label"]
         labels = meta.get("labels") or []
         if labels:
             return max(labels)
+        if meta.get("statement_label"):
+            return meta["statement_label"]
     created = _to_date(batch.get("created_at"))
     return created.strftime("%Y-%m") if created else None
 
@@ -152,7 +188,7 @@ def list_deposits(db, month_from: Optional[str] = None, month_to: Optional[str] 
             continue
         if month_to and month and month > month_to:
             continue
-        dep = deposit_status(b, today, month)
+        dep = deposit_status(b, today, month, db=db)
         if only == "needs_attention" and dep["status"] not in NEEDS_ATTENTION:
             continue
         if only == "open" and dep["status"] not in (NEEDS_ATTENTION | {"awaiting"}):
