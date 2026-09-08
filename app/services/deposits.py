@@ -23,6 +23,9 @@ GRACE_AFTER_PAY_DATE = 7
 GRACE_AFTER_IMPORT = 14
 
 NEEDS_ATTENTION = {"short_paid", "over_paid", "overdue"}
+# Deposit tracking started Sep 2026; older statements with no deposit recorded
+# are "not_tracked" rather than flooding the page with years of "overdue".
+TRACKING_FROM_MONTH = "2026-07"
 
 
 def statement_figures(parsed: dict) -> dict:
@@ -49,8 +52,9 @@ def _to_date(v) -> Optional[date]:
             return None
 
 
-def deposit_status(batch: dict, today: Optional[date] = None) -> dict:
+def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[str] = None) -> dict:
     today = today or date.today()
+    month = month or statement_month(batch)
     total = batch.get("total_affinity_amount")
     total = float(total) if total is not None else None
     withheld = float(batch.get("total_withheld") or 0)
@@ -83,6 +87,10 @@ def deposit_status(batch: dict, today: Optional[date] = None) -> dict:
         return out
 
     if received is None:
+        if month and month < TRACKING_FROM_MONTH:
+            out["status"] = "not_tracked"
+            out["explanation"] = "Statement predates deposit tracking; record the deposit if you want it checked."
+            return out
         if due and today > due:
             out["status"] = "overdue"
             out["explanation"] = f"No deposit recorded and the pay window closed {due.isoformat()}."
@@ -144,7 +152,7 @@ def list_deposits(db, month_from: Optional[str] = None, month_to: Optional[str] 
             continue
         if month_to and month and month > month_to:
             continue
-        dep = deposit_status(b, today)
+        dep = deposit_status(b, today, month)
         if only == "needs_attention" and dep["status"] not in NEEDS_ATTENTION:
             continue
         if only == "open" and dep["status"] not in (NEEDS_ATTENTION | {"awaiting"}):
@@ -171,7 +179,8 @@ def list_deposits(db, month_from: Optional[str] = None, month_to: Optional[str] 
         "totals": {
             "statement_total": round(sum(i["statement_total"] or 0 for i in items), 2),
             "received": round(sum(i["amount_received"] or 0 for i in items), 2),
-            "not_yet_received": round(sum((i["expected_deposit"] or 0) for i in items if i["amount_received"] is None), 2),
+            "not_yet_received": round(sum((i["expected_deposit"] or 0) for i in items
+                                          if i["amount_received"] is None and i["status"] != "not_tracked"), 2),
             "unexplained_difference": round(sum((i["difference"] or 0) for i in items
                                                 if i["status"] in ("short_paid", "over_paid")), 2),
         },
