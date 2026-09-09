@@ -20,14 +20,14 @@ from typing import Optional
 
 from app.services.file_parser.provider_parsers import CUMULATIVE_GROUPS
 
-TOLERANCE = 0.05  # providers round per-row; a few cents is not a shortfall
+TOLERANCE = 0.25  # providers round per-row; a few cents is not a shortfall
 GRACE_AFTER_PAY_DATE = 7
 GRACE_AFTER_IMPORT = 14
 
 NEEDS_ATTENTION = {"short_paid", "over_paid", "overdue"}
 # Deposit tracking started Sep 2026; older statements with no deposit recorded
 # are "not_tracked" rather than flooding the page with years of "overdue".
-TRACKING_FROM_MONTH = "2026-07"
+TRACKING_FROM_MONTH = "2024-09"  # bank history recorded from the Sep 2024 Chase export onward
 
 
 def statement_figures(parsed: dict) -> dict:
