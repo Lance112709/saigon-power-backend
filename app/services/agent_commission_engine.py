@@ -356,6 +356,19 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
     return out
 
 
+def _enrollment_only(plan: dict) -> bool:
+    """A plan made only of flat_per_enrollment components: the agent is paid per
+    customer enrolled in the month and nothing else, so provider-paid accounts
+    are irrelevant to their payout (and are not shown on it)."""
+    comps = (plan or {}).get("components") or []
+    return bool(comps) and all(c.get("type") == "flat_per_enrollment" for c in comps)
+
+
+def _enrollment_rate(plan: dict) -> float:
+    return sum(float(c.get("amount") or 0) for c in (plan or {}).get("components") or []
+               if c.get("type") == "flat_per_enrollment")
+
+
 def _month_label(year: int, month: int) -> str:
     return f"{year}-{month:02d}"
 
@@ -472,6 +485,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
             "enrollment_bonuses": 0.0, "enrolled": 0, "held": 0,
             "statement_share": 0.0, "statement_rows": 0,  # sub-agent split printed on the provider's statement
             "new_enrollments": 0, "renewals": 0,  # enrolled split: brand-new customers vs renewals
+            "enrollment_only": False, "enrollment_rate": 0.0,  # plan = $ per enrolled customer, nothing else
             "deals_paid": 0, "gross_received": 0.0, "excluded_deals": 0,
             "deals": [],  # per-deal detail for breakdowns
         })
@@ -479,6 +493,9 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
     # enrollment bonuses first — they do not depend on provider payments
     for display_name, deals in enrolled.items():
         b = agent_bucket(display_name)
+        plan = plans.get(norm_name(display_name))
+        b["enrollment_only"] = _enrollment_only(plan)
+        b["enrollment_rate"] = _enrollment_rate(plan)
         for d in deals:
             b["enrolled"] += 1
             if d.get("enrollment_type") == "renewal":
@@ -522,6 +539,11 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
             unknown_agent_names[k] = unknown_agent_names.get(k, 0) + 1
             unassigned["agent_not_registered"][k] = round(
                 unassigned["agent_not_registered"].get(k, 0) + gross, 2)
+            continue
+
+        if _enrollment_only(plan):
+            # paid per enrolled customer only — provider dollars on their
+            # accounts belong to the company and never appear on their payout
             continue
 
         b = agent_bucket(plan["name"])
@@ -609,7 +631,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
                             f"until you set their plan.")
 
     for b in agents.values():
-        for k in ("total", "residual", "bonuses", "flat_monthly", "gross_received", "enrollment_bonuses", "statement_share"):
+        for k in ("total", "residual", "bonuses", "flat_monthly", "gross_received", "enrollment_bonuses", "statement_share", "enrollment_rate"):
             b[k] = round(b[k], 2)
         b["deals"].sort(key=lambda d: -d["commission"])
 
@@ -652,8 +674,21 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "renewals": vals.get("renewals", 0),
             "statement_share": vals.get("statement_share", 0),
             "statement_rows": vals.get("statement_rows", 0),
+            "enrollment_only": vals.get("enrollment_only", False),
+            "enrollment_rate": vals.get("enrollment_rate", 0),
             "excluded_deals": vals["excluded_deals"],
         })
+        if vals.get("enrollment_only"):
+            paid_n = vals.get("enrolled", 0) - vals.get("held", 0)
+            log_note = (f"{paid_n} enrolled × ${vals.get('enrollment_rate', 0):g} = ${vals['total']}"
+                        f" ({vals.get('new_enrollments', 0)} new · {vals.get('renewals', 0)} renewals"
+                        f"{' · ' + str(vals['held']) + ' held at $0' if vals.get('held') else ''})")
+        else:
+            log_note = (f"{vals['deals_paid']} paid deals · {vals.get('enrolled', 0)} enrolled"
+                        f" ({vals.get('new_enrollments', 0)} new · {vals.get('renewals', 0)} renewals"
+                        f"{' · ' + str(vals['held']) + ' held' if vals.get('held') else ''})"
+                        f"{' · ' + str(vals['statement_rows']) + ' statement rows $' + str(vals['statement_share']) if vals.get('statement_rows') else ''}"
+                        f" · gross ${vals['gross_received']} · payout ${vals['total']}")
 
         if existing:
             rec = existing[0]
@@ -689,11 +724,7 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "agent_name":    agent,
             "month":         month,
             "year":          year,
-            "notes":         f"{vals['deals_paid']} paid deals · {vals.get('enrolled', 0)} enrolled"
-                             f" ({vals.get('new_enrollments', 0)} new · {vals.get('renewals', 0)} renewals"
-                             f"{' · ' + str(vals['held']) + ' held' if vals.get('held') else ''})"
-                             f"{' · ' + str(vals['statement_rows']) + ' statement rows $' + str(vals['statement_share']) if vals.get('statement_rows') else ''}"
-                             f" · gross ${vals['gross_received']} · payout ${vals['total']}",
+            "notes":         log_note,
             "created_at":    now,
         }).execute()
         saved.append({"agent_name": agent, "total_commission": vals["total"],

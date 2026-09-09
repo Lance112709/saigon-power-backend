@@ -219,9 +219,7 @@ def get_breakdown(id: str, user: UserContext = Depends(require_admin)):
 @router.get("/{id}/export")
 def export_statement(id: str, user: UserContext = Depends(require_admin)):
     """Excel commission statement for one agent-month (to send to the agent)."""
-    import io
     import pandas as pd
-    from fastapi.responses import StreamingResponse
 
     db  = get_client()
     rec = _load_record(db, id)
@@ -231,6 +229,32 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
     deals = match["deals"] if match else []
 
     month_str = date(rec["year"], rec["month"], 1).strftime("%B %Y")
+    m = match or {}
+    if m.get("enrollment_only"):
+        # paid per enrolled customer: the statement is just that list and the math
+        paid_n = m.get("enrolled", 0) - m.get("held", 0)
+        summary = pd.DataFrame([{
+            "Agent": rec["agent_name"], "Month": month_str,
+            "Customers enrolled": m.get("enrolled", 0),
+            "  of which brand-new": m.get("new_enrollments", 0),
+            "  of which renewals": m.get("renewals", 0),
+            "Held for review ($0)": m.get("held", 0),
+            "Rate per enrolled customer": m.get("enrollment_rate", 0),
+            "Calculation": f"{paid_n} × ${m.get('enrollment_rate', 0):g}",
+            "TOTAL PAYOUT": m.get("total", rec.get("total_commission", 0)),
+            "Status": rec.get("status"),
+        }])
+        detail = pd.DataFrame([{
+            "Customer": d["customer"], "ESI ID": d["esiid"], "Provider": d["supplier"],
+            "Service address": d.get("address", ""), "Contract start": d.get("contract_start", ""),
+            "Plan type": d["plan_type"],
+            "Type": "Renewal" if d.get("enrollment_type") == "renewal" else "New customer",
+            "Status": "HELD — needs review" if d.get("held") and d.get("hold_reason") != "rejected"
+                      else ("Rejected (duplicate)" if d.get("hold_reason") == "rejected" else "Paid"),
+            "Bonus $": d["commission"],
+        } for d in sorted(deals, key=lambda d: (bool(d.get("held")), d.get("contract_start") or "", d["customer"]))])
+        return _xlsx_response(rec, summary, detail, "Enrolled customers")
+
     summary = pd.DataFrame([{
         "Agent": rec["agent_name"], "Month": month_str,
         "Paid deals": (match or {}).get("deals_paid", 0),
@@ -265,10 +289,17 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
         "How calculated": d["applied"], "Commission $": d["commission"],
     } for d in ordered])
 
+    return _xlsx_response(rec, summary, detail, "Deals")
+
+
+def _xlsx_response(rec: dict, summary, detail, detail_sheet: str):
+    import io
+    import pandas as pd
+    from fastapi.responses import StreamingResponse
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as w:
         summary.to_excel(w, sheet_name="Summary", index=False)
-        (detail if len(detail) else pd.DataFrame(columns=["Customer"])).to_excel(w, sheet_name="Deals", index=False)
+        (detail if len(detail) else pd.DataFrame(columns=["Customer"])).to_excel(w, sheet_name=detail_sheet, index=False)
     buf.seek(0)
     fname = f"commission_{rec['agent_name'].replace(' ', '_')}_{rec['year']}-{rec['month']:02d}.xlsx"
     return StreamingResponse(

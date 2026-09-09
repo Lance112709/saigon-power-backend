@@ -285,3 +285,19 @@ def test_enrollment_type_matches_by_esiid_when_address_differs():
     b = cdeal("m2", "Nga Nguyen", "2026-08-20", "2027-08-20", "12 Birch Ln")
     nga2 = run_enroll([a, b])["agents"]["Nga Nguyen"]
     assert nga2["new_enrollments"] == 2 and nga2["renewals"] == 0
+
+
+def test_enrollment_only_plan_ignores_provider_payments_entirely():
+    """Nga's rule: payout = customers enrolled in the month × rate. Provider
+    dollars on her accounts never show on her breakdown or change the total."""
+    old = cdeal("old", "Nga Nguyen", "2023-12-26", "2026-12-25", "20303 Kingsland Blvd")
+    old["esiid"] = "1008901049787440449100"
+    new = cdeal("new", "Nga Nguyen", "2026-08-05", "2027-08-05", "1 New St")
+    pay = {"raw_esiid": "1008901049787440449100", "raw_amount": 18.48, "raw_kwh": 2640,
+           "raw_rate": None, "supplier_id": "s1", "billing_month": "2026-08-01", "suppliers": {"name": "APG&E", "code": "APGE"}}
+    r = run_enroll([old, new], payments=[pay])
+    nga = r["agents"]["Nga Nguyen"]
+    assert nga["enrollment_only"] is True and nga["enrollment_rate"] == 5.0
+    assert nga["deals_paid"] == 0 and nga["gross_received"] == 0.0
+    assert [d["deal_id"] for d in nga["deals"]] == ["new"]
+    assert nga["enrolled"] == 1 and nga["total"] == 5.0
