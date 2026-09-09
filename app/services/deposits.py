@@ -20,7 +20,7 @@ from typing import Optional
 
 from app.services.file_parser.provider_parsers import CUMULATIVE_GROUPS
 
-TOLERANCE = 0.02
+TOLERANCE = 0.05  # providers round per-row; a few cents is not a shortfall
 GRACE_AFTER_PAY_DATE = 7
 GRACE_AFTER_IMPORT = 14
 
