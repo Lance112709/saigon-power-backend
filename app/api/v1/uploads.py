@@ -33,7 +33,7 @@ from app.services.audit_detections import run_extended_audit
 from app.services.audit_notifications import notify_big_findings
 from app.services.commission_rules import get_rule_for_month
 from app.services.exception_cases import upsert_cases_from_run
-from app.services.deposits import deposit_status, list_deposits, statement_figures
+from app.services.deposits import deposit_status, list_deposits, statement_figures, cycle_status
 from app.auth.deps import require_admin, UserContext
 
 router = APIRouter()
@@ -483,6 +483,15 @@ def deposits(month_from: Optional[str] = Query(None, alias="from"),
         if m and not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", m):
             raise HTTPException(status_code=400, detail="from/to must be YYYY-MM")
     return list_deposits(get_client(), month_from, month_to, only)
+
+
+@router.get("/deposits/cycle")
+def deposits_cycle(month: Optional[str] = Query(None), user: UserContext = Depends(require_admin)):
+    """Who has paid for one statement month: providers paid / statement in but
+    no deposit yet / statement not received. Default = previous calendar month."""
+    if month and not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", month):
+        raise HTTPException(status_code=400, detail="month must be YYYY-MM")
+    return cycle_status(get_client(), month)
 
 
 @router.get("/{id}")

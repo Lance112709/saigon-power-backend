@@ -222,3 +222,86 @@ def list_deposits(db, month_from: Optional[str] = None, month_to: Optional[str] 
         },
         "range": {"from": month_from, "to": month_to},
     }
+
+
+def cycle_status(db, month: Optional[str] = None) -> dict:
+    """Who has paid for one statement month: per active provider, whether the
+    statement is in and whether its deposit has been recorded.
+
+    Active providers = any supplier with a confirmed statement in the six
+    months before `month`. Default month = the previous calendar month (the
+    statements that are arriving and being paid now)."""
+    today = date.today()
+    if not month:
+        y, m = today.year, today.month - 1
+        if m == 0:
+            y, m = y - 1, 12
+        month = f"{y}-{m:02d}"
+    rows, off = [], 0
+    while True:
+        page = db.table("upload_batches").select("*, suppliers(name, code)") \
+            .eq("status", "confirmed").order("created_at", desc=True).range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    for b in rows:
+        b["_month"] = statement_month(b)
+
+    def month_add(mm, n):
+        yy, mo = int(mm[:4]), int(mm[5:7]) + n
+        while mo > 12:
+            mo -= 12; yy += 1
+        while mo < 1:
+            mo += 12; yy -= 1
+        return f"{yy}-{mo:02d}"
+
+    window_lo = month_add(month, -6)
+    active = {}
+    for b in rows:
+        mm = b.get("_month")
+        if mm and window_lo <= mm <= month and b.get("supplier_id"):
+            active.setdefault(b["supplier_id"], (b.get("suppliers") or {}).get("name") or "")
+
+    paid, awaiting, missing = [], [], []
+    for sid, name in active.items():
+        mine = [b for b in rows if b.get("supplier_id") == sid and b.get("_month") == month]
+        history = [b for b in rows if b.get("supplier_id") == sid and b.get("_month") and window_lo <= b["_month"] < month]
+        # typical pay day = median day-of-month of recorded deposits (falls back
+        # to import dates, which bulk backfills can skew)
+        days = sorted(int(str(b["received_at"])[8:10]) for b in history if b.get("received_at"))
+        if not days:
+            days = sorted(int(str(b.get("confirmed_at") or b.get("created_at"))[8:10]) for b in history
+                          if b.get("confirmed_at") or b.get("created_at"))
+        usual_day = days[len(days) // 2] if days else None
+        last_month = max((b["_month"] for b in history), default=None)
+        if mine:
+            deps = [deposit_status(b, today, month, db=db) for b in mine]
+            got = [d for d in deps if d["amount_received"] is not None]
+            entry = {
+                "supplier_id": sid, "provider": name, "statements": len(mine),
+                "batch_ids": [b["id"] for b in mine],
+                "statement_total": round(sum(d["statement_total"] or 0 for d in deps), 2),
+                "expected_deposit": round(sum(d["expected_deposit"] or 0 for d in deps), 2),
+                "amount_received": round(sum(d["amount_received"] or 0 for d in got), 2) if got else None,
+                "received_at": max((d["received_at"] for d in got if d["received_at"]), default=None) if got else None,
+                "due_date": min((d["due_date"] for d in deps if d["due_date"]), default=None),
+                "statuses": sorted({d["status"] for d in deps}),
+                "usual_day": usual_day,
+            }
+            if got and len(got) == len(deps):
+                paid.append(entry)
+            else:
+                awaiting.append(entry)
+        else:
+            missing.append({"supplier_id": sid, "provider": name, "last_statement_month": last_month,
+                            "usual_day": usual_day,
+                            "overdue": bool(usual_day) and (today > date(int(month_add(month, 1)[:4]), int(month_add(month, 1)[5:7]), min(usual_day + 7, 28)))})
+    for lst in (paid, awaiting, missing):
+        lst.sort(key=lambda e: e["provider"])
+    return {
+        "month": month, "previous_month": month_add(month, -1), "next_month": month_add(month, 1),
+        "providers": len(active), "paid": paid, "awaiting": awaiting, "missing": missing,
+        "totals": {"received": round(sum(e["amount_received"] or 0 for e in paid + awaiting), 2),
+                   "awaiting": round(sum((e["expected_deposit"] or 0) - (e["amount_received"] or 0) for e in awaiting), 2)},
+    }
