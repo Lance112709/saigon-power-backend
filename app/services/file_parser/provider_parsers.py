@@ -368,10 +368,36 @@ def _parse_chariot(xl, path_label, warnings):
     return rows
 
 
+def _affinity_clawbacks(xl) -> dict:
+    """Budget's Affinity report carries a 'clawback' sheet (title row, then the
+    same columns) listing commissions taken back this month. Its total is
+    deducted from the deposit, so it is returned as total_withheld."""
+    for sh in xl.sheet_names:
+        if "clawback" not in sh.lower():
+            continue
+        for header in (0, 1, 2):
+            try:
+                df = pd.read_excel(xl, sheet_name=sh, dtype=str, header=header).dropna(how="all")
+            except Exception:
+                continue
+            if "Premise ID" in df.columns and "Affinity Amount" in df.columns:
+                total, n = 0.0, 0
+                for _, r in df.iterrows():
+                    amt = _f(r.get("Affinity Amount"))
+                    if amt is None or not is_valid_esiid(normalize_esiid(r.get("Premise ID"))):
+                        continue  # skip the sheet's own "Clawbacks" total line
+                    total += abs(amt)
+                    n += 1
+                return {"total_withheld": round(total, 2), "clawback_rows": n}
+    return {}
+
+
 def _parse_budget(xl, path_label, warnings):
     rows = []
     found = False
     for sh in xl.sheet_names:
+        if "clawback" in sh.lower():
+            continue
         df = pd.read_excel(xl, sheet_name=sh, dtype=str).dropna(how="all")
         if "Premise ID" not in df.columns or "Affinity Amount" not in df.columns:
             continue
@@ -380,6 +406,13 @@ def _parse_budget(xl, path_label, warnings):
             es = normalize_esiid(r.get("Premise ID"))
             amt = _f(r.get("Affinity Amount"))
             if not es or amt is None:
+                continue
+            # The report ends with a totals line: no bill, no customer, and a
+            # stray number (the clawback total) in the Premise ID column.
+            # Importing it doubled the Jan 2026 statement.
+            if not is_valid_esiid(es) and not _s(r.get("Bill No")) and not _s(r.get("Cust Last Name")) \
+                    and not _s(r.get("Cust Company Name")):
+                warnings.append(f"Skipped a totals line (${amt:,.2f}) at the bottom of sheet '{sh}'")
                 continue
             nm = _s(r.get("Cust Company Name")) or (_s(r.get("Cust First Name")) + " " + _s(r.get("Cust Last Name"))).strip()
             rows.append(_mk_row(
@@ -391,7 +424,9 @@ def _parse_budget(xl, path_label, warnings):
                 contract_start=_d(r.get("Cust Contract Start Date")), contract_end=_d(r.get("Cust Contract End Date")),
                 raw=_clean_raw(r.to_dict()),
             ))
-    return rows if found else None
+    if not found:
+        return None
+    return rows, _affinity_clawbacks(xl)
 
 
 def _heritage_columns(df):
