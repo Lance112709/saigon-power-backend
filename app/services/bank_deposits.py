@@ -27,7 +27,8 @@ from app.services.deposits import deposit_status, statement_month, TOLERANCE
 
 ALERT_SENDER = "no.reply.alerts@chase.com"
 ALERT_LABEL = "CRM-Deposit"
-MIN_CHIP_AMOUNT = 150.0   # unmatched deposits below this stay in the table, off the strip
+MIN_CHIP_AMOUNT = 500.0   # unmatched deposits below this stay in the table, off the strip
+RECURRING_AUTO_IGNORE = 3  # same unmatched amount this many times in the window = card payout / membership, not a provider
 
 _AMT = re.compile(r"\$\s?([\d,]+\.\d{2})")
 _POSTED = re.compile(r"Posted\s*\|?\s*([A-Z][a-z]{2} \d{1,2}, \d{4})")
@@ -252,7 +253,16 @@ def match_deposits(db, actor: str = "bank-alerts") -> dict:
             if len(hits) == 1:
                 _record(db, hits[0], list(combo), f"{k} deposits summed", actor)
                 used.update(d["id"] for d in combo); used.add(hits[0]["id"]); matched += 1
-    # leftovers: guess the provider from amount + pay-day pattern
+    # leftovers: recurring identical amounts are card payouts / memberships → ignore
+    left = [d for d in deps if d["id"] not in used]
+    from collections import Counter
+    freq = Counter(round(float(d["amount"]), 2) for d in left)
+    recurring = [d for d in left if freq[round(float(d["amount"]), 2)] >= RECURRING_AUTO_IGNORE]
+    if recurring:
+        db.table("bank_deposits").update({"status": "ignored", "notes": "auto: recurring amount, not a provider deposit",
+                                          "updated_at": now}).in_("id", [d["id"] for d in recurring]).execute()
+        used.update(d["id"] for d in recurring)
+    # then guess the provider for what is left from amount + pay-day pattern
     _tag_likely(db, [d for d in deps if d["id"] not in used])
     return {"matched": matched, "unmatched": len([d for d in deps if d["id"] not in used])}
 
@@ -294,7 +304,10 @@ def _tag_likely(db, deps: list):
             if typical <= 0:
                 continue
             closeness = 1 - min(1.0, abs(amt - typical) / typical)      # 1 = same size
-            if closeness < 0.55:
+            if closeness < 0.75:
+                continue
+            # only providers that actually lack a statement for this pay cycle
+            if m in p["months"] and _month_add(m, -1) in p["months"]:
                 continue
             usual = sorted(p["days"])[len(p["days"]) // 2] if p["days"] else None
             day_score = 1 - min(1.0, abs(day - usual) / 10) if usual else 0.5
