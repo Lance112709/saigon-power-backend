@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.services.agent_commission_engine import calculate_month, plan_components
+from app.services.agent_commission_engine import calculate_month, plan_components, enrollment_math
 
 
 class FQ:
@@ -301,3 +301,32 @@ def test_enrollment_only_plan_ignores_provider_payments_entirely():
     assert nga["deals_paid"] == 0 and nga["gross_received"] == 0.0
     assert [d["deal_id"] for d in nga["deals"]] == ["new"]
     assert nga["enrolled"] == 1 and nga["total"] == 5.0
+
+
+def test_enrollment_bonus_by_segment_residential_vs_commercial():
+    """Jennie's rule: $5 per residential enrollment, $10 per commercial one."""
+    plan = {"components": [{"type": "flat_per_enrollment", "amount": 5, "segment": "residential"},
+                           {"type": "flat_per_enrollment", "amount": 10, "segment": "commercial"}]}
+    res = cdeal("r1", "Jennie Duong", "2026-08-04", "2027-08-04", "1 Home St")
+    com = cdeal("c1", "Jennie Duong", "2026-08-06", "2027-08-06", "9 Shop Rd"); com["meter_type"] = "Commercial"
+    biz = cdeal("c2", "Jennie Duong", "2026-08-09", "2027-08-09", "11 Plaza Dr"); biz["business_name"] = "Pho 99"
+    lead_com = {"id": "l1", "status": "Active", "supplier": "Heritage Power", "esiid": "", "rate_type": "Fixed Rate",
+                "plan_name": None, "contract_term": "12", "sales_agent": "Jennie Duong", "product_type": "Commercial",
+                "start_date": "2026-08-12", "end_date": "2027-08-12", "service_address": "5 Mall Way", "service_zip": "77036",
+                "created_at": "2026-08-12", "leads": {"first_name": "Nail", "last_name": "Salon", "business_name": "Nails"}}
+    db = FakeDB({"sales_agents": [agent("Jennie Duong", plan)], "lead_deals": [lead_com],
+                 "crm_deals": [res, com, biz], "actual_commissions": [], "audit_log": []})
+    j = calculate_month(db, 2026, 8)["agents"]["Jennie Duong"]
+    assert j["enrollment_only"] and j["enrollment_rate"] == 0.0  # mixed rates → per segment
+    assert j["enrolled"] == 4 and j["total"] == 35.0
+    assert j["enrolled_by_segment"] == {"residential": {"count": 1, "paid": 1, "amount": 5.0},
+                                        "commercial": {"count": 3, "paid": 3, "amount": 30.0}}
+    assert enrollment_math(j) == "1 residential × $5 + 3 commercial × $10"
+    by = {d["deal_id"]: d for d in j["deals"]}
+    assert by["r1"]["segment"] == "residential" and by["c1"]["segment"] == "commercial" and by["l1"]["segment"] == "commercial"
+    assert "commercial, contract start 2026-08-06" in by["c1"]["applied"]
+    # a plan with no segment on the component still pays everyone
+    db2 = FakeDB({"sales_agents": [agent("Jennie Duong", {"components": [{"type": "flat_per_enrollment", "amount": 5}]})],
+                  "lead_deals": [lead_com], "crm_deals": [res, com, biz], "actual_commissions": [], "audit_log": []})
+    j2 = calculate_month(db2, 2026, 8)["agents"]["Jennie Duong"]
+    assert j2["total"] == 20.0 and enrollment_math(j2) == "4 enrolled × $5"

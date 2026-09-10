@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, Body, HTTPException, Query
 
 from app.db.client import get_client
 from app.auth.deps import require_admin, UserContext
-from app.services.agent_commission_engine import calculate_month, save_month_results, norm_name
+from app.services.agent_commission_engine import calculate_month, save_month_results, enrollment_math, norm_name
 
 router = APIRouter()
 
@@ -232,15 +232,15 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
     m = match or {}
     if m.get("enrollment_only"):
         # paid per enrolled customer: the statement is just that list and the math
-        paid_n = m.get("enrolled", 0) - m.get("held", 0)
         summary = pd.DataFrame([{
             "Agent": rec["agent_name"], "Month": month_str,
             "Customers enrolled": m.get("enrolled", 0),
             "  of which brand-new": m.get("new_enrollments", 0),
             "  of which renewals": m.get("renewals", 0),
             "Held for review ($0)": m.get("held", 0),
-            "Rate per enrolled customer": m.get("enrollment_rate", 0),
-            "Calculation": f"{paid_n} × ${m.get('enrollment_rate', 0):g}",
+            "Rate per enrolled customer": (m.get("enrollment_rate") or
+                " · ".join(f"{r['segment']} ${r['amount']:g}" for r in m.get("enrollment_rates", []))),
+            "Calculation": enrollment_math(m),
             "TOTAL PAYOUT": m.get("total", rec.get("total_commission", 0)),
             "Status": rec.get("status"),
         }])
@@ -248,6 +248,7 @@ def export_statement(id: str, user: UserContext = Depends(require_admin)):
             "Customer": d["customer"], "ESI ID": d["esiid"], "Provider": d["supplier"],
             "Service address": d.get("address", ""), "Contract start": d.get("contract_start", ""),
             "Plan type": d["plan_type"],
+            "Segment": (d.get("segment") or "residential").capitalize(),
             "Type": "Renewal" if d.get("enrollment_type") == "renewal" else "New customer",
             "Status": "HELD — needs review" if d.get("held") and d.get("hold_reason") != "rejected"
                       else ("Rejected (duplicate)" if d.get("hold_reason") == "rejected" else "Paid"),

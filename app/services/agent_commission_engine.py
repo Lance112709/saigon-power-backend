@@ -187,12 +187,26 @@ def _addr_key(address, zipcode) -> str:
     return f"{a}|{zip5(zipcode)}" if a else ""
 
 
+def _segment(type_field, business_name) -> str:
+    """'commercial' or 'residential' for a deal: lead deals carry product_type
+    (Residential/Commercial), CRM deals carry meter_type; a business name on
+    either is a commercial account too."""
+    if norm_name(type_field) == "commercial" or (business_name or "").strip():
+        return "commercial"
+    return "residential"
+
+
+def _segment_matches(component, segment: str) -> bool:
+    want = norm_name(component.get("segment"))
+    return want in ("", "any", "all") or want == segment
+
+
 def load_enrollment_book(db) -> list:
     """Every deal with the fields the enrollment bonus needs (both tables)."""
     out = []
     for d in fetch_all(db, "lead_deals",
-                       "id,status,supplier,esiid,rate_type,plan_name,contract_term,sales_agent,"
-                       "start_date,end_date,service_address,service_zip,created_at,leads(first_name,last_name)"):
+                       "id,status,supplier,esiid,rate_type,plan_name,contract_term,sales_agent,product_type,"
+                       "start_date,end_date,service_address,service_zip,created_at,leads(first_name,last_name,business_name)"):
         lead = d.get("leads") or {}
         out.append({
             "source": "lead_deals", "id": d["id"], "status": d.get("status") or "",
@@ -202,10 +216,11 @@ def load_enrollment_book(db) -> list:
             "start": (d.get("start_date") or "")[:10], "end": (d.get("end_date") or "")[:10],
             "address": d.get("service_address") or "", "addr_key": _addr_key(d.get("service_address"), d.get("service_zip")),
             "customer": f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip(),
+            "segment": _segment(d.get("product_type"), lead.get("business_name")),
             "owner": "", "created": (d.get("created_at") or "")[:10],
         })
     for d in fetch_all(db, "crm_deals",
-                       "id,deal_status,provider,esiid,product_type,contract_term,sales_agent,business_name,deal_owner,"
+                       "id,deal_status,provider,esiid,product_type,meter_type,contract_term,sales_agent,business_name,deal_owner,"
                        "contract_start_date,contract_end_date,service_address,service_zip,created_at,"
                        "crm_customers(full_name,postal_code)"):
         cust = d.get("crm_customers") or {}
@@ -218,6 +233,7 @@ def load_enrollment_book(db) -> list:
             "address": d.get("service_address") or "",
             "addr_key": _addr_key(d.get("service_address"), d.get("service_zip") or cust.get("postal_code")),
             "customer": cust.get("full_name") or d.get("business_name") or "",
+            "segment": _segment(d.get("meter_type"), d.get("business_name")),
             "owner": d.get("deal_owner") or "", "created": (d.get("created_at") or "")[:10],
         })
     return out
@@ -311,7 +327,8 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
         if not plan:
             continue
         comps = [c for c in plan["components"] if c.get("type") == "flat_per_enrollment"
-                 and _supplier_matches(c, d["supplier"], "", d["supplier"])]
+                 and _supplier_matches(c, d["supplier"], "", d["supplier"])
+                 and _segment_matches(c, d["segment"])]
         if not comps:
             continue
         excluded = _excluded(d["plan_type"], plan["rules"])
@@ -337,10 +354,11 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
             commission, applied = 0.0, "excluded plan type"
         else:
             commission = amount
-            applied = f"enrollment bonus ${amount:.2f} (contract start {d['start']}) · {type_txt}" + \
+            applied = f"enrollment bonus ${amount:.2f} ({d['segment']}, contract start {d['start']}) · {type_txt}" + \
                       (" — released by admin" if dup and decision == "release" else "")
         out.setdefault(plan["name"], []).append({
             "kind": "enrollment", "esiid": d["esiid"], "customer": d["customer"], "supplier": d["supplier"],
+            "segment": d["segment"],
             "deal_source": d["source"], "deal_id": d["id"], "address": d["address"],
             "contract_start": d["start"], "kwh_paid": 0, "gross_received": 0,
             "first_payment": False, "excluded": excluded, "plan_type": d["plan_type"],
@@ -364,9 +382,22 @@ def _enrollment_only(plan: dict) -> bool:
     return bool(comps) and all(c.get("type") == "flat_per_enrollment" for c in comps)
 
 
+def _enrollment_rates(plan: dict) -> list:
+    """[{segment, amount}] for the plan's flat_per_enrollment components
+    (segment 'any' when the component applies to every customer)."""
+    out = []
+    for c in (plan or {}).get("components") or []:
+        if c.get("type") == "flat_per_enrollment":
+            seg = norm_name(c.get("segment")) or "any"
+            out.append({"segment": "any" if seg in ("all", "any") else seg, "amount": float(c.get("amount") or 0)})
+    return out
+
+
 def _enrollment_rate(plan: dict) -> float:
-    return sum(float(c.get("amount") or 0) for c in (plan or {}).get("components") or []
-               if c.get("type") == "flat_per_enrollment")
+    """Single per-customer rate when every enrollment component pays the same
+    amount; 0 when the plan pays different amounts per segment (see rates)."""
+    amounts = {r["amount"] for r in _enrollment_rates(plan)}
+    return amounts.pop() if len(amounts) == 1 else 0.0
 
 
 def _month_label(year: int, month: int) -> str:
@@ -486,6 +517,8 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
             "statement_share": 0.0, "statement_rows": 0,  # sub-agent split printed on the provider's statement
             "new_enrollments": 0, "renewals": 0,  # enrolled split: brand-new customers vs renewals
             "enrollment_only": False, "enrollment_rate": 0.0,  # plan = $ per enrolled customer, nothing else
+            "enrollment_rates": [],  # [{segment, amount}] when the rate differs by residential/commercial
+            "enrolled_by_segment": {},  # {segment: {"count", "paid", "amount"}}
             "deals_paid": 0, "gross_received": 0.0, "excluded_deals": 0,
             "deals": [],  # per-deal detail for breakdowns
         })
@@ -496,8 +529,14 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
         plan = plans.get(norm_name(display_name))
         b["enrollment_only"] = _enrollment_only(plan)
         b["enrollment_rate"] = _enrollment_rate(plan)
+        b["enrollment_rates"] = _enrollment_rates(plan)
         for d in deals:
             b["enrolled"] += 1
+            seg = b["enrolled_by_segment"].setdefault(d.get("segment") or "residential", {"count": 0, "paid": 0, "amount": 0.0})
+            seg["count"] += 1
+            if d["commission"]:
+                seg["paid"] += 1
+                seg["amount"] = round(seg["amount"] + d["commission"], 2)
             if d.get("enrollment_type") == "renewal":
                 b["renewals"] += 1
             else:
@@ -643,6 +682,23 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
             "gross_total": round(sum(float(r.get("raw_amount") or 0) for r in rows), 2)}
 
 
+def enrollment_math(vals: dict) -> str:
+    """'68 enrolled × $5' or '61 residential × $5 + 9 commercial × $10'."""
+    rate = vals.get("enrollment_rate") or 0
+    segs = vals.get("enrolled_by_segment") or {}
+    if rate or not segs:
+        paid_n = vals.get("enrolled", 0) - vals.get("held", 0)
+        return f"{paid_n} enrolled × ${rate:g}"
+    parts = []
+    for seg in ("residential", "commercial"):
+        s = segs.get(seg)
+        if not s:
+            continue
+        per = (s["amount"] / s["paid"]) if s["paid"] else 0
+        parts.append(f"{s['paid']} {seg} × ${per:g}")
+    return " + ".join(parts) or "0 enrolled"
+
+
 def save_month_results(db, year: int, month: int, result: dict, performed_by: str, only_agent: str = None):
     """Persist a calculate_month() result as agent_commissions rows (one per
     agent-month) with a 'recalculated' log line each. Rows already approved,
@@ -676,11 +732,12 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "statement_rows": vals.get("statement_rows", 0),
             "enrollment_only": vals.get("enrollment_only", False),
             "enrollment_rate": vals.get("enrollment_rate", 0),
+            "enrollment_rates": vals.get("enrollment_rates", []),
+            "enrolled_by_segment": vals.get("enrolled_by_segment", {}),
             "excluded_deals": vals["excluded_deals"],
         })
         if vals.get("enrollment_only"):
-            paid_n = vals.get("enrolled", 0) - vals.get("held", 0)
-            log_note = (f"{paid_n} enrolled × ${vals.get('enrollment_rate', 0):g} = ${vals['total']}"
+            log_note = (f"{enrollment_math(vals)} = ${vals['total']}"
                         f" ({vals.get('new_enrollments', 0)} new · {vals.get('renewals', 0)} renewals"
                         f"{' · ' + str(vals['held']) + ' held at $0' if vals.get('held') else ''})")
         else:
