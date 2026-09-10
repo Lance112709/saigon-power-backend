@@ -146,8 +146,20 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
                         # rate sheets / DNP reports from the same senders are cheap to
                         # peek and must not use up the import budget (Chariot mails
                         # several a week and the statement sits behind them)
-                        unrecognized.append({"file": fname, "from": sender, "subject": subject,
-                                             "peek": _peek(blob, fname)})
+                        entry = {"file": fname, "from": sender, "subject": subject, "peek": _peek(blob, fname)}
+                        if from_filter:
+                            # targeted runs are parser work: keep the file so the new
+                            # layout can be inspected (statements bucket, unrecognized/)
+                            try:
+                                import hashlib
+                                from app.api.v1.uploads import _storage_put
+                                ext = fname.rsplit(".", 1)[-1].lower()
+                                key = f"unrecognized/{hashlib.sha256(blob).hexdigest()[:16]}.{ext}"
+                                _storage_put(db, key, blob, "application/octet-stream")
+                                entry["stored"] = f"statements/{key}"
+                            except Exception as e:
+                                entry["stored_error"] = str(e)[:100]
+                        unrecognized.append(entry)
                         continue
                     processed_count += 1
 
