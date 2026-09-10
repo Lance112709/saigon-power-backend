@@ -334,12 +334,81 @@ def _parse_nrg_business(xl, path_label, warnings):
     return rows, summary
 
 
+def _chariot_new_system(df, warnings) -> list:
+    """Chariot's post-conversion layouts (billing system changed spring 2026):
+      Jul-26 onward : ESIID | CustomerName | ServiceStart | ServiceEnd | PaymentRate | Usage | PaymentAmount | PaymentType
+      Apr–Jun 2026  : ESIID | CustomerName | BillingPeriodStartDate/EndDate | BilledkWh |
+                      BrokerMils (AgentCommissionRate) | CommissionAmount (...) | Payment Month | CurrentPaymentDate | CurrentPayment
+    Returns rows, or None when the sheet is neither."""
+    cols = {str(c).strip(): c for c in df.columns}
+    def col(*starts):
+        norm = {k.lower().replace(" ", ""): c for k, c in cols.items()}
+        for st in starts:                      # exact name first ("CurrentPayment" before "CurrentPaymentDate")
+            if st in norm:
+                return norm[st]
+        for st in starts:
+            for kl, c in norm.items():
+                if kl.startswith(st):
+                    return c
+        return None
+    es_col = col("esiid")
+    amt_col = col("paymentamount", "currentpayment", "commissionamount")
+    if es_col is None or amt_col is None:
+        return None
+    if col("currentpayment") is not None:
+        amt_col = col("currentpayment")   # what was actually paid this run
+    name_col = col("customername"); usage_col = col("usage", "billedkwh"); rate_col = col("paymentrate", "brokermils")
+    start_col = col("servicestart", "billingperiodstart"); end_col = col("serviceend", "billingperiodend")
+    month_col = col("paymentmonth"); paydate_col = col("currentpaymentdate", "bill/enroll"); type_col = col("paymenttype")
+    rows = []
+    for _, r in df.iterrows():
+        es = normalize_esiid(r.get(es_col))
+        amt = _f(r.get(amt_col))
+        if not es or amt is None:
+            continue
+        rate = _f(r.get(rate_col)) if rate_col is not None else None
+        if rate is not None and rate > 0.5:
+            rate = rate / 1000.0          # "BrokerMils" is in mils
+        label = ""
+        if month_col is not None:
+            pm = _d(r.get(month_col)) or ""
+            if not pm:
+                pm = label_from_filename(str(r.get(month_col) or ""))
+            label = pm[:7] if pm else ""
+        if not label and paydate_col is not None:
+            pd_ = _d(r.get(paydate_col))
+            label = pd_[:7] if pd_ else ""
+        ptype = _s(r.get(type_col)) if type_col is not None else ""
+        rows.append(_mk_row(
+            es, customer_name=_s(r.get(name_col)) if name_col is not None else "",
+            usage_kwh=_f(r.get(usage_col)) if usage_col is not None else None, rate=rate, amount=amt,
+            service_start=_d(r.get(start_col)) if start_col is not None else None,
+            service_end=_d(r.get(end_col)) if end_col is not None else None,
+            row_type="bonus" if any(k in ptype.lower() for k in ("upfront", "bounty", "bonus")) else "commission",
+            statement_label=label, raw=_clean_raw(r.to_dict()),
+        ))
+    return rows
+
+
 def _parse_chariot(xl, path_label, warnings):
     if "Commissions" not in xl.sheet_names:
         return None
     df = pd.read_excel(xl, sheet_name="Commissions", dtype=str).dropna(how="all")
     if "Premise ID" not in df.columns or "Affinity Amount" not in df.columns:
-        return None
+        if "Clawback" not in xl.sheet_names:
+            return None
+        rows = _chariot_new_system(df, warnings)
+        if rows is None:
+            return None
+        if "Clawback" in xl.sheet_names:
+            cb = pd.read_excel(xl, sheet_name="Clawback", dtype=str).dropna(how="all")
+            for _, r in cb.iterrows():
+                es = normalize_esiid(r.get("ESID:"))
+                if not es:
+                    continue
+                rows.append(_mk_row(es, customer_name=_s(r.get("Name:")), service_start=_d(r.get("Start Date:")),
+                                    service_end=_d(r.get("End Date:")), row_type="clawback", raw=_clean_raw(r.to_dict())))
+        return rows
     rows = []
     for _, r in df.iterrows():
         es = normalize_esiid(r.get("Premise ID"))
