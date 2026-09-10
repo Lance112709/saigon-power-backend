@@ -59,12 +59,17 @@ def provider_group(batch: dict) -> Optional[str]:
     return meta.get("provider_group") if isinstance(meta, dict) else None
 
 
-def batch_month_total(db, batch_id: str, month: str) -> Optional[float]:
-    """Sum of one batch's rows for one statement month (paginated)."""
+def batch_month_total(db, batch_id: str, month: str, supplier_id: str = None) -> Optional[float]:
+    """Sum of the ledger rows for one statement month. For cumulative providers
+    the rows are summed across ALL batches of the supplier: a newer cumulative
+    file replaces the older file's rows for the months it covers, so the older
+    batch alone would come up empty (CleanSky Jun 2026 showed the $27,722 file
+    total instead of the $526.94 June rows)."""
     total, off, seen = 0.0, 0, False
     while True:
-        page = db.table("actual_commissions").select("raw_amount").eq("upload_batch_id", batch_id) \
-            .eq("billing_month", f"{month}-01").order("id").range(off, off + 999).execute().data or []
+        q = db.table("actual_commissions").select("raw_amount").eq("billing_month", f"{month}-01")
+        q = q.eq("supplier_id", supplier_id) if supplier_id else q.eq("upload_batch_id", batch_id)
+        page = q.order("id").range(off, off + 999).execute().data or []
         seen = seen or bool(page)
         total += sum(float(r.get("raw_amount") or 0) for r in page)
         if len(page) < 1000:
@@ -82,7 +87,7 @@ def deposit_status(batch: dict, today: Optional[date] = None, month: Optional[st
     if cumulative and db is not None and month:
         # Cumulative account summaries (CleanSky) restate the whole history;
         # the REP's deposit is only the newest month's commissions.
-        mt = batch_month_total(db, batch["id"], month)
+        mt = batch_month_total(db, batch["id"], month, supplier_id=batch.get("supplier_id"))
         if mt is not None:
             total = mt
     withheld = float(batch.get("total_withheld") or 0)
