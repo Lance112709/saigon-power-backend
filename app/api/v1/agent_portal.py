@@ -22,12 +22,15 @@ router = APIRouter()
 
 
 def _resolve_agent(user: UserContext, agent_param: Optional[str]) -> str:
-    if user.is_sales_agent:
-        name = (user.sales_agent_name or "").strip()
-        if not name:
+    linked = (user.sales_agent_name or "").strip()
+    # Sales agents — and any non-admin staff login linked to a sales agent
+    # (e.g. a manager who also enrolls customers) — only ever see their own
+    # book. The ?agent= preview is ignored for them.
+    if user.is_sales_agent or (linked and not user.is_admin):
+        if not linked:
             raise HTTPException(status_code=400,
                                 detail="Your login is not linked to a sales agent yet — ask the admin to set it.")
-        return name
+        return linked
     # Previewing another agent's book is a manager/admin-only capability.
     if not user.is_manager:
         raise HTTPException(status_code=403, detail="Access denied")
@@ -36,8 +39,32 @@ def _resolve_agent(user: UserContext, agent_param: Optional[str]) -> str:
     raise HTTPException(status_code=400, detail="Pass ?agent=<name> to preview an agent's portal.")
 
 
+def _book_from(db, agent_name: str) -> Optional[str]:
+    """sales_agents.portal_book_from — when set, the portal only shows this
+    agent's enrollments whose contract start is on/after that date (and
+    payouts from that month on). None = full history."""
+    try:
+        rows = fetch_all(db, "sales_agents", "name,portal_book_from")
+    except Exception:  # column not migrated yet
+        return None
+    me = norm_name(agent_name)
+    for r in rows:
+        if norm_name(r.get("name")) == me:
+            v = r.get("portal_book_from")
+            return str(v)[:10] if v else None
+    return None
+
+
 def _my_deals(db, agent_name: str) -> list:
-    """The agent's deals across both deal tables."""
+    """The agent's deals across both deal tables, limited to portal_book_from."""
+    mine = _my_deals_all(db, agent_name)
+    since = _book_from(db, agent_name)
+    if not since:
+        return mine
+    return [d for d in mine if d.get("start") and str(d["start"])[:10] >= since]
+
+
+def _my_deals_all(db, agent_name: str) -> list:
     me = norm_name(agent_name)
     book = load_deal_book(db)  # esiid-keyed deals
     mine = [d | {"esiid": es} for es, d in book.items() if norm_name(d["agent"]) == me]
@@ -101,8 +128,8 @@ def overview(agent: Optional[str] = Query(None), user: UserContext = Depends(get
     my_esiids = {d["esiid"] for d in active if d["esiid"]}
     paid_last_month = len(my_esiids & paid_recent.get(latest_label, set())) if latest_label else 0
 
-    comms = db.table("agent_commissions").select("*").ilike("agent_name", name) \
-        .order("year", desc=True).order("month", desc=True).limit(1).execute().data
+    since = _book_from(db, name)
+    comms = _my_commissions(db, name, since, limit=1)
     last_comm = comms[0] if comms else None
 
     plans = load_agent_plans(db)
@@ -119,8 +146,17 @@ def overview(agent: Optional[str] = Query(None), user: UserContext = Depends(get
         "last_commission": last_comm,
         "plan_components": components,
         "has_plan": bool(components),
+        "book_from": since,
         "sgp": _sgp_payload(db, name),
     }
+
+
+def _my_commissions(db, name: str, since: Optional[str], limit: int = 24) -> list:
+    q = db.table("agent_commissions").select("*").ilike("agent_name", name)
+    if since:
+        y, m = int(since[:4]), int(since[5:7])
+        q = q.or_(f"year.gt.{y},and(year.eq.{y},month.gte.{m})")
+    return q.order("year", desc=True).order("month", desc=True).limit(limit).execute().data or []
 
 
 def _sgp_payload(db, agent_name: str):
@@ -200,8 +236,7 @@ def book(agent: Optional[str] = Query(None), user: UserContext = Depends(get_cur
 def commissions(agent: Optional[str] = Query(None), user: UserContext = Depends(get_current_user)):
     db = get_client()
     name = _resolve_agent(user, agent)
-    rows = db.table("agent_commissions").select("*").ilike("agent_name", name) \
-        .order("year", desc=True).order("month", desc=True).limit(24).execute().data or []
+    rows = _my_commissions(db, name, _book_from(db, name))
     for r in rows:
         try:
             r["summary"] = json.loads(r.get("notes") or "{}")
@@ -226,6 +261,30 @@ def my_breakdown(id: str, agent: Optional[str] = Query(None), user: UserContext 
     return {"commission": rec,
             "summary": {k: v for k, v in (match or {}).items() if k != "deals"},
             "deals": (match or {}).get("deals", [])}
+
+
+@router.get("/renewals")
+def renewals(days: int = Query(90, ge=1, le=365), agent: Optional[str] = Query(None),
+             user: UserContext = Depends(get_current_user)):
+    """Active accounts in MY book whose contract ends within `days`."""
+    from app.utils.deals import is_month_to_month
+    db = get_client()
+    name = _resolve_agent(user, agent)
+    today = date.today()
+    horizon = (today + timedelta(days=days)).isoformat()
+    out = []
+    for d in _my_deals(db, name):
+        end = str(d.get("end") or "")[:10]
+        if not d["active"] or not end or is_month_to_month(d.get("plan_type")):
+            continue
+        if today.isoformat() <= end <= horizon:
+            out.append({
+                "source": d.get("source"), "deal_id": d.get("id"), "esiid": d["esiid"],
+                "full_name": d["customer"], "provider": d["supplier"], "plan_name": d.get("plan_type"),
+                "end_date": end, "days_left": (date.fromisoformat(end) - today).days,
+            })
+    out.sort(key=lambda r: r["end_date"])
+    return {"agent": name, "days": days, "renewals": out}
 
 
 @router.get("/alerts")
