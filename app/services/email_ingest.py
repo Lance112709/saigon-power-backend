@@ -221,7 +221,7 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
             pass
 
     return {"ok": True, "mailbox": user, "imported": imported, "already_imported": skipped_known,
-            "unrecognized": unrecognized[:10], "errors": errors[:5],
+            "unrecognized": unrecognized[:60], "errors": errors[:10],
             "checked_messages": len(ids) if 'ids' in dir() else 0}
 
 
