@@ -334,7 +334,7 @@ def _parse_nrg_business(xl, path_label, warnings):
     return rows, summary
 
 
-def _chariot_new_system(df, warnings) -> list:
+def _chariot_new_system(df, warnings, path_label: str = "") -> list:
     """Chariot's post-conversion layouts (billing system changed spring 2026):
       Jul-26 onward : ESIID | CustomerName | ServiceStart | ServiceEnd | PaymentRate | Usage | PaymentAmount | PaymentType
       Apr–Jun 2026  : ESIID | CustomerName | BillingPeriodStartDate/EndDate | BilledkWh |
@@ -352,11 +352,11 @@ def _chariot_new_system(df, warnings) -> list:
                     return c
         return None
     es_col = col("esiid")
-    amt_col = col("paymentamount", "currentpayment", "commissionamount")
+    # CommissionAmount is the broker's money; CurrentPayment is what the CUSTOMER
+    # paid Chariot on the bill (importing that overstated Apr–Jun 2026 by 70x)
+    amt_col = col("commissionamount", "paymentamount")
     if es_col is None or amt_col is None:
         return None
-    if col("currentpayment") is not None:
-        amt_col = col("currentpayment")   # what was actually paid this run
     name_col = col("customername"); usage_col = col("usage", "billedkwh"); rate_col = col("paymentrate", "brokermils")
     start_col = col("servicestart", "billingperiodstart"); end_col = col("serviceend", "billingperiodend")
     month_col = col("paymentmonth"); paydate_col = col("currentpaymentdate", "bill/enroll"); type_col = col("paymenttype")
@@ -369,15 +369,14 @@ def _chariot_new_system(df, warnings) -> list:
         rate = _f(r.get(rate_col)) if rate_col is not None else None
         if rate is not None and rate > 0.5:
             rate = rate / 1000.0          # "BrokerMils" is in mils
+        # month: the pay-run date carries the year; "Payment Month" is just "June"
         label = ""
-        if month_col is not None:
-            pm = _d(r.get(month_col)) or ""
-            if not pm:
-                pm = label_from_filename(str(r.get(month_col) or ""))
-            label = pm[:7] if pm else ""
-        if not label and paydate_col is not None:
+        if paydate_col is not None:
             pd_ = _d(r.get(paydate_col))
             label = pd_[:7] if pd_ else ""
+        if not label and month_col is not None:
+            pm = _d(r.get(month_col)) or label_from_filename(str(r.get(month_col) or "") + " " + (path_label or ""))
+            label = pm[:7] if pm else ""
         ptype = _s(r.get(type_col)) if type_col is not None else ""
         rows.append(_mk_row(
             es, customer_name=_s(r.get(name_col)) if name_col is not None else "",
@@ -397,7 +396,7 @@ def _parse_chariot(xl, path_label, warnings):
     if "Premise ID" not in df.columns or "Affinity Amount" not in df.columns:
         if "Clawback" not in xl.sheet_names:
             return None
-        rows = _chariot_new_system(df, warnings)
+        rows = _chariot_new_system(df, warnings, path_label)
         if rows is None:
             return None
         if "Clawback" in xl.sheet_names:
