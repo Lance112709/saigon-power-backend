@@ -343,6 +343,9 @@ def earnings(agent: Optional[str] = Query(None), user: UserContext = Depends(get
     """
     db = get_client()
     name = _resolve_agent(user, agent)
+    # Admin-only: gross provider dollars and open money issues are internal.
+    if not user.is_admin:
+        raise HTTPException(status_code=403, detail="Admin only")
     deals = _my_deals(db, name)
     active = [d for d in deals if d["active"]]
     my_esiids = [d["esiid"] for d in active if d["esiid"]]
