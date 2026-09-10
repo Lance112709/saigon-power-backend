@@ -36,6 +36,19 @@ LABEL = "CRM-Imported"
 MAX_ATTACHMENTS_PER_RUN = 25
 
 
+# Providers that email statements to lance@ (the "pricing" mailbox) instead of
+# commission@. The daily job polls each sender separately so the busy inbox
+# (daily pricing matrices) never starves a statement of the per-run budget.
+LANCE_STATEMENT_SENDERS = [
+    "hernandezabel2011@yahoo.com",          # Heritage (Abel)
+    "ResidentialBrokers@nrg.com",           # NRG residual statement (all NRG brands)
+    "sajid.aurangzeb1@nrg.com",             # NRG backpay statements
+    "commissions@hudsonenergy.net",         # Hudson
+    "accounting@ironhorsepowerservices.com",  # Iron Horse
+    "brokerdesk@mychariotenergy.com",       # Chariot
+    "Acampos@budgetpowertx.com",            # Budget (also copies commission@)
+]
+
 MAILBOXES = {
     # name -> (user env, app-password env). "pricing" is the lance@ inbox that
     # Heritage (Abel) and Hudson mail statements to; its creds already exist on
@@ -207,3 +220,20 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
     return {"ok": True, "mailbox": user, "imported": imported, "already_imported": skipped_known,
             "unrecognized": unrecognized[:10], "errors": errors[:5],
             "checked_messages": len(ids) if 'ids' in dir() else 0}
+
+
+def poll_lance_statements(actor: str = "email-ingest-lance", lookback_days: int = 12) -> dict:
+    """Daily: pull statements the providers mail to lance@ (one sender-filtered
+    pass each; hash-idempotent so re-runs never duplicate)."""
+    out = {"ok": True, "imported": [], "errors": [], "senders": 0}
+    for sender in LANCE_STATEMENT_SENDERS:
+        try:
+            r = poll_inbox(actor=actor, lookback_days=lookback_days, from_filter=sender, mailbox="pricing")
+            out["senders"] += 1
+            if not r.get("ok", True) and r.get("error"):
+                out["errors"].append(f"{sender}: {r['error']}")
+            out["imported"].extend(r.get("imported") or [])
+            out["errors"].extend(r.get("errors") or [])
+        except Exception as e:
+            out["errors"].append(f"{sender}: {str(e)[:120]}")
+    return out

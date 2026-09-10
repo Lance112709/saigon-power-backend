@@ -485,6 +485,47 @@ def deposits(month_from: Optional[str] = Query(None, alias="from"),
     return list_deposits(get_client(), month_from, month_to, only)
 
 
+@router.get("/deposits/bank")
+def bank_deposits(status: Optional[str] = Query(None), user: UserContext = Depends(require_admin)):
+    """Bank deposits read from Chase alert emails: unmatched (no statement yet), matched, ignored."""
+    from app.services.bank_deposits import list_bank_deposits
+    return list_bank_deposits(get_client(), status)
+
+
+@router.post("/deposits/bank/poll")
+def bank_deposits_poll(lookback_days: int = Query(14, le=400), user: UserContext = Depends(require_admin)):
+    """Read new Chase deposit alerts from lance@ now and match them to statements."""
+    from app.services.bank_deposits import poll_chase_alerts
+    return poll_chase_alerts(actor=user.email or "admin", lookback_days=lookback_days)
+
+
+@router.post("/deposits/bank/statements-poll")
+def lance_statements_poll(lookback_days: int = Query(12, le=400), user: UserContext = Depends(require_admin)):
+    """Pull statements from the providers that mail lance@ (same job the scheduler runs daily)."""
+    from app.services.email_ingest import poll_lance_statements
+    return poll_lance_statements(actor=user.email or "admin", lookback_days=lookback_days)
+
+
+@router.patch("/deposits/bank/{deposit_id}")
+def bank_deposit_update(deposit_id: str, data: dict = Body(...), user: UserContext = Depends(require_admin)):
+    """Body: {status: "ignored"|"unmatched"} to (un)ignore, or {upload_batch_id} to assign the deposit to a statement."""
+    from app.services.bank_deposits import assign_deposit
+    db = get_client()
+    if data.get("upload_batch_id"):
+        try:
+            return assign_deposit(db, deposit_id, data["upload_batch_id"], user.email or "admin")
+        except ValueError as e:
+            raise HTTPException(status_code=404, detail=str(e))
+    st = data.get("status")
+    if st not in ("ignored", "unmatched"):
+        raise HTTPException(status_code=400, detail="status must be ignored or unmatched, or pass upload_batch_id")
+    res = db.table("bank_deposits").update({"status": st, "notes": (data.get("notes") or None),
+                                            "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", deposit_id).execute().data
+    if not res:
+        raise HTTPException(status_code=404, detail="Deposit not found")
+    return res[0]
+
+
 @router.get("/deposits/cycle")
 def deposits_cycle(month: Optional[str] = Query(None), user: UserContext = Depends(require_admin)):
     """Who has paid for one statement month: providers paid / statement in but

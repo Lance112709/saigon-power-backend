@@ -299,9 +299,26 @@ def cycle_status(db, month: Optional[str] = None) -> dict:
                             "overdue": bool(usual_day) and (today > date(int(month_add(month, 1)[:4]), int(month_add(month, 1)[5:7]), min(usual_day + 7, 28)))})
     for lst in (paid, awaiting, missing):
         lst.sort(key=lambda e: e["provider"])
+    # bank deposits that landed in this cycle's pay window (statement month or the
+    # month after) with no statement to sit on — "paid, statement missing"
+    unmatched = []
+    try:
+        from app.services.bank_deposits import MIN_CHIP_AMOUNT
+        lo, hi = f"{month}-01", f"{month_add(month, 2)}-01"
+        rows_u = db.table("bank_deposits").select("id,posted_at,amount,likely_supplier_id,suppliers(name)") \
+            .eq("status", "unmatched").gte("posted_at", lo).lt("posted_at", hi).order("posted_at").execute().data or []
+        names = {sid: nm for sid, nm in active.items()}
+        for r in rows_u:
+            if float(r["amount"]) < MIN_CHIP_AMOUNT:
+                continue
+            unmatched.append({"id": r["id"], "posted_at": r["posted_at"], "amount": float(r["amount"]),
+                              "likely_provider": (r.get("suppliers") or {}).get("name") or names.get(r.get("likely_supplier_id"))})
+    except Exception:
+        pass  # table not migrated yet
     return {
         "month": month, "previous_month": month_add(month, -1), "next_month": month_add(month, 1),
         "providers": len(active), "paid": paid, "awaiting": awaiting, "missing": missing,
+        "unmatched_deposits": unmatched,
         "totals": {"received": round(sum(e["amount_received"] or 0 for e in paid + awaiting), 2),
                    "awaiting": round(sum((e["expected_deposit"] or 0) - (e["amount_received"] or 0) for e in awaiting), 2)},
     }

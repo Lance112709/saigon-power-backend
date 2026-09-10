@@ -67,6 +67,23 @@ def _run_email_ingest():
     except Exception:
         pass
 
+def _run_lance_statements():
+    """Daily: statements that providers mail to lance@ (Heritage, NRG residual,
+    Hudson, Iron Horse, Chariot, Budget, NRG backpay)."""
+    try:
+        from app.services.email_ingest import poll_lance_statements
+        poll_lance_statements()
+    except Exception:
+        pass
+
+def _run_bank_alerts():
+    """Daily: Chase deposit alerts → bank_deposits → matched onto statements."""
+    try:
+        from app.services.bank_deposits import poll_chase_alerts
+        poll_chase_alerts()
+    except Exception:
+        pass
+
 def _run_email_campaigns():
     """Auto-drip: send the next batch of any active bulk-email campaign,
     bounded by the Resend plan's daily cap (EMAIL_DAILY_CAP)."""
@@ -131,6 +148,12 @@ try:
     # watchdog's own precheck poll on the 10th or by next month's run, and
     # nothing is ever imported twice. "Check Email Now" still pulls on demand.
     scheduler.add_job(_run_email_ingest, "cron", day=8, hour=9, minute=15)
+    # Daily: providers that mail lance@ pay on their own days through the month
+    # (Heritage ~5th, Chariot ~16th, Budget ~18th, Iron Horse ~19th, NRG ~21st,
+    # Hudson ~25th) — one sender-filtered pass each morning catches every one
+    # the day it lands; then the Chase deposit alerts are matched to statements.
+    scheduler.add_job(_run_lance_statements, "cron", hour=10, minute=30)
+    scheduler.add_job(_run_bank_alerts, "cron", hour=10, minute=45)
     # Phase 2 pricing automation: NRG emails the matrix each business morning;
     # poll weekday mornings so agents have fresh rates by the time they log in.
     scheduler.add_job(_run_pricing_ingest, "cron", day_of_week="mon-fri", hour="6-12", minute="*/20")
