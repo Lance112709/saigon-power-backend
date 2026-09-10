@@ -222,11 +222,27 @@ def _parse_dp(xl, path_label, warnings):
     return rows
 
 
+def _read_sheet_find_header(xl, sh, needles, max_scan=8):
+    """Read a sheet whose real header row may sit under title lines (Iron
+    Horse's 2026 report: 'Lance Nguyen — Volumetric Commissions', a count line,
+    a blank, THEN the columns). Returns the DataFrame with proper columns."""
+    df = pd.read_excel(xl, sheet_name=sh, dtype=str).dropna(how="all")
+    if any(n in df.columns for n in needles):
+        return df
+    raw = pd.read_excel(xl, sheet_name=sh, dtype=str, header=None)
+    for i in range(min(max_scan, len(raw))):
+        vals = [str(v).strip() for v in raw.iloc[i].tolist()]
+        if any(n in vals for n in needles):
+            return pd.read_excel(xl, sheet_name=sh, dtype=str, header=i).dropna(how="all")
+    return df
+
+
 def _parse_iron_horse(xl, path_label, warnings):
     rows = []
     found = False
     for sh in xl.sheet_names:
-        df = pd.read_excel(xl, sheet_name=sh, dtype=str).dropna(how="all")
+        df = _read_sheet_find_header(xl, sh, ("Utility Account Number", "Utility Account"))
+        is_clawback = "clawback" in sh.lower()
         if "Utility Account Number" in df.columns and "Commission Paid" in df.columns:
             found = True
             for _, r in df.iterrows():
@@ -257,6 +273,7 @@ def _parse_iron_horse(xl, path_label, warnings):
                     usage_kwh=_f(r.get("Eligible Electric Usage")), rate=_f(r.get(rate_col)), amount=amt,
                     service_start=_d(r.get("Invoice Service Start")), service_end=_d(r.get("Invoice Service End")),
                     provider_status=_s(r.get("Account Type")),
+                    row_type="clawback" if is_clawback else "commission",
                     raw=_clean_raw(r.to_dict()),
                 ))
     return rows if found else None
