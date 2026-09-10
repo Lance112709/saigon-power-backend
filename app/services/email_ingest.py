@@ -140,13 +140,16 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
                     blob = part.get_payload(decode=True)
                     if not blob or len(blob) > 30_000_000:
                         continue
-                    processed_count += 1
 
                     parsed = detect_and_parse(blob, fname)
                     if not parsed:
+                        # rate sheets / DNP reports from the same senders are cheap to
+                        # peek and must not use up the import budget (Chariot mails
+                        # several a week and the statement sits behind them)
                         unrecognized.append({"file": fname, "from": sender, "subject": subject,
                                              "peek": _peek(blob, fname)})
                         continue
+                    processed_count += 1
 
                     # already imported? (hash-level idempotency)
                     exists = db.table("upload_batches").select("id").eq("file_hash", parsed["file_hash"]).limit(1).execute().data
