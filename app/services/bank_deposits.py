@@ -180,6 +180,29 @@ def _record(db, stmt: dict, deposits: list, how: str, actor: str):
           reason=f"Bank alert matched to {stmt['provider']} {stmt['month']} ({how})", actor=actor)
 
 
+def _already_recorded(db, deps: list, lo_month: str) -> list:
+    """(amount, received_at, batch_id, provider) for every deposit already
+    recorded on a statement — from the notes' "$1,234.56" figures when a
+    statement was paid by several deposits, else the recorded total."""
+    rows, off = [], 0
+    while True:
+        page = db.table("upload_batches").select("id,amount_received,received_at,received_notes,suppliers(name)") \
+            .eq("status", "confirmed").not_.is_("amount_received", "null").gte("received_at", f"{lo_month}-01") \
+            .order("received_at", desc=True).range(off, off + 999).execute().data or []
+        rows.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    out = []
+    for b in rows:
+        prov = (b.get("suppliers") or {}).get("name") or ""
+        figs = [float(x.replace(",", "")) for x in _AMT.findall(b.get("received_notes") or "")]
+        figs = figs or [float(b["amount_received"])]
+        for f in figs:
+            out.append((round(f, 2), b.get("received_at"), b["id"], prov))
+    return out
+
+
 def match_deposits(db, actor: str = "bank-alerts") -> dict:
     deps = db.table("bank_deposits").select("*").eq("status", "unmatched").order("posted_at").execute().data or []
     if not deps:
@@ -187,6 +210,21 @@ def match_deposits(db, actor: str = "bank-alerts") -> dict:
     months = sorted({d["posted_at"][:7] for d in deps})
     stmts = _open_statements(db, _month_add(months[0], -2), months[-1])
     used = set(); matched = 0
+    now = datetime.now(timezone.utc).isoformat()
+
+    # 0) deposits that were already recorded on a statement by hand / CSV import
+    recorded = _already_recorded(db, deps, _month_add(months[0], -1))
+    taken = set()
+    for dep in deps:
+        amt = float(dep["amount"]); day = date.fromisoformat(dep["posted_at"])
+        for i, (f, when, bid, prov) in enumerate(recorded):
+            if i in taken or abs(f - amt) > TOLERANCE or not when:
+                continue
+            if abs((date.fromisoformat(str(when)[:10]) - day).days) <= 7:
+                db.table("bank_deposits").update({"status": "matched", "upload_batch_id": bid, "matched_how": "already recorded",
+                                                  "updated_at": now}).eq("id", dep["id"]).execute()
+                used.add(dep["id"]); taken.add(i); matched += 1
+                break
 
     def cands(dep):
         m = dep["posted_at"][:7]
