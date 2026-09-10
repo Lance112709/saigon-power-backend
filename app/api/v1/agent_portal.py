@@ -289,9 +289,14 @@ def renewals(days: int = Query(90, ge=1, le=365), agent: Optional[str] = Query(N
 
 @router.get("/alerts")
 def alerts(agent: Optional[str] = Query(None), user: UserContext = Depends(get_current_user)):
-    """Unresolved reconciliation issues on MY accounts (latest run per provider)."""
+    """Unresolved reconciliation issues on MY accounts (latest run per provider).
+
+    Admin-only: reconciliation findings are internal; everyone else gets an
+    empty list (the page hides the card)."""
     db = get_client()
     name = _resolve_agent(user, agent)
+    if not user.is_admin:
+        return {"agent": name, "alerts": []}
     deals = _my_deals(db, name)
     my_esiids = [d["esiid"] for d in deals if d["esiid"]]
     if not my_esiids:
