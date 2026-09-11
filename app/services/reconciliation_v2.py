@@ -67,6 +67,12 @@ def fetch_all(db, table: str, cols: str, filters=None):
 def load_deals(db, provider_group: str) -> dict:
     """All deals for a provider group, indexed for matching."""
     wanted = {k for k, v in CRM_PROVIDER_GROUPS.items() if v == provider_group}
+    if provider_group == "Budget Power":
+        # The Budget book moved to Direct Energy on 2026-04-15 (deals re-labelled
+        # in the CRM). Budget statements — every month before the transfer, and
+        # the back-pay rows Budget still issues — must match those deals, or a
+        # re-run of any old Budget month reports ~1,800 "unexpected" accounts.
+        wanted.add("direct energy")
     by_esiid = {}
     no_esiid = []
 
