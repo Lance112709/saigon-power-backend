@@ -643,32 +643,46 @@ def renewal_stats(user: UserContext = Depends(require_manager)):
                 and (x.get("contract_start_date") or "") > start
                 and (statuses is None or x.get("deal_status") in statuses)]
 
-    # ── Renewals: RENEWED deal + the newer contract that replaced it ────────
-    ren_by_month: dict = {}
-    unpaired = 0
+    # ── Renewal cohorts: contracts due to end in each month, and their outcome ──
+    # A meter is "renewed" when a newer contract exists on it (any status —
+    # renewed-then-dropped still counts as a renewal that month).
+    this_m = today.strftime("%Y-%m")
+    first = today.replace(day=1)
+    window = [_shift_month(first, k).strftime("%Y-%m") for k in range(-11, 4)]   # 12 back + 3 ahead
+    cohort: dict = {m: {"month": m, "due": 0, "renewed": 0, "holdover": 0, "dropped": 0, "pending": 0,
+                        "by_provider": {}, "deals": []} for m in window}
     for d in deals:
-        if d.get("deal_status") != "RENEWED":
+        end = (d.get("contract_end_date") or "")[:10]
+        m = end[:7]
+        if m not in cohort or not digits(d.get("esiid")) or d.get("deal_status") == "FUTURE":
             continue
         nxt = newer_deals(d)
-        if not nxt:
-            unpaired += 1
-            continue
-        n = min(nxt, key=lambda x: x.get("contract_start_date") or "")
-        m = (n.get("contract_start_date") or "")[:7]
-        b = ren_by_month.setdefault(m, {"month": m, "count": 0, "by_provider": {}, "deals": []})
-        b["count"] += 1
-        prov = canon_supplier(n.get("provider"))
-        b["by_provider"][prov] = b["by_provider"].get(prov, 0) + 1
+        if nxt:
+            outcome = "renewed"
+            n = min(nxt, key=lambda x: x.get("contract_start_date") or "")
+        elif end >= today.isoformat():
+            outcome, n = "pending", None
+        elif d.get("deal_status") == "ACTIVE":
+            outcome, n = "holdover", None
+        else:
+            outcome, n = "dropped", None
+        b = cohort[m]
+        b["due"] += 1
+        b[outcome] += 1
+        prov = canon_supplier(d.get("provider"))
+        bp = b["by_provider"].setdefault(prov, {"due": 0, "renewed": 0})
+        bp["due"] += 1
+        bp["renewed"] += 1 if outcome == "renewed" else 0
         b["deals"].append({"customer_id": d.get("customer_id"),
                            "customer": (d.get("crm_customers") or {}).get("full_name") or "",
-                           "provider": prov, "esiid": d.get("esiid"),
-                           "old_end": d.get("contract_end_date"), "new_start": n.get("contract_start_date"),
-                           "new_end": n.get("contract_end_date"), "new_rate": n.get("energy_rate"),
-                           "sales_agent": n.get("sales_agent") or d.get("sales_agent"), "deal_id": n["id"]})
-    months = sorted(ren_by_month)
-    this_m = today.strftime("%Y-%m")
-    window = {_shift_month(today.replace(day=1), -k).strftime("%Y-%m") for k in range(12)}
-    last12 = [m for m in months if m in window]
+                           "provider": prov, "esiid": d.get("esiid"), "outcome": outcome,
+                           "old_end": end, "new_start": (n or {}).get("contract_start_date"),
+                           "new_end": (n or {}).get("contract_end_date"), "new_provider": canon_supplier(n.get("provider")) if n else None,
+                           "sales_agent": (n or {}).get("sales_agent") or d.get("sales_agent"), "deal_id": d["id"]})
+    unpaired = sum(1 for d in deals if d.get("deal_status") == "RENEWED" and not newer_deals(d))
+    past = [m for m in window if m < this_m]
+    due_12 = sum(cohort[m]["due"] for m in past)
+    ren_12 = sum(cohort[m]["renewed"] for m in past)
 
     # ── Holdovers: ACTIVE, contract ended, nothing newer on the meter ───────
     paid: dict = {}
@@ -710,13 +724,14 @@ def renewal_stats(user: UserContext = Depends(require_manager)):
     # Managers see the expired/holdover picture; renewal history stays admin-only.
     return {
         "renewals": None if not user.is_admin else {
-            "by_month": [{"month": m, "count": ren_by_month[m]["count"],
-                          "by_provider": sorted(ren_by_month[m]["by_provider"].items(), key=lambda x: -x[1]),
-                          "deals": sorted(ren_by_month[m]["deals"], key=lambda x: x["customer"])} for m in months],
-            "last_12_months": last12,
-            "total_last_12": sum(ren_by_month[m]["count"] for m in last12),
-            "this_month": ren_by_month.get(this_m, {}).get("count", 0),
-            "upcoming": sum(ren_by_month[m]["count"] for m in months if m > this_m),
+            "by_month": [{**{k: v for k, v in cohort[m].items() if k not in ("by_provider", "deals")},
+                          "by_provider": sorted(([p, v["due"], v["renewed"]] for p, v in cohort[m]["by_provider"].items()), key=lambda x: -x[1]),
+                          "deals": sorted(cohort[m]["deals"], key=lambda x: (x["outcome"] != "renewed", x["customer"]))}
+                         for m in window],
+            "this_month": this_m,
+            "last_12": {"due": due_12, "renewed": ren_12, "rate": round(ren_12 / due_12 * 100, 1) if due_12 else None},
+            "next_3": {"due": sum(cohort[m]["due"] for m in window if m > this_m),
+                       "renewed": sum(cohort[m]["renewed"] for m in window if m > this_m)},
             "marked_renewed_no_new_contract": unpaired,
         },
         "holdovers": {
