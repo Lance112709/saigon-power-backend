@@ -1024,9 +1024,8 @@ def create_lead(data: dict = Body(...), request: Request = None):
     return new_lead
 
 @router.get("/{id}/activity")
-def lead_activity(id: str, user: UserContext = Depends(get_current_user)):
+def lead_activity(id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
-    assert_lead_access(db, user, id)
     deal_ids = [d["id"] for d in (db.table("lead_deals").select("id").eq("lead_id", id).execute().data or [])]
     return {"events": activity.fetch(db, [id, *deal_ids])}
 

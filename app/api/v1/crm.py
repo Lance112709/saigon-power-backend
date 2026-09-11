@@ -1178,16 +1178,14 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
 # ── Activity log ──────────────────────────────────────────────────────────────
 
 @router.get("/customers/{id}/activity")
-def customer_activity(id: str, user: UserContext = Depends(get_current_user)):
+def customer_activity(id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
-    assert_customer_access(db, user, id)
     deal_ids = [d["id"] for d in (db.table("crm_deals").select("id").eq("customer_id", id).execute().data or [])]
     return {"events": activity.fetch(db, [id, *deal_ids])}
 
 @router.get("/deals/{id}/activity")
-def deal_activity(id: str, user: UserContext = Depends(get_current_user)):
+def deal_activity(id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
-    assert_crm_deal_access(db, user, id)
     return {"events": activity.fetch(db, [id])}
 
 # ── Import ─────────────────────────────────────────────────────────────────────
