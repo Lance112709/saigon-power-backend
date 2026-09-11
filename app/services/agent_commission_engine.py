@@ -155,9 +155,10 @@ def load_deal_book(db) -> dict:
 
     for d in fetch_all(db, "lead_deals",
                        "id,status,supplier,esiid,adder,rate_type,plan_name,contract_term,sales_agent,"
-                       "provider_status,start_date,leads(first_name,last_name)"):
+                       "provider_status,start_date,service_address,leads(first_name,last_name)"):
         lead = d.get("leads") or {}
         put(d.get("esiid"), {
+            "address": d.get("service_address") or "",
             "source": "lead_deals", "id": d["id"], "active": d.get("status") == "Active",
             "provider_status": d.get("provider_status"), "start": d.get("start_date"),
             "agent": (d.get("sales_agent") or "").strip(),
@@ -168,9 +169,10 @@ def load_deal_book(db) -> dict:
         })
     for d in fetch_all(db, "crm_deals",
                        "id,deal_status,provider,esiid,adder,product_type,contract_term,sales_agent,business_name,"
-                       "provider_status,contract_start_date,crm_customers(full_name)"):
+                       "provider_status,contract_start_date,service_address,crm_customers(full_name)"):
         cust = d.get("crm_customers") or {}
         put(d.get("esiid"), {
+            "address": d.get("service_address") or "",
             "source": "crm_deals", "id": d["id"], "active": d.get("deal_status") == "ACTIVE",
             "provider_status": d.get("provider_status"), "start": d.get("contract_start_date"),
             "agent": (d.get("sales_agent") or "").strip(),
@@ -747,6 +749,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
         b["total"] += payout
         b["deals"].append({
             "esiid": esiid, "customer": deal["customer"], "supplier": sup_name or deal["supplier"],
+            "address": deal.get("address", ""),
             "deal_source": deal["source"], "deal_id": deal["id"],
             "kwh_paid": round(kwh, 2), "gross_received": round(gross, 2),
             "first_payment": esiid in first_payment_esiids,
