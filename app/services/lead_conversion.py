@@ -36,7 +36,7 @@ def next_sgp_id(db) -> str:
     return f"SGP-2026{num:06d}"
 
 
-def convert_lead(db, lead_id: str) -> dict:
+def convert_lead(db, lead_id: str, actor: str = "system") -> dict:
     """Mark a lead as a converted customer if it has an Active deal.
 
     Idempotent. Raises on any DB failure — callers decide whether to surface
@@ -65,14 +65,21 @@ def convert_lead(db, lead_id: str) -> dict:
     if len(patch) > 1:
         db.table("leads").update(patch).eq("id", lead_id).execute()
         logger.info("lead %s converted (sgp=%s)", lead_id, sgp)
+        if patch.get("status") == "converted":
+            from app.services.audit import audit
+            try:
+                audit(db, "leads", lead_id, "lead_converted", {"status": cur.get("status")},
+                      {"status": "converted", "sgp_customer_id": sgp}, reason="Active deal on file", actor=actor)
+            except Exception:
+                pass
     return {"converted": True, "sgp_customer_id": sgp, "reason": "ok"}
 
 
-def try_convert_lead(db, lead_id: str) -> dict:
+def try_convert_lead(db, lead_id: str, actor: str = "system") -> dict:
     """convert_lead that never raises: logs the traceback and reports the error
     so the caller can surface it (e.g. in an API response) instead of losing it."""
     try:
-        return convert_lead(db, lead_id)
+        return convert_lead(db, lead_id, actor=actor)
     except Exception as e:
         logger.exception("lead conversion failed for %s", lead_id)
         return {"converted": False, "sgp_customer_id": None, "reason": f"error: {e}"}

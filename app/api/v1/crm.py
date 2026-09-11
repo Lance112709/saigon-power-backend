@@ -11,6 +11,7 @@ from app.auth.deps import get_current_user, require_admin, require_manager, User
 from app.auth.ownership import assert_customer_access, assert_crm_deal_access
 from app.core.security import sanitize_search
 from app.services.audit import audit
+from app.services import activity
 
 router = APIRouter()
 
@@ -592,6 +593,7 @@ def create_customer_note(id: str, data: dict = Body(...), user: UserContext = De
     db = get_client()
     assert_customer_access(db, user, id)
     res = db.table("crm_customer_notes").insert({"crm_customer_id": id, "content": content, "author_name": author}).execute()
+    activity.record(db, user, "crm_customers", id, "note_added", None, {"note": content[:300], "author": author})
     return res.data[0]
 
 @router.patch("/customers/{id}/notes/{note_id}")
@@ -615,7 +617,9 @@ def update_customer_note(id: str, note_id: str, data: dict = Body(...), user: Us
 @router.delete("/customers/{id}/notes/{note_id}")
 def delete_customer_note(id: str, note_id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
+    old = (db.table("crm_customer_notes").select("content, author_name").eq("id", note_id).limit(1).execute().data or [{}])[0]
     db.table("crm_customer_notes").delete().eq("id", note_id).eq("crm_customer_id", id).execute()
+    activity.record(db, user, "crm_customers", id, "note_deleted", {"note": (old.get("content") or "")[:300], "author": old.get("author_name")}, None)
     return {"ok": True}
 
 # ── Customer attachments ──
@@ -661,6 +665,7 @@ async def upload_customer_attachment(id: str, file: UploadFile = File(...), user
         "uploaded_by": user.name or user.email or None,
     }
     res = db.table("crm_customer_attachments").insert(row).execute()
+    activity.record(db, user, "crm_customers", id, "attachment_added", None, {"file_name": original, "file_size": len(file_bytes)})
     return res.data[0]
 
 @router.get("/customers/{id}/attachments/{attachment_id}/url")
@@ -696,6 +701,7 @@ def delete_customer_attachment(id: str, attachment_id: str, user: UserContext = 
     except Exception:
         pass  # row removal still proceeds even if the blob is already gone
     db.table("crm_customer_attachments").delete().eq("id", attachment_id).eq("crm_customer_id", id).execute()
+    activity.record(db, user, "crm_customers", id, "attachment_deleted", {"file_name": path.rsplit("/", 1)[-1]}, None)
     return {"ok": True}
 
 @router.patch("/customers/{id}")
@@ -707,14 +713,17 @@ def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends
     payload = {k: v for k, v in data.items() if k in allowed}
     from datetime import datetime, timezone
     result = {}
+    before = (db.table("crm_customers").select("*").eq("id", id).limit(1).execute().data or [{}])[0]
     if payload:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         res = db.table("crm_customers").update(payload).eq("id", id).execute()
         result = res.data[0] if res.data else {}
+        activity.record_update(db, user, "crm_customers", id, before, payload, action="customer_updated")
     # ANXH lives on crm_deals — update all deals for this customer
     if "anxh" in data:
         db.table("crm_deals").update({"anxh": data["anxh"] or None}).eq("customer_id", id).execute()
         result["anxh"] = data["anxh"]
+        activity.record(db, user, "crm_customers", id, "customer_updated", None, {"anxh": data["anxh"] or None})
     if not payload and "anxh" not in data:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     return result
@@ -722,8 +731,10 @@ def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends
 @router.delete("/customers/{id}")
 def delete_crm_customer(id: str, user: UserContext = Depends(require_manager)):
     db = get_client()
+    snap = (db.table("crm_customers").select("id, full_name, email, phone, mailing_address").eq("id", id).limit(1).execute().data or [{}])[0]
     # Delete deal notes first (FK: crm_deal_notes → crm_deals)
     deals = db.table("crm_deals").select("id").eq("customer_id", id).execute().data or []
+    activity.record(db, user, "crm_customers", id, "customer_deleted", {**snap, "deals": len(deals)}, None)
     for deal in deals:
         db.table("crm_deal_notes").delete().eq("crm_deal_id", deal["id"]).execute()
     db.table("crm_deals").delete().eq("customer_id", id).execute()
@@ -843,6 +854,8 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
     res = db.table("crm_deals").insert(payload).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Failed to create deal")
+    activity.record(db, user, "crm_deals", res.data[0]["id"], "deal_created", None,
+                    {k: v for k, v in payload.items() if v not in (None, False, "") and k not in ("customer_id", "created_by")})
     return res.data[0]
 
 def _apply_deal_filters(q, search, provider, deal_status, meter_type, deal_type, sales_agent):
@@ -1043,6 +1056,7 @@ def create_deal_note(id: str, data: dict = Body(...), user: UserContext = Depend
     db = get_client()
     assert_crm_deal_access(db, user, id)
     res = db.table("crm_deal_notes").insert({"crm_deal_id": id, "content": content, "author_name": author}).execute()
+    activity.record(db, user, "crm_deals", id, "note_added", None, {"note": content[:300], "author": author})
     return res.data[0]
 
 @router.patch("/deals/{id}/notes/{note_id}")
@@ -1070,6 +1084,7 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
 
     # Mark original deal as RENEWED
     db.table("crm_deals").update({"deal_status": "RENEWED"}).eq("id", id).execute()
+    activity.record(db, user, "crm_deals", id, "deal_renewed", {"deal_status": orig.get("deal_status")}, {"deal_status": "RENEWED"})
 
     # Build new deal — inherit ESIID/address/meter from original, override with form data
     status = str(data.get("deal_status") or "ACTIVE").upper()
@@ -1105,19 +1120,29 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
         "created_by":           user.name,
     }
     res = db.table("crm_deals").insert(new_deal).execute()
+    if res.data:
+        activity.record(db, user, "crm_deals", res.data[0]["id"], "deal_created", None,
+                        {k: v for k, v in new_deal.items() if v not in (None, False, "") and k not in ("customer_id", "created_by")},
+                        reason=f"Renewal of {orig.get('deal_name') or 'previous deal'}")
     return res.data[0]
 
 @router.delete("/deals/{id}")
 def delete_deal(id: str, user: UserContext = Depends(require_manager)):
     db = get_client()
+    snap = (db.table("crm_deals").select("id, customer_id, deal_name, provider, esiid, deal_status, contract_start_date, contract_end_date, adder, energy_rate, sales_agent")
+            .eq("id", id).limit(1).execute().data or [{}])[0]
     db.table("crm_deal_notes").delete().eq("crm_deal_id", id).execute()
     db.table("crm_deals").delete().eq("id", id).execute()
+    if snap.get("customer_id"):   # logged on the customer so it survives the deal's deletion
+        activity.record(db, user, "crm_customers", snap["customer_id"], "deal_deleted", snap, None)
     return {"ok": True}
 
 @router.delete("/deals/{id}/notes/{note_id}")
 def delete_deal_note(id: str, note_id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
+    old = (db.table("crm_deal_notes").select("content, author_name").eq("id", note_id).limit(1).execute().data or [{}])[0]
     db.table("crm_deal_notes").delete().eq("id", note_id).eq("crm_deal_id", id).execute()
+    activity.record(db, user, "crm_deals", id, "note_deleted", {"note": (old.get("content") or "")[:300], "author": old.get("author_name")}, None)
     return {"ok": True}
 
 @router.patch("/deals/{id}")
@@ -1139,9 +1164,31 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
     if payload.get("deal_status") == "ACTIVE":
         payload.setdefault("terminated_date", None)
     from datetime import datetime, timezone
+    before = (db.table("crm_deals").select("*").eq("id", id).limit(1).execute().data or [{}])[0]
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     res = db.table("crm_deals").update(payload).eq("id", id).execute()
+    new_status = payload.get("deal_status")
+    if new_status and new_status != before.get("deal_status"):
+        action = "deal_terminated" if new_status == "INACTIVE" and payload.get("terminated_date") else "deal_status_changed"
+    else:
+        action = "deal_updated"
+    activity.record_update(db, user, "crm_deals", id, before, payload, action=action)
     return res.data[0] if res.data else {}
+
+# ── Activity log ──────────────────────────────────────────────────────────────
+
+@router.get("/customers/{id}/activity")
+def customer_activity(id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    assert_customer_access(db, user, id)
+    deal_ids = [d["id"] for d in (db.table("crm_deals").select("id").eq("customer_id", id).execute().data or [])]
+    return {"events": activity.fetch(db, [id, *deal_ids])}
+
+@router.get("/deals/{id}/activity")
+def deal_activity(id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    assert_crm_deal_access(db, user, id)
+    return {"events": activity.fetch(db, [id])}
 
 # ── Import ─────────────────────────────────────────────────────────────────────
 

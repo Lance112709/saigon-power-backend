@@ -13,6 +13,7 @@ from app.core.security import sanitize_search, rate_limit
 from app.services.merge_vars import lead_merge_vars
 from app.api.v1.tasks import create_lead_tasks
 from app.services.lead_conversion import next_sgp_id, try_convert_lead, heal_stuck_leads
+from app.services import activity
 import logging
 
 logger = logging.getLogger("saigon.leads")
@@ -34,11 +35,11 @@ def _full_name(lead: dict) -> str:
 def _next_sgp_id(db) -> str:
     return next_sgp_id(db)
 
-def _try_convert(db, lead_id: str) -> dict:
+def _try_convert(db, lead_id: str, actor: str = "system") -> dict:
     """Convert a lead once it has an Active deal. Never raises; the result's
     "reason" carries any error so callers can surface it (see
     app.services.lead_conversion)."""
-    return try_convert_lead(db, lead_id)
+    return try_convert_lead(db, lead_id, actor=actor)
 
 def _auto_promote_deals(db, deals: list) -> list:
     """Promote 'Future' deals to 'Active' once start_date has passed.
@@ -1005,6 +1006,9 @@ def create_lead(data: dict = Body(...), request: Request = None):
         "source":         str(data.get("source") or "manual").strip(),
     }
     res = db.table("leads").insert(payload).execute()
+    if res.data:
+        activity.record(db, "web form", "leads", res.data[0]["id"], "lead_created", None,
+                        {k: payload.get(k) for k in ("first_name", "last_name", "phone", "email", "sales_agent", "source") if payload.get(k)})
     new_lead = res.data[0]
     lead_name = f"{payload['first_name']} {payload['last_name']}"
     try:
@@ -1018,6 +1022,13 @@ def create_lead(data: dict = Body(...), request: Request = None):
     except Exception:
         pass
     return new_lead
+
+@router.get("/{id}/activity")
+def lead_activity(id: str, user: UserContext = Depends(get_current_user)):
+    db = get_client()
+    assert_lead_access(db, user, id)
+    deal_ids = [d["id"] for d in (db.table("lead_deals").select("id").eq("lead_id", id).execute().data or [])]
+    return {"events": activity.fetch(db, [id, *deal_ids])}
 
 # ── Lead Detail + Update ───────────────────────────────────────────────────────
 
@@ -1057,10 +1068,12 @@ def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     payload["updated_at"] = _now()
+    before = (db.table("leads").select("*").eq("id", id).limit(1).execute().data or [{}])[0]
     try:
         res = db.table("leads").update(payload).eq("id", id).execute()
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Update failed: {e}")
+    activity.record_update(db, user, "leads", id, before, payload, action="lead_updated")
     return res.data[0] if res.data else {}
 
 # ── Delete Lead ───────────────────────────────────────────────────────────────
@@ -1068,6 +1081,8 @@ def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get
 @router.delete("/{id}")
 def delete_lead(id: str, user: UserContext = Depends(require_manager)):
     db = get_client()
+    snap = (db.table("leads").select("id, first_name, last_name, phone, email, status").eq("id", id).limit(1).execute().data or [{}])[0]
+    activity.record(db, user, "leads", id, "lead_deleted", snap, None)
     db.table("lead_notes").delete().eq("lead_id", id).execute()
     db.table("lead_deals").delete().eq("lead_id", id).execute()
     db.table("lead_customers").delete().eq("lead_id", id).execute()
@@ -1108,9 +1123,11 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
     if not res.data:
         raise HTTPException(status_code=500, detail="Insert returned no data — check DB columns exist")
     deal = res.data[0]
+    activity.record(db, user, "lead_deals", deal["id"], "deal_created", None,
+                    {k: v for k, v in payload.items() if v not in (None, False, "") and k != "lead_id"})
 
     if deal["status"] == "Active":
-        conv = _try_convert(db, id)
+        conv = _try_convert(db, id, activity.actor_of(user))
         if not conv["converted"]:
             raise HTTPException(status_code=500, detail=f"Deal saved, but converting the lead to a customer failed: {conv['reason']}")
 
@@ -1120,7 +1137,10 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
 def delete_lead_deal(id: str, deal_id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
     assert_lead_access(db, user, id)
+    snap = (db.table("lead_deals").select("id, supplier, esiid, status, start_date, end_date, rate, adder, sales_agent")
+            .eq("id", deal_id).limit(1).execute().data or [{}])[0]
     db.table("lead_deals").delete().eq("id", deal_id).eq("lead_id", id).execute()
+    activity.record(db, user, "leads", id, "deal_deleted", snap, None)   # on the lead so it survives the deal's deletion
     return {"ok": True}
 
 @router.get("/{id}/notes")
@@ -1141,6 +1161,7 @@ def create_lead_note(id: str, data: dict = Body(...), user: UserContext = Depend
     if not author:
         raise HTTPException(status_code=400, detail="Author name is required")
     res = db.table("lead_notes").insert({"lead_id": id, "content": content, "author_name": author}).execute()
+    activity.record(db, user, "leads", id, "note_added", None, {"note": content[:300], "author": author})
     return res.data[0]
 
 @router.patch("/{id}/notes/{note_id}")
@@ -1164,7 +1185,9 @@ def update_lead_note(id: str, note_id: str, data: dict = Body(...), user: UserCo
 @router.delete("/{id}/notes/{note_id}")
 def delete_lead_note(id: str, note_id: str, user: UserContext = Depends(require_admin)):
     db = get_client()
+    old = (db.table("lead_notes").select("content, author_name").eq("id", note_id).limit(1).execute().data or [{}])[0]
     db.table("lead_notes").delete().eq("id", note_id).eq("lead_id", id).execute()
+    activity.record(db, user, "leads", id, "note_deleted", {"note": (old.get("content") or "")[:300], "author": old.get("author_name")}, None)
     return {"ok": True}
 
 # ── Lead attachments ──
@@ -1210,6 +1233,7 @@ async def upload_lead_attachment(id: str, file: UploadFile = File(...), user: Us
         "uploaded_by": user.name or user.email or None,
     }
     res = db.table("lead_attachments").insert(row).execute()
+    activity.record(db, user, "leads", id, "attachment_added", None, {"file_name": row.get("file_name"), "file_size": row.get("file_size")})
     return res.data[0]
 
 @router.get("/{id}/attachments/{attachment_id}/url")
@@ -1245,6 +1269,7 @@ def delete_lead_attachment(id: str, attachment_id: str, user: UserContext = Depe
     except Exception:
         pass  # row removal still proceeds even if the blob is already gone
     db.table("lead_attachments").delete().eq("id", attachment_id).eq("lead_id", id).execute()
+    activity.record(db, user, "leads", id, "attachment_deleted", {"file_name": path.rsplit("/", 1)[-1]}, None)
     return {"ok": True}
 
 @router.patch("/{id}/deals/{deal_id}")
@@ -1266,12 +1291,19 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
     if payload.get("status") == "Active":
         payload.setdefault("terminated_date", None)
     payload["updated_at"] = _now()
+    before = (db.table("lead_deals").select("*").eq("id", deal_id).eq("lead_id", id).limit(1).execute().data or [{}])[0]
     res = db.table("lead_deals").update(payload).eq("id", deal_id).eq("lead_id", id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Deal not found")
+    new_status = payload.get("status")
+    if new_status and new_status != before.get("status"):
+        action = "deal_terminated" if new_status == "Inactive" and payload.get("terminated_date") else "deal_status_changed"
+    else:
+        action = "deal_updated"
+    activity.record_update(db, user, "lead_deals", deal_id, before, payload, action=action)
 
     if payload.get("status") == "Active":
-        conv = _try_convert(db, id)
+        conv = _try_convert(db, id, activity.actor_of(user))
         if not conv["converted"]:
             raise HTTPException(status_code=500, detail=f"Deal saved, but converting the lead to a customer failed: {conv['reason']}")
 
