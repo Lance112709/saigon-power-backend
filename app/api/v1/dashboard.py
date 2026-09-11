@@ -611,7 +611,7 @@ def get_revenue_forecast(refresh: bool = Query(False), user: UserContext = Depen
 
 # ── Renewals & holdovers (admin dashboard) ──────────────────────────────────
 @router.get("/renewal-stats")
-def renewal_stats(user: UserContext = Depends(require_admin)):
+def renewal_stats(user: UserContext = Depends(require_manager)):
     """Renewed deals by month (month = start of the new contract) and holdovers:
     active contracts past their end date with no newer deal on the meter —
     customers still with the provider on the default / month-to-month rate."""
@@ -707,8 +707,9 @@ def renewal_stats(user: UserContext = Depends(require_admin)):
         b["count"] += 1
         b["still_paying"] += 1 if h["still_paying"] else 0
 
+    # Managers see the expired/holdover picture; renewal history stays admin-only.
     return {
-        "renewals": {
+        "renewals": None if not user.is_admin else {
             "by_month": [{"month": m, "count": ren_by_month[m]["count"],
                           "by_provider": sorted(ren_by_month[m]["by_provider"].items(), key=lambda x: -x[1]),
                           "deals": sorted(ren_by_month[m]["deals"], key=lambda x: x["customer"])} for m in months],
