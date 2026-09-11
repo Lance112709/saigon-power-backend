@@ -1,7 +1,7 @@
 from fastapi import APIRouter, HTTPException, Query, Body, Depends, UploadFile, File, Request
 from fastapi.responses import StreamingResponse
 from typing import Optional
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 import re
 import io
 import csv
@@ -569,6 +569,138 @@ def backfill_sgp_ids(user: UserContext = Depends(get_current_user)):
 
 # ── Dropped Deals ─────────────────────────────────────────────────────────────
 
+# ── Dropped deals ────────────────────────────────────────────────────────────
+# Rebuilt 2026-09-11. "Inactive" alone is not evidence of a lost customer:
+# imports, dedupe cleanups and lead conversion all leave inactive rows behind.
+# A deal counts as dropped only with evidence — the provider reported it on a
+# statement, someone terminated it explicitly, or the contract ended and the
+# provider has stopped paying. Superseded meters (a live deal on the same ESI),
+# rows with no ESI, and pipeline copies of converted leads are excluded, and
+# meters the provider is still paying on are surfaced separately for review.
+_DROPPED_CACHE: dict = {"at": None, "rows": None, "extra": None}
+_DROPPED_TTL = timedelta(minutes=5)
+
+
+def _drop_evidence(*, provider_status, provider_status_date, terminated_date, end_date, paid_month, today):
+    """-> (kind, drop_date). kind: dropped | still_paying | no_evidence"""
+    ps = (provider_status or "").strip().lower()
+    provider_drop = bool(ps) and not ps.startswith("active")
+    psd = str(provider_status_date or "")[:10]
+    term = str(terminated_date or "")[:10]
+    end = str(end_date or "")[:10]
+    explicit_term = bool(term) and term != end        # migration 013 backfilled term = end
+    if paid_month:
+        # Provider is still paying on this meter — only a drop if it was reported
+        # or terminated on/after the last paid statement month.
+        if provider_drop and psd[:7] >= paid_month:
+            return "dropped", psd
+        if explicit_term and term[:7] >= paid_month:
+            return "dropped", term
+        return "still_paying", None
+    if provider_drop:
+        return "dropped", psd or term or end or None
+    if explicit_term:
+        return "dropped", term
+    if end and end < today:
+        return "dropped", end
+    return "no_evidence", None
+
+
+def _build_dropped(db) -> tuple:
+    from app.api.v1.agent_portal import _recent_paid_esiids
+    today = date.today().isoformat()
+    digits = lambda e: re.sub(r"\D", "", e or "")
+
+    def fetch_pages(q, cap=10000):
+        out, off = [], 0
+        while True:
+            page = q.range(off, off + 999).execute().data or []
+            out.extend(page)
+            if len(page) < 1000 or len(out) >= cap:
+                break
+            off += 1000
+        return out
+
+    # meters with a live deal anywhere → an inactive row on the same meter is superseded
+    live_esi = set()
+    for d in fetch_pages(db.table("crm_deals").select("esiid").in_("deal_status", ["ACTIVE", "RENEWED", "FUTURE"])):
+        if digits(d.get("esiid")):
+            live_esi.add(digits(d["esiid"]))
+    for d in fetch_pages(db.table("lead_deals").select("esiid").in_("status", ["Active", "Future"])):
+        if digits(d.get("esiid")):
+            live_esi.add(digits(d["esiid"]))
+
+    # last paid statement month per meter, over the 3 most recent statement months
+    paid: dict = {}
+    for lb, esis in _recent_paid_esiids(db, months_back=3).items():   # newest label first
+        for e in esis:
+            n = digits(e)
+            if n and n not in paid:
+                paid[n] = lb
+
+    rows, still_paying = [], []
+    excluded = {"superseded": 0, "no_esiid": 0, "converted_pipeline": 0, "no_evidence": 0, "still_paying": 0}
+
+    def consider(rec: dict, *, provider_status, provider_status_date, terminated_date, end_date):
+        es = digits(rec.get("esiid"))
+        if not es:
+            excluded["no_esiid"] += 1; return
+        if es in live_esi:
+            excluded["superseded"] += 1; return
+        kind, drop_date = _drop_evidence(provider_status=provider_status, provider_status_date=provider_status_date,
+                                         terminated_date=terminated_date, end_date=end_date,
+                                         paid_month=paid.get(es), today=today)
+        if kind == "still_paying":
+            excluded["still_paying"] += 1
+            still_paying.append({**rec, "last_paid_month": paid.get(es)})
+            return
+        if kind == "no_evidence":
+            excluded["no_evidence"] += 1; return
+        if drop_date and drop_date > today:
+            drop_date = None          # reported dropped but no usable date — listed, not charted
+        rec["drop_date"] = drop_date
+        rec["drop_month"] = drop_date[:7] if drop_date else None
+        rows.append(rec)
+
+    # Pipeline deals (lead_deals)
+    for d in fetch_pages(db.table("lead_deals")
+                         .select("*, leads(first_name, last_name, phone, address, city, state, status)")
+                         .eq("status", "Inactive").order("updated_at", desc=True)):
+        lead = d.pop("leads", None) or {}
+        if (lead.get("status") or "").lower() == "converted":
+            excluded["converted_pipeline"] += 1      # the real deal lives in crm_deals
+            continue
+        consider({**d, "source": "pipeline",
+                  "lead_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
+                  "lead_phone": lead.get("phone"),
+                  "lead_address": f"{lead.get('address','')} {lead.get('city','')} {lead.get('state','')}".strip()},
+                 provider_status=d.get("provider_status"), provider_status_date=d.get("provider_status_date"),
+                 terminated_date=d.get("terminated_date"), end_date=d.get("end_date"))
+
+    # Imported contracts (crm_deals)
+    for d in fetch_pages(db.table("crm_deals")
+                         .select("id, customer_id, provider, esiid, energy_rate, sales_agent, contract_start_date, "
+                                 "contract_end_date, updated_at, provider_status, provider_status_date, "
+                                 "provider_status_source, terminated_date, crm_customers(full_name, phone)")
+                         .eq("deal_status", "INACTIVE").order("updated_at", desc=True)):
+        cust = d.pop("crm_customers", None) or {}
+        consider({"id": d["id"], "source": "imported", "customer_id": d.get("customer_id"), "lead_id": None,
+                  "lead_name": cust.get("full_name") or "", "lead_phone": cust.get("phone"), "lead_address": "",
+                  "supplier": d.get("provider"), "esiid": d.get("esiid"), "rate": d.get("energy_rate"),
+                  "sales_agent": d.get("sales_agent"), "start_date": d.get("contract_start_date"),
+                  "end_date": d.get("contract_end_date"), "updated_at": d.get("updated_at"),
+                  "terminated_date": d.get("terminated_date"),
+                  "provider_status": d.get("provider_status"), "provider_status_date": d.get("provider_status_date"),
+                  "provider_status_source": d.get("provider_status_source")},
+                 provider_status=d.get("provider_status"), provider_status_date=d.get("provider_status_date"),
+                 terminated_date=d.get("terminated_date"), end_date=d.get("contract_end_date"))
+
+    still_paying.sort(key=lambda r: (r.get("supplier") or "", r.get("lead_name") or ""))
+    extra = {"excluded": excluded, "still_paying": still_paying,
+             "paid_months_checked": sorted({m for m in paid.values()}, reverse=True)}
+    return rows, extra
+
+
 @router.get("/dropped-deals")
 def list_dropped_deals(
     search: Optional[str] = Query(None),
@@ -577,68 +709,23 @@ def list_dropped_deals(
     month: Optional[str] = Query(None, description="YYYY-MM — filter by drop month"),
     limit: int = Query(100),
     offset: int = Query(0),
+    refresh: bool = Query(False),
     user: UserContext = Depends(get_current_user),
 ):
-    """Every dropped contract across BOTH deal tables (pipeline + imported),
-    including why: the provider-reported status from commission statements."""
+    """Dropped contracts across BOTH deal tables, with evidence — see _build_dropped."""
     db = get_client()
-
-    def fetch_pages(q):
-        out, off = [], 0
-        while True:
-            page = q.range(off, off + 999).execute().data or []
-            out.extend(page)
-            if len(page) < 1000 or len(out) >= 5000:
-                break
-            off += 1000
-        return out
-
-    merged = []
-
-    # Pipeline deals (lead_deals)
-    for d in fetch_pages(db.table("lead_deals")
-                         .select("*, leads(first_name, last_name, phone, address, city, state)")
-                         .eq("status", "Inactive").order("updated_at", desc=True)):
-        lead = d.pop("leads", None) or {}
-        merged.append({
-            **d,
-            "source": "pipeline",
-            "lead_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
-            "lead_phone": lead.get("phone"),
-            "lead_address": f"{lead.get('address','')} {lead.get('city','')} {lead.get('state','')}".strip(),
-        })
-
-    # Imported contracts (crm_deals)
-    for d in fetch_pages(db.table("crm_deals")
-                         .select("id, customer_id, provider, esiid, energy_rate, sales_agent, contract_start_date, "
-                                 "contract_end_date, updated_at, provider_status, provider_status_date, "
-                                 "provider_status_source, crm_customers(full_name, phone)")
-                         .eq("deal_status", "INACTIVE").order("updated_at", desc=True)):
-        cust = d.pop("crm_customers", None) or {}
-        merged.append({
-            "id": d["id"],
-            "source": "imported",
-            "customer_id": d.get("customer_id"),
-            "lead_id": None,
-            "lead_name": cust.get("full_name") or "",
-            "lead_phone": cust.get("phone"),
-            "lead_address": "",
-            "supplier": d.get("provider"),
-            "esiid": d.get("esiid"),
-            "rate": d.get("energy_rate"),
-            "sales_agent": d.get("sales_agent"),
-            "start_date": d.get("contract_start_date"),
-            "end_date": d.get("contract_end_date"),
-            "updated_at": d.get("updated_at"),
-            "provider_status": d.get("provider_status"),
-            "provider_status_date": d.get("provider_status_date"),
-            "provider_status_source": d.get("provider_status_source"),
-        })
+    now = datetime.now(timezone.utc)
+    c = _DROPPED_CACHE
+    if refresh or c["rows"] is None or not c["at"] or now - c["at"] > _DROPPED_TTL:
+        c["rows"], c["extra"] = _build_dropped(db)
+        c["at"] = now
+    merged = [dict(r) for r in c["rows"]]
+    extra = c["extra"]
 
     # Filters (applied uniformly to both sources)
     if user.is_sales_agent:
         if not user.sales_agent_name:
-            return []
+            return {"summary": {"total": 0, "provider_reported": 0, "by_month": []}, "deals": []}
         me = user.sales_agent_name.strip().lower()
         merged = [d for d in merged if (d.get("sales_agent") or "").strip().lower() == me]
     if supplier:
@@ -654,13 +741,6 @@ def list_dropped_deals(
                   or s in (d.get("sales_agent") or "").lower()
                   or s in (d.get("esiid") or "").lower()]
 
-    # When it was dropped: statement month when reported by the provider,
-    # otherwise the record's last update.
-    for d in merged:
-        drop_date = str(d.get("provider_status_date") or d.get("updated_at") or "")[:10]
-        d["drop_date"] = drop_date or None
-        d["drop_month"] = drop_date[:7] if drop_date else None
-
     # Month histogram BEFORE the month filter, so the chart always shows the full picture
     by_month: dict = {}
     for d in merged:
@@ -674,14 +754,17 @@ def list_dropped_deals(
         merged = [d for d in merged if d["drop_month"] == month]
 
     merged.sort(key=lambda d: str(d.get("drop_date") or ""), reverse=True)
-    return {
-        "summary": {
-            "total": len(merged),
-            "provider_reported": sum(1 for d in merged if d.get("provider_status")),
-            "by_month": [{"month": m, **v} for m, v in sorted(by_month.items())],
-        },
-        "deals": merged[offset:offset + limit],
+    summary = {
+        "total": len(merged),
+        "provider_reported": sum(1 for d in merged if d.get("provider_status")),
+        "by_month": [{"month": m, **v} for m, v in sorted(by_month.items())],
+        "excluded": extra["excluded"],
+        "paid_months_checked": extra["paid_months_checked"],
     }
+    if user.is_manager:   # review list: inactive in the CRM but the provider is still paying
+        summary["still_paying"] = extra["still_paying"]
+    return {"summary": summary, "deals": merged[offset:offset + limit]}
+
 
 @router.get("/all-deals")
 def list_all_lead_deals(
