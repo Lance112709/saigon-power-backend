@@ -250,12 +250,61 @@ def test_imported_and_transferred_deals_never_earn_enrollment_bonus():
     assert nga is None or nga["enrolled"] == 0
 
 
-def test_identical_start_dates_hold_exactly_one_of_the_pair():
+def test_identical_contract_entered_twice_is_auto_rejected_not_held():
     a = cdeal("aaa", "Nga Nguyen", "2026-08-03", "2029-08-03", "2727 Pecan Ridge Dr")
     b = cdeal("bbb", "Nga Nguyen", "2026-08-03", "2029-08-03", "2727 Pecan Ridge Dr")
     nga = run_enroll([b, a])["agents"]["Nga Nguyen"]
-    assert nga["enrolled"] == 2 and nga["held"] == 1 and nga["total"] == 5.0
-    assert [d["deal_id"] for d in nga["deals"] if d["held"]] == ["bbb"]
+    assert nga["enrolled"] == 2 and nga["held"] == 0 and nga["total"] == 5.0
+    by = {d["deal_id"]: d for d in nga["deals"]}
+    assert by["bbb"]["auto_decision"] == "reject" and by["bbb"]["hold_reason"] == "auto_rejected" and by["bbb"]["commission"] == 0
+    assert "duplicate record of the same contract" in by["bbb"]["applied"] and by["aaa"]["commission"] == 5.0
+    # admin can still override: release the auto-rejected copy → both pay
+    r2 = run_enroll([b, a], audit=[{"record_id": "bbb", "action": "enrollment_bonus_release", "created_at": "2026-09-01"}])
+    assert r2["agents"]["Nga Nguyen"]["total"] == 10.0
+
+
+def test_provider_switch_after_inactive_contract_is_auto_released():
+    old = cdeal("old", "Jennie Duong", "2025-10-09", "", "8323 Wilcrest Dr", status="INACTIVE", supplier="Heritage Power")
+    new = cdeal("new", "Nga Nguyen", "2026-08-02", "2026-09-03", "8323 Wilcrest Dr", supplier="Iron Horse")
+    nga = run_enroll([old, new])["agents"]["Nga Nguyen"]
+    assert nga["held"] == 0 and nga["total"] == 5.0
+    d = nga["deals"][0]
+    assert d["auto_decision"] == "release" and "switched from Heritage Power" in d["applied"] and "auto-released" in d["applied"]
+
+
+def test_two_agents_same_live_contract_stays_held_for_a_person():
+    a = cdeal("lance", "Lance Nguyen", "2026-08-11", "2027-08-11", "6015 Ida Rose Ct")
+    b = cdeal("nga", "Nga Nguyen", "2026-08-11", "2027-08-11", "6015 Ida Rose Ct")
+    nga = run_enroll([a, b])["agents"]["Nga Nguyen"]
+    assert nga["held"] == 1 and nga["deals"][0]["auto_decision"] is None and nga["total"] == 0.0
+
+
+def test_clawback_when_customer_cancels_inside_the_window():
+    rules = {"components": [{"type": "flat_per_enrollment", "amount": 5}], "clawback_days": 60}
+    def run(deals, y, m):
+        db = FakeDB({"sales_agents": [agent("Nga Nguyen", rules)], "lead_deals": [], "crm_deals": deals,
+                     "actual_commissions": [], "audit_log": []})
+        return calculate_month(db, y, m)["agents"].get("Nga Nguyen")
+    # enrolled in July, cancelled in August (25 days later) → July paid $5, August claws back −$5
+    d = cdeal("d1", "Nga Nguyen", "2026-07-20", "2027-07-20", "1 Main St", status="INACTIVE")
+    d["terminated_date"] = "2026-08-14"
+    jul = run([d], 2026, 7); aug = run([d], 2026, 8)
+    assert jul["total"] == 5.0 and jul["clawbacks"] == 0
+    assert aug["clawbacks"] == 1 and aug["clawback_total"] == -5.0 and aug["total"] == -5.0
+    row = aug["deals"][0]
+    assert row["kind"] == "clawback" and row["commission"] == -5.0 and "25 days" in row["applied"]
+    # cancelled after the window → no clawback
+    late = cdeal("d2", "Nga Nguyen", "2026-05-01", "2027-05-01", "2 Oak St", status="INACTIVE")
+    late["terminated_date"] = "2026-08-20"
+    assert run([late], 2026, 8) is None
+    # cancelled in the SAME month it started → bonus simply not paid
+    same = cdeal("d3", "Nga Nguyen", "2026-08-03", "2027-08-03", "3 Elm St", status="INACTIVE")
+    same["terminated_date"] = "2026-08-20"
+    r = run([same], 2026, 8)
+    assert r["total"] == 0.0 and r["deals"][0]["hold_reason"] == "cancelled" and "within 60 days" in r["deals"][0]["applied"]
+    # no clawback window on the plan → nothing changes
+    rules.pop("clawback_days")
+    assert run([d], 2026, 8) is None
 
 
 # ── enrollment type: brand-new customer vs renewal ───────────────────────────

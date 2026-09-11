@@ -132,6 +132,28 @@ def _run_lead_conversion_heal():
         logging.getLogger("saigon.lead_conversion").exception("nightly lead self-heal crashed")
 
 
+def _run_commission_autocalc():
+    """Daily: refresh 'calculated' agent-commission rows for this month and the
+    two before it (approved/paid rows are locked)."""
+    try:
+        from app.services.commission_autorun import auto_calculate
+        auto_calculate()
+    except Exception:
+        import logging
+        logging.getLogger("saigon.commission_autorun").exception("auto-calculate crashed")
+
+
+def _run_commission_digest():
+    """Monthly (day 8, after the statement ingest): email Lance the pre-payout
+    checklist for the previous month."""
+    try:
+        from app.services.commission_digest import send_digest
+        send_digest()
+    except Exception:
+        import logging
+        logging.getLogger("saigon.commission_digest").exception("digest crashed")
+
+
 def _run_sgp_evaluation():
     """Fold last month's provider-paid GP into SGP tier progress and apply
     any permanently earned promotions (idempotent)."""
@@ -151,6 +173,8 @@ try:
     # Day 10, after the watchdog: fold last month's provider-paid GP into SGP
     # tier progress and apply any permanently earned promotions.
     scheduler.add_job(_run_sgp_evaluation, "cron", day=10, hour=10, minute=0)
+    scheduler.add_job(_run_commission_autocalc, "cron", hour=5, minute=45)
+    scheduler.add_job(_run_commission_digest, "cron", day=8, hour=11, minute=0)
     scheduler.add_job(_run_lead_conversion_heal, "cron", hour=5, minute=30)
     # Monthly: commission statements arrive once a month (providers pay by the
     # 7th) — pull the commission@ inbox on the 8th. The 40-day lookback plus

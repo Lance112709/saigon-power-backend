@@ -5,6 +5,7 @@ agent's custom plan (sales_agents.commission_rules) — see
 app/services/agent_commission_engine.py. Workflow per agent per month:
 calculated → approved → closed_out → paid, with an action log.
 """
+import json
 from datetime import datetime, timezone, date
 from typing import Optional
 
@@ -306,6 +307,103 @@ def _xlsx_response(rec: dict, summary, detail, detail_sheet: str):
     return StreamingResponse(
         buf, media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+
+# ── One-click month close ─────────────────────────────────────────────────────
+
+@router.post("/close-month")
+def close_month(data: dict = Body(...), user: UserContext = Depends(require_admin)):
+    """Approve, close out and mark paid every record of a month in one step.
+    Body: {year, month, paid_at?: YYYY-MM-DD (default today), notes?, ids?: [..]
+    (subset), skip_held?: bool (default true — records whose summary still has
+    HELD enrollment bonuses are left alone)}."""
+    import re as _re
+    year, month = int(data.get("year") or 0), int(data.get("month") or 0)
+    if not (year and 1 <= month <= 12):
+        raise HTTPException(status_code=400, detail="year and month required")
+    paid_at = str(data.get("paid_at") or datetime.now(timezone.utc).date().isoformat()).strip()
+    if not _re.fullmatch(r"20\d{2}-\d{2}-\d{2}", paid_at):
+        raise HTTPException(status_code=400, detail="paid_at must be YYYY-MM-DD")
+    only = set(data.get("ids") or [])
+    skip_held = data.get("skip_held", True)
+    notes = (data.get("notes") or "").strip()
+    who = user.name or user.email
+    now = datetime.now(timezone.utc).isoformat()
+    db = get_client()
+    rows = db.table("agent_commissions").select("*").eq("year", year).eq("month", month).execute().data or []
+    paid, skipped = [], []
+    for rec in rows:
+        if only and rec["id"] not in only:
+            continue
+        if rec["status"] == "paid":
+            continue
+        held = 0
+        try:
+            held = int((json.loads(rec.get("notes") or "{}") or {}).get("held") or 0)
+        except Exception:
+            pass
+        if skip_held and held:
+            skipped.append({"agent_name": rec["agent_name"], "reason": f"{held} held enrollment bonus(es) still need a decision"})
+            continue
+        if float(rec.get("total_commission") or 0) <= 0:
+            skipped.append({"agent_name": rec["agent_name"], "reason": "nothing to pay"})
+            continue
+        payload = {"status": "paid", "paid_at": f"{paid_at}T12:00:00+00:00", "paid_by": who, "updated_at": now}
+        if not rec.get("approved_at"):
+            payload.update({"approved_at": now, "approved_by": who})
+        if not rec.get("closed_out_at"):
+            payload.update({"closed_out_at": now, "closed_out_by": who})
+        db.table("agent_commissions").update(payload).eq("id", rec["id"]).execute()
+        db.table("commission_logs").insert({
+            "commission_id": rec["id"], "action": "mark_paid", "performed_by": who,
+            "agent_name": rec["agent_name"], "month": month, "year": year,
+            "notes": f"Month close — paid {paid_at} ${float(rec.get('total_commission') or 0):,.2f}"
+                     + (f" | {notes}" if notes else ""),
+            "created_at": now,
+        }).execute()
+        paid.append({"id": rec["id"], "agent_name": rec["agent_name"], "total_commission": rec.get("total_commission")})
+    return {"ok": True, "year": year, "month": month, "paid_at": paid_at,
+            "paid": paid, "paid_total": round(sum(float(p["total_commission"] or 0) for p in paid), 2),
+            "skipped": skipped}
+
+
+# ── Pre-payout checklist (digest) ────────────────────────────────────────────
+
+@router.get("/digest")
+def get_digest(year: int = Query(...), month: int = Query(...), user: UserContext = Depends(require_admin)):
+    from app.services.commission_digest import build_digest
+    return build_digest(year, month)
+
+
+@router.post("/digest/send")
+def send_digest_now(data: dict = Body(default={}), user: UserContext = Depends(require_admin)):
+    from app.services.commission_digest import send_digest
+    return send_digest(int(data.get("year") or 0) or None, int(data.get("month") or 0) or None)
+
+
+# ── Agent name hygiene ───────────────────────────────────────────────────────
+
+@router.get("/agent-names")
+def agent_names_report(month: Optional[str] = Query(None), user: UserContext = Depends(require_admin)):
+    from app.services.agent_names import agent_name_report
+    return agent_name_report(get_client(), month_label=month)
+
+
+@router.post("/agent-names/normalize")
+def agent_names_normalize(data: dict = Body(default={}), user: UserContext = Depends(require_admin)):
+    """Rewrite deal agent names that differ from a registered agent only by
+    case or spacing. dry_run (default true) just reports what would change."""
+    from app.services.agent_names import normalize_deal_agent_names
+    from app.services.audit import audit
+    db = get_client()
+    try:
+        res = normalize_deal_agent_names(db, dry_run=bool(data.get("dry_run", True)), renames=data.get("renames") or None)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not res["dry_run"] and res["changed"]:
+        audit(db, "crm_deals", "agent-names", "agent_names_normalized", None,
+              {"changed": res["changed"]}, reason="Agent name hygiene", actor=user.email or user.name or "admin")
+    return res
 
 
 # ── Paid-to-agents summary (month range / YTD) ───────────────────────────────

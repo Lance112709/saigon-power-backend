@@ -5,6 +5,7 @@ from datetime import datetime, timezone, date
 import re
 import io
 import csv
+from app.services.agent_names import canonical_agent
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_lead_access
@@ -78,6 +79,14 @@ def _shape_lead(lead: dict, db=None) -> dict:
         "active_deal_count": sum(1 for d in deals if d.get("status") == "Active"),
     }
 
+def _AGENT_REGISTRY() -> dict:
+    from app.services.agent_names import registered_agents
+    try:
+        return registered_agents(get_client())
+    except Exception:
+        return {}
+
+
 def _deal_payload(data: dict) -> dict:
     def _f(key):
         v = data.get(key)
@@ -112,7 +121,7 @@ def _deal_payload(data: dict) -> dict:
         "service_zip":     str(data.get("service_zip") or "").strip() or None,
         "esiid":           str(data.get("esiid") or "").strip() or None,
         # Assignment
-        "sales_agent": str(data.get("sales_agent") or "").strip() or None,
+        "sales_agent": canonical_agent(None, data.get("sales_agent"), _AGENT_REGISTRY()),
         # Deal meta
         "deal_type":          str(data.get("deal_type") or "").strip() or None,
         "service_order_type": str(data.get("service_order_type") or "").strip() or None,
@@ -1169,6 +1178,8 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    if "sales_agent" in payload:
+        payload["sales_agent"] = canonical_agent(db, payload["sales_agent"])
     if payload.get("status") == "Active":
         payload.setdefault("terminated_date", None)
     payload["updated_at"] = _now()

@@ -196,6 +196,15 @@ def _segment(type_field, business_name) -> str:
     return "residential"
 
 
+def _cancel_date(status, terminated_date, updated_at) -> str:
+    """YYYY-MM-DD the contract was cancelled, or '' while it is live. CRM deals
+    record terminated_date; otherwise the moment the status flipped to
+    inactive (updated_at) is the best evidence available."""
+    if norm_name(status) != "inactive":
+        return ""
+    return ((terminated_date or updated_at or "")[:10])
+
+
 def _segment_matches(component, segment: str) -> bool:
     want = norm_name(component.get("segment"))
     return want in ("", "any", "all") or want == segment
@@ -206,7 +215,8 @@ def load_enrollment_book(db) -> list:
     out = []
     for d in fetch_all(db, "lead_deals",
                        "id,status,supplier,esiid,rate_type,plan_name,contract_term,sales_agent,product_type,"
-                       "start_date,end_date,service_address,service_zip,created_at,leads(first_name,last_name,business_name)"):
+                       "start_date,end_date,service_address,service_zip,created_at,updated_at,terminated_date,"
+                       "leads(first_name,last_name,business_name)"):
         lead = d.get("leads") or {}
         out.append({
             "source": "lead_deals", "id": d["id"], "status": d.get("status") or "",
@@ -217,11 +227,12 @@ def load_enrollment_book(db) -> list:
             "address": d.get("service_address") or "", "addr_key": _addr_key(d.get("service_address"), d.get("service_zip")),
             "customer": f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip(),
             "segment": _segment(d.get("product_type"), lead.get("business_name")),
+            "cancelled": _cancel_date(d.get("status"), d.get("terminated_date"), d.get("updated_at")),
             "owner": "", "created": (d.get("created_at") or "")[:10],
         })
     for d in fetch_all(db, "crm_deals",
                        "id,deal_status,provider,esiid,product_type,meter_type,contract_term,sales_agent,business_name,deal_owner,"
-                       "contract_start_date,contract_end_date,service_address,service_zip,created_at,"
+                       "contract_start_date,contract_end_date,service_address,service_zip,created_at,updated_at,terminated_date,"
                        "crm_customers(full_name,postal_code)"):
         cust = d.get("crm_customers") or {}
         out.append({
@@ -234,6 +245,7 @@ def load_enrollment_book(db) -> list:
             "addr_key": _addr_key(d.get("service_address"), d.get("service_zip") or cust.get("postal_code")),
             "customer": cust.get("full_name") or d.get("business_name") or "",
             "segment": _segment(d.get("meter_type"), d.get("business_name")),
+            "cancelled": _cancel_date(d.get("deal_status"), d.get("terminated_date"), d.get("updated_at")),
             "owner": d.get("deal_owner") or "", "created": (d.get("created_at") or "")[:10],
         })
     return out
@@ -278,6 +290,29 @@ def _prior_contract(deal: dict, by_esiid: dict, by_addr: dict):
         if best is None or o["start"] > best["start"]:
             best = o
     return best
+
+
+ACTIVE_STATUSES = ("active", "future")
+
+
+def _auto_decision(deal: dict, dup: dict):
+    """Decide the mechanical duplicate-address cases so the admin only sees
+    the judgment calls:
+      reject  — the same contract entered twice (same agent, same start and
+                end dates; ESI IDs equal or one of them blank)
+      release — the customer switched providers: the earlier contract is no
+                longer live and was with a different provider
+    Anything else (different agents, two live contracts, same provider
+    re-signed early) stays HELD for a person."""
+    same_agent = norm_name(deal["agent"]) == norm_name(dup["agent"])
+    same_dates = deal["start"] == dup["start"] and (deal["end"] or "") == (dup["end"] or "")
+    esiid_ok = (not deal["esiid"] or not dup["esiid"] or deal["esiid"] == dup["esiid"])
+    if same_agent and same_dates and esiid_ok:
+        return "reject", "duplicate record of the same contract"
+    dup_live = norm_name(dup["status"]) in ACTIVE_STATUSES or norm_name(dup["status"]) == ""
+    if not dup_live and norm_name(dup["supplier"]) != norm_name(deal["supplier"]):
+        return "release", f"customer switched from {dup['supplier'] or 'another provider'} (earlier contract {dup['status'].lower() or 'ended'})"
+    return None, ""
 
 
 def _duplicate_of(deal: dict, same_addr: list):
@@ -343,19 +378,34 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
         if d["addr_key"]:
             dup, why = _duplicate_of(d, by_addr.get(d["addr_key"], []))
         decision = decisions.get(d["id"])
-        held = bool(dup) and decision != "release"
+        auto, auto_why = (None, "")
+        if dup and not decision:
+            auto, auto_why = _auto_decision(d, dup)
+        held = bool(dup) and decision != "release" and auto is None
         rejected = decision == "reject"
+        clawback_days = int((plan["rules"] or {}).get("clawback_days") or 0)
+        # cancelled inside the window during the START month → no bonus at all;
+        # a later cancellation leaves this month's (already paid) bonus alone and
+        # is clawed back in the month it happened (see below)
+        cancelled_early = bool(clawback_days and d["cancelled"] and d["cancelled"][:7] == label
+                               and d["cancelled"] <= _plus_days(d["start"], clawback_days))
         if rejected:
             held, commission, applied = True, 0.0, "rejected by admin — duplicate service address"
+        elif auto == "reject":
+            commission, applied = 0.0, f"$0 — {auto_why} ({dup['source']} {dup['id'][:8]} pays) · auto"
         elif held:
             commission = 0.0
             applied = f"HELD — {why} ({dup['customer'] or 'unknown'}, {dup['source']} {dup['id'][:8]})"
         elif excluded:
             commission, applied = 0.0, "excluded plan type"
+        elif cancelled_early:
+            commission = 0.0
+            applied = f"$0 — cancelled {d['cancelled']}, within {clawback_days} days of the {d['start']} start"
         else:
             commission = amount
             applied = f"enrollment bonus ${amount:.2f} ({d['segment']}, contract start {d['start']}) · {type_txt}" + \
-                      (" — released by admin" if dup and decision == "release" else "")
+                      (" — released by admin" if dup and decision == "release" else "") + \
+                      (f" — {auto_why} (auto-released)" if auto == "release" else "")
         out.setdefault(plan["name"], []).append({
             "kind": "enrollment", "esiid": d["esiid"], "customer": d["customer"], "supplier": d["supplier"],
             "segment": d["segment"],
@@ -366,10 +416,50 @@ def enrollment_bonuses(db, label: str, plans: dict, book: list = None, decisions
             "prior_contract": {"source": prior["source"], "id": prior["id"], "customer": prior["customer"],
                                "supplier": prior["supplier"], "agent": prior["agent"],
                                "contract_start": prior["start"], "contract_end": prior["end"]} if prior else None,
-            "held": held, "hold_reason": why if held and not rejected else ("rejected" if rejected else ""),
+            "held": held,
+            "hold_reason": (why if held and not rejected else
+                            ("rejected" if rejected else ("auto_rejected" if auto == "reject" else
+                             ("cancelled" if cancelled_early else "")))),
+            "auto_decision": auto,
             "duplicate_of": {"source": dup["source"], "id": dup["id"], "customer": dup["customer"],
                              "contract_start": dup["start"], "contract_end": dup["end"], "agent": dup["agent"]} if dup else None,
             "commission": round(commission, 4), "applied": applied,
+        })
+    # Clawbacks: a bonus paid in an EARLIER month whose contract was cancelled
+    # during this month, within the plan's clawback window.
+    for d in book:
+        if not d["cancelled"] or d["cancelled"][:7] != label or not d["start"] or d["start"][:7] >= label:
+            continue
+        if not d["agent"] or IMPORTED_OWNER_RE.search(d["owner"] or ""):
+            continue
+        plan = plans.get(norm_name(d["agent"]))
+        if not plan:
+            continue
+        clawback_days = int((plan["rules"] or {}).get("clawback_days") or 0)
+        if not clawback_days or d["cancelled"] > _plus_days(d["start"], clawback_days):
+            continue
+        comps = [c for c in plan["components"] if c.get("type") == "flat_per_enrollment"
+                 and _supplier_matches(c, d["supplier"], "", d["supplier"])
+                 and _segment_matches(c, d["segment"])]
+        if not comps or _excluded(d["plan_type"], plan["rules"]):
+            continue
+        # was the bonus actually paid in the start month? (not held / rejected / auto-rejected)
+        paid_then = next((x for x in enrollment_bonuses(db, d["start"][:7], plans, book, decisions).get(plan["name"], [])
+                          if x["deal_id"] == d["id"]), None)
+        if not paid_then or not paid_then["commission"]:
+            continue
+        amount = paid_then["commission"]
+        days = (date.fromisoformat(d["cancelled"]) - date.fromisoformat(d["start"])).days
+        out.setdefault(plan["name"], []).append({
+            "kind": "clawback", "esiid": d["esiid"], "customer": d["customer"], "supplier": d["supplier"],
+            "segment": d["segment"], "deal_source": d["source"], "deal_id": d["id"], "address": d["address"],
+            "contract_start": d["start"], "cancelled": d["cancelled"], "kwh_paid": 0, "gross_received": 0,
+            "first_payment": False, "excluded": False, "plan_type": d["plan_type"], "held": False,
+            "hold_reason": "", "enrollment_type": paid_then.get("enrollment_type"), "prior_contract": None,
+            "duplicate_of": None, "auto_decision": None,
+            "commission": round(-amount, 4),
+            "applied": f"clawback −${amount:.2f} — enrolled {d['start']}, cancelled {d['cancelled']} "
+                       f"({days} days, within the {clawback_days}-day window); bonus paid {d['start'][:7]}",
         })
     return out
 
@@ -518,6 +608,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
             "new_enrollments": 0, "renewals": 0,  # enrolled split: brand-new customers vs renewals
             "enrollment_only": False, "enrollment_rate": 0.0,  # plan = $ per enrolled customer, nothing else
             "enrollment_rates": [],  # [{segment, amount}] when the rate differs by residential/commercial
+            "clawbacks": 0, "clawback_total": 0.0,  # bonuses taken back for early cancellations
             "enrolled_by_segment": {},  # {segment: {"count", "paid", "amount"}}
             "deals_paid": 0, "gross_received": 0.0, "excluded_deals": 0,
             "deals": [],  # per-deal detail for breakdowns
@@ -531,6 +622,12 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
         b["enrollment_rate"] = _enrollment_rate(plan)
         b["enrollment_rates"] = _enrollment_rates(plan)
         for d in deals:
+            if d.get("kind") == "clawback":
+                b["clawbacks"] += 1
+                b["clawback_total"] += d["commission"]
+                b["total"] += d["commission"]
+                b["deals"].append(d)
+                continue
             b["enrolled"] += 1
             seg = b["enrolled_by_segment"].setdefault(d.get("segment") or "residential", {"count": 0, "paid": 0, "amount": 0.0})
             seg["count"] += 1
@@ -670,7 +767,7 @@ def calculate_month(db, year: int, month: int, plans: dict = None, book: dict = 
                             f"until you set their plan.")
 
     for b in agents.values():
-        for k in ("total", "residual", "bonuses", "flat_monthly", "gross_received", "enrollment_bonuses", "statement_share", "enrollment_rate"):
+        for k in ("total", "residual", "bonuses", "flat_monthly", "gross_received", "enrollment_bonuses", "statement_share", "enrollment_rate", "clawback_total"):
             b[k] = round(b[k], 2)
         b["deals"].sort(key=lambda d: -d["commission"])
 
@@ -734,10 +831,15 @@ def save_month_results(db, year: int, month: int, result: dict, performed_by: st
             "enrollment_rate": vals.get("enrollment_rate", 0),
             "enrollment_rates": vals.get("enrollment_rates", []),
             "enrolled_by_segment": vals.get("enrolled_by_segment", {}),
+            "clawbacks": vals.get("clawbacks", 0),
+            "clawback_total": vals.get("clawback_total", 0),
             "excluded_deals": vals["excluded_deals"],
         })
         if vals.get("enrollment_only"):
-            log_note = (f"{enrollment_math(vals)} = ${vals['total']}"
+            cb = vals.get("clawbacks", 0)
+            log_note = (f"{enrollment_math(vals)}"
+                        f"{' − ' + str(cb) + ' clawback' + ('s' if cb != 1 else '') + ' $' + format(-vals.get('clawback_total', 0), '.2f') if cb else ''}"
+                        f" = ${vals['total']}"
                         f" ({vals.get('new_enrollments', 0)} new · {vals.get('renewals', 0)} renewals"
                         f"{' · ' + str(vals['held']) + ' held at $0' if vals.get('held') else ''})")
         else:

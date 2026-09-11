@@ -5,6 +5,7 @@ import re
 import io
 import csv
 from datetime import datetime as dt
+from app.services.agent_names import canonical_agent
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_customer_access, assert_crm_deal_access
@@ -828,7 +829,7 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         "contract_end_date":     data.get("contract_end_date") or None,
         "contract_signed_date":  data.get("contract_signed_date") or None,
         "service_address":       str(data.get("service_address") or "").strip() or None,
-        "sales_agent":           str(data.get("sales_agent") or "").strip() or None,
+        "sales_agent":           canonical_agent(db, data.get("sales_agent")),
         "deal_owner":            str(data.get("deal_owner") or "").strip() or None,
         "product_type":          str(data.get("product_type") or "").strip() or None,
         "flag_tos":              bool(data.get("flag_tos", False)),
@@ -1079,7 +1080,7 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
         "esiid":                data.get("esiid") or orig.get("esiid"),
         "provider":             data.get("provider") or orig.get("provider"),
         "deal_status":          status,
-        "sales_agent":          data.get("sales_agent") or orig.get("sales_agent"),
+        "sales_agent":          canonical_agent(db, data.get("sales_agent") or orig.get("sales_agent")),
         "deal_owner":           data.get("deal_owner") or orig.get("deal_owner"),
         "service_address":      data.get("service_address") or orig.get("service_address"),
         "service_city":         data.get("service_city") or None,
@@ -1133,6 +1134,8 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    if "sales_agent" in payload:
+        payload["sales_agent"] = canonical_agent(db, payload["sales_agent"])
     if payload.get("deal_status") == "ACTIVE":
         payload.setdefault("terminated_date", None)
     from datetime import datetime, timezone
@@ -1317,8 +1320,17 @@ def list_providers(user: UserContext = Depends(get_current_user)):
 
 @router.get("/agents")
 def list_agents(user: UserContext = Depends(get_current_user)):
+    """Agent names for pickers and filters: every registered sales agent (in
+    its canonical spelling) plus any legacy spelling still on a deal that
+    matches no registered agent, so old records stay filterable."""
+    from app.services.agent_names import registered_agents, _key
     db = get_client()
-    return _paginate_distinct(db, "crm_deals", "sales_agent")
+    reg = registered_agents(db)
+    names = set(reg.values())
+    for v in _paginate_distinct(db, "crm_deals", "sales_agent"):
+        if _key(v) not in reg:
+            names.add(v)
+    return sorted(names, key=lambda n: n.lower())
 
 
 # ── Import Template Download ───────────────────────────────────────────────────
