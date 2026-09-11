@@ -183,6 +183,11 @@ async def lifespan(app: FastAPI):
             scheduler.start()
         except Exception:
             pass
+    try:  # pre-build the revenue forecast so the first /forecast visit is instant
+        from app.api.v1.dashboard import warm_revenue_forecast
+        warm_revenue_forecast()
+    except Exception:
+        pass
     yield
     if _scheduler_ok:
         try:

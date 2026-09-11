@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Query, Depends
+from fastapi import APIRouter, Query, Depends, HTTPException
+import threading
 from typing import Optional
 import re
 from datetime import date, datetime, timezone, timedelta
@@ -311,188 +312,293 @@ def get_commission_history(user: UserContext = Depends(get_current_user)):
     sorted_months = sorted(monthly.keys())[-6:]
     return [{"month": m, "amount": round(monthly[m], 2)} for m in sorted_months]
 
-@router.get("/revenue-forecast")
-def get_revenue_forecast(user: UserContext = Depends(get_current_user)):
-    db = get_client()
+# ── Revenue forecast ─────────────────────────────────────────────────────────
+# Rebuilt 2026-09-10. Per meter: baseline kWh = mean of (statement kWh /
+# seasonal index) over the last 12 statement months; projected kWh for a
+# future month = baseline x that calendar month's index. The index is the
+# median same-meter month/mean ratio across meters with (near) full-year
+# history. Rate = the meter's own observed paid $/kWh when it has been on a
+# statement; otherwise the contract adder x the supplier's realization
+# factor (what the supplier actually paid vs contract on meters we can
+# see). Supplier names are canonicalized to the paying entity.
+FORECAST_MONTHS = 60
+_FORECAST_CACHE: dict = {"at": None, "data": None}
+_FORECAST_TTL = timedelta(hours=6)
+
+_SUPPLIER_ALIASES = {
+    "directenergy": "Discount Power", "discountpower": "Discount Power",
+    "nrg": "NRG Commercial", "nrgcommercial": "NRG Commercial", "nrgenergy": "NRG Commercial",
+    "budgetpower": "Budget Power", "budget": "Budget Power",
+    "heritagepower": "Heritage Power", "heritage": "Heritage Power",
+    "ironhorse": "Iron Horse", "ironhorseenergy": "Iron Horse",
+    "hudsonenergy": "Hudson Energy", "hudson": "Hudson Energy",
+    "chariotenergy": "Chariot Energy", "chariot": "Chariot Energy",
+    "cleanskyenergy": "CleanSky Energy", "cleansky": "CleanSky Energy",
+    "taraenergy": "Tara Energy", "tara": "Tara Energy",
+    "apge": "APG&E", "reliant": "Reliant Energy", "reliantenergy": "Reliant Energy",
+    "cirro": "Cirro Energy", "cirroenergy": "Cirro Energy",
+    "pennywise": "Pennywise Energy", "pennywiseenergy": "Pennywise Energy",
+}
+
+
+def canon_supplier(name: Optional[str]) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        return "Unknown"
+    key = re.sub(r"[^a-z0-9]", "", raw.lower())
+    return _SUPPLIER_ALIASES.get(key, raw.title() if raw.isupper() else raw)
+
+
+def _median(xs: list) -> float:
+    xs = sorted(xs)
+    n = len(xs)
+    if not n:
+        return 0.0
+    return xs[n // 2] if n % 2 else (xs[n // 2 - 1] + xs[n // 2]) / 2
+
+
+def _shift_month(d: date, n: int) -> date:
+    y, m = d.year, d.month + n
+    y += (m - 1) // 12
+    m = (m - 1) % 12 + 1
+    return date(y, m, 1)
+
+
+def _build_revenue_forecast(db) -> dict:
     today = date.today()
-    cutoff = date(today.year + 2, today.month, 1)
+    this_month = today.replace(day=1)
+    cutoff = _shift_month(this_month, FORECAST_MONTHS)
+    window_floor = _shift_month(this_month, -14).isoformat()   # 14 months back covers every calendar month once
+    rate_floor = _shift_month(this_month, -6).isoformat()
+    DEFAULT_RES_KWH, DEFAULT_COM_KWH = 1100.0, 2500.0
 
-    # Real trailing usage per ESI ID from the last 5 statement months;
-    # flat Texas averages are only the fallback for meters never seen
-    # on a statement.
-    DEFAULT_RES_KWH = 1100.0
-    DEFAULT_COM_KWH = 2500.0
-
-    def _default_kwh(meter_type: str) -> float:
-        return DEFAULT_COM_KWH if "commercial" in (meter_type or "").lower() else DEFAULT_RES_KWH
-
-    usage_floor = (today.replace(day=1) - timedelta(days=155)).isoformat()
-    usage_sum: dict = {}
-    usage_months: dict = {}
-    usage_latest: dict = {}         # per ESI: actual kWh from its most recent statement
-    usage_latest_month: dict = {}   # per ESI: the billing month of that statement
-    u_off = 0
+    # ── 1. Statement history: per meter per month ───────────────────────────
+    meter: dict = {}            # es -> {month(YYYY-MM): [kwh, amount]}
+    stmt_supplier: dict = {}    # es -> (month, canonical supplier of latest statement)
+    month_rows: dict = {}       # month -> row count (to spot partially imported months)
+    off = 0
     while True:
-        page = db.table("actual_commissions").select("raw_esiid, raw_kwh, billing_month") \
-            .gte("billing_month", usage_floor).order("id").range(u_off, u_off + 999).execute().data or []
+        page = db.table("actual_commissions") \
+            .select("raw_esiid, raw_kwh, raw_amount, billing_month, suppliers(name)") \
+            .gte("billing_month", window_floor).order("id").range(off, off + 999).execute().data or []
         for r in page:
-            kwh = float(r.get("raw_kwh") or 0)
             es = re.sub(r"\D", "", r.get("raw_esiid") or "")
-            if not es or kwh <= 0:
+            m = (r.get("billing_month") or "")[:7]
+            if not es or not m:
                 continue
-            usage_sum[es] = usage_sum.get(es, 0.0) + kwh
-            month = r.get("billing_month") or ""
-            usage_months.setdefault(es, set()).add(month[:7])
-            # keep the most recent statement's actual usage for this meter
-            if month > usage_latest_month.get(es, ""):
-                usage_latest_month[es] = month
-                usage_latest[es] = kwh
+            month_rows[m] = month_rows.get(m, 0) + 1
+            cell = meter.setdefault(es, {}).setdefault(m, [0.0, 0.0])
+            cell[0] += float(r.get("raw_kwh") or 0)
+            cell[1] += float(r.get("raw_amount") or 0)
+            sup = canon_supplier((r.get("suppliers") or {}).get("name"))
+            if m > stmt_supplier.get(es, ("", ""))[0]:
+                stmt_supplier[es] = (m, sup)
         if len(page) < 1000:
             break
-        u_off += 1000
-    usage_avg = {es: usage_sum[es] / len(m) for es, m in usage_months.items() if m}
+        off += 1000
 
-    monthly: dict = {}
-    by_supplier: dict = {}
-    contributing = 0
-    skipped = 0
-    usage_based = 0
-    active_esiids: set = set()   # every active deal's ESI, for actual-usage totals
-    not_projected = {"expired_or_month_to_month": 0, "missing_adder": 0, "missing_end_date": 0}
+    # A month with under half the typical row count is still being imported —
+    # keep its rows for meters, but not for the seasonal curve.
+    typical = _median(list(month_rows.values())) if month_rows else 0
+    complete_months = {m for m, n in month_rows.items() if typical and n >= 0.5 * typical}
 
-    def _next_month(d: date) -> date:
-        return (d.replace(day=28) + timedelta(days=4)).replace(day=1)
+    # ── 2. Seasonal index by calendar month (same-meter ratios) ─────────────
+    def _ratios(min_months: int) -> dict:
+        acc: dict = {i: [] for i in range(1, 13)}
+        for es, months in meter.items():
+            pts = [(m, v[0]) for m, v in months.items() if m in complete_months and v[0] > 0]
+            if len(pts) < min_months:
+                continue
+            mean = sum(k for _, k in pts) / len(pts)
+            for m, k in pts:
+                acc[int(m[5:7])].append(k / mean)
+        return acc
 
-    def _project(kwh: float, adder: float, end_d: date, supplier: str):
-        nonlocal contributing
-        if not kwh or not adder or end_d <= today:
-            return
-        commission_mo = kwh * adder
-        contributing += 1
-        cur = today.replace(day=1)
-        while cur <= end_d and cur < cutoff:
-            key = cur.strftime("%Y-%m")
-            monthly[key] = monthly.get(key, 0) + commission_mo
-            by_supplier[supplier] = by_supplier.get(supplier, 0) + commission_mo
-            cur = _next_month(cur)
+    ratios = _ratios(11)
+    seasonal_meters = min((len(v) for v in ratios.values()), default=0)
+    if seasonal_meters < 100:
+        ratios = _ratios(8)
+        seasonal_meters = min((len(v) for v in ratios.values()), default=0)
+    index = {i: (_median(v) if len(v) >= 20 else 1.0) for i, v in ratios.items()}
+    mean_idx = sum(index.values()) / 12
+    index = {i: v / mean_idx for i, v in index.items()} if mean_idx else {i: 1.0 for i in index}
 
-    # ── Source 1: lead_deals (real usage, else est_kwh) ─────────────────────
+    # ── 3. Per-meter baseline kWh (deseasonalized) and observed paid rate ──
+    base: dict = {}
+    meter_rate: dict = {}
+    usage_latest: dict = {}
+    usage_latest_month: dict = {}
+    for es, months in meter.items():
+        recent = [(m, v) for m, v in months.items() if m >= window_floor[:7] and v[0] > 0]
+        if recent:
+            base[es] = sum(v[0] / index[int(m[5:7])] for m, v in recent) / len(recent)
+            lm = max(recent, key=lambda t: t[0])
+            usage_latest[es], usage_latest_month[es] = lm[1][0], lm[0]
+        rates = [v[1] / v[0] for m, v in months.items()
+                 if m >= rate_floor[:7] and v[0] > 0 and v[1] > 0 and 0.0005 <= v[1] / v[0] <= 0.05]
+        if rates:
+            meter_rate[es] = _median(rates)
+
+    # ── 4. Active deals ────────────────────────────────────────────────────
+    deals: list = []
     ld_offset = 0
     while True:
-        rows = db.table("lead_deals").select(
-            "esiid, est_kwh, adder, end_date, supplier, status"
-        ).eq("status", "Active").range(ld_offset, ld_offset + 999).execute().data or []
+        rows = db.table("lead_deals").select("esiid, est_kwh, adder, end_date, supplier, status") \
+            .eq("status", "Active").range(ld_offset, ld_offset + 999).execute().data or []
         for d in rows:
-            es = re.sub(r"\D", "", d.get("esiid") or "")
-            if es:
-                active_esiids.add(es)
-            real = usage_avg.get(es)
-            kwh   = real or float(d.get("est_kwh") or 0)
-            adder = float(d.get("adder") or 0)
-            end_raw = (d.get("end_date") or "")[:10]
-            if not adder:
-                not_projected["missing_adder"] += 1
-                skipped += 1
-                continue
-            if adder > 0.05 or adder < 0.0005:
-                not_projected["suspect_adder"] = not_projected.get("suspect_adder", 0) + 1
-                skipped += 1
-                continue
-            if not end_raw:
-                not_projected["missing_end_date"] += 1
-                skipped += 1
-                continue
-            if not kwh:
-                skipped += 1
-                continue
-            try:
-                end_d = datetime.strptime(end_raw, "%Y-%m-%d").date()
-            except Exception:
-                skipped += 1
-                continue
-            if end_d <= today:
-                not_projected["expired_or_month_to_month"] += 1
-                skipped += 1
-                continue
-            if real:
-                usage_based += 1
-            _project(kwh, adder, end_d, d.get("supplier") or "Unknown")
+            deals.append({"es": re.sub(r"\D", "", d.get("esiid") or ""), "adder": float(d.get("adder") or 0),
+                          "end": (d.get("end_date") or "")[:10], "supplier": d.get("supplier"),
+                          "fallback_kwh": float(d.get("est_kwh") or 0) or DEFAULT_RES_KWH})
         if len(rows) < 1000:
             break
         ld_offset += 1000
-
-    # ── Source 2: crm_deals (real usage, else meter-type average) ───────────
     cd_offset = 0
     while True:
-        rows = db.table("crm_deals").select(
-            "esiid, adder, meter_type, contract_end_date, provider, deal_status"
-        ).eq("deal_status", "ACTIVE").range(cd_offset, cd_offset + 999).execute().data or []
+        rows = db.table("crm_deals").select("esiid, adder, meter_type, contract_end_date, provider, deal_status") \
+            .eq("deal_status", "ACTIVE").range(cd_offset, cd_offset + 999).execute().data or []
         for d in rows:
-            es = re.sub(r"\D", "", d.get("esiid") or "")
-            if es:
-                active_esiids.add(es)
-            adder = float(d.get("adder") or 0)
-            if not adder:
-                not_projected["missing_adder"] += 1
-                skipped += 1
-                continue
-            if adder > 0.05 or adder < 0.0005:
-                not_projected["suspect_adder"] = not_projected.get("suspect_adder", 0) + 1
-                skipped += 1
-                continue
-            end_raw = (d.get("contract_end_date") or "")[:10]
-            if not end_raw:
-                not_projected["missing_end_date"] += 1
-                skipped += 1
-                continue
-            try:
-                end_d = datetime.strptime(end_raw, "%Y-%m-%d").date()
-            except Exception:
-                skipped += 1
-                continue
-            if end_d <= today:
-                not_projected["expired_or_month_to_month"] += 1
-                skipped += 1
-                continue
-            real = usage_avg.get(es)
-            kwh = real or _default_kwh(d.get("meter_type"))
-            if real:
-                usage_based += 1
-            _project(kwh, adder, end_d, d.get("provider") or "Unknown")
+            com = "commercial" in (d.get("meter_type") or "").lower()
+            deals.append({"es": re.sub(r"\D", "", d.get("esiid") or ""), "adder": float(d.get("adder") or 0),
+                          "end": (d.get("contract_end_date") or "")[:10], "supplier": d.get("provider"),
+                          "fallback_kwh": DEFAULT_COM_KWH if com else DEFAULT_RES_KWH})
         if len(rows) < 1000:
             break
         cd_offset += 1000
 
+    def _deal_supplier(d: dict) -> str:
+        st = stmt_supplier.get(d["es"])
+        return st[1] if st else canon_supplier(d["supplier"])
+
+    # ── 5. Supplier realization: observed paid rate vs contract adder ───────
+    real_acc: dict = {}
+    for d in deals:
+        r = meter_rate.get(d["es"])
+        if r and 0.0005 <= d["adder"] <= 0.05:
+            real_acc.setdefault(_deal_supplier(d), []).append(r / d["adder"])
+    realization = {s: max(0.5, min(1.1, _median(v))) for s, v in real_acc.items() if len(v) >= 10}
+
+    # ── 6. Project ─────────────────────────────────────────────────────────
+    monthly: dict = {}
+    by_supplier: dict = {}
+    contributing = usage_based = skipped = 0
+    rate_sources = {"meter_observed": 0, "contract_adjusted": 0, "contract": 0}
+    not_projected = {"expired_or_month_to_month": 0, "missing_adder": 0, "missing_end_date": 0, "suspect_adder": 0}
+    active_esiids: set = set()
+
+    for d in deals:
+        es = d["es"]
+        if es:
+            active_esiids.add(es)
+        observed = meter_rate.get(es)
+        adder = d["adder"]
+        if not observed:
+            if not adder:
+                not_projected["missing_adder"] += 1; skipped += 1; continue
+            if adder > 0.05 or adder < 0.0005:
+                not_projected["suspect_adder"] += 1; skipped += 1; continue
+        if not d["end"]:
+            not_projected["missing_end_date"] += 1; skipped += 1; continue
+        try:
+            end_d = datetime.strptime(d["end"], "%Y-%m-%d").date()
+        except Exception:
+            skipped += 1; continue
+        if end_d <= today:
+            not_projected["expired_or_month_to_month"] += 1; skipped += 1; continue
+
+        supplier = _deal_supplier(d)
+        if observed:
+            rate = observed; rate_sources["meter_observed"] += 1
+        elif supplier in realization:
+            rate = adder * realization[supplier]; rate_sources["contract_adjusted"] += 1
+        else:
+            rate = adder; rate_sources["contract"] += 1
+        kwh_base = base.get(es)
+        if kwh_base:
+            usage_based += 1
+        else:
+            kwh_base = d["fallback_kwh"]
+        if not kwh_base or not rate:
+            skipped += 1; continue
+
+        contributing += 1
+        cur = this_month
+        while cur <= end_d and cur < cutoff:
+            amt = kwh_base * index[cur.month] * rate
+            key = cur.strftime("%Y-%m")
+            monthly[key] = monthly.get(key, 0.0) + amt
+            by_supplier[supplier] = by_supplier.get(supplier, 0.0) + amt
+            cur = _shift_month(cur, 1)
+
     sorted_months = sorted(monthly.keys())
     total = sum(monthly.values())
-
-    # Actual usage you're getting paid on: for each active-deal ESI that
-    # appears on a statement, take the kWh from its MOST RECENT monthly
-    # commission statement, and sum across the active book. Fallback
-    # estimates are excluded — this is the real metered usage billed on.
     usage_esiids = active_esiids & usage_latest.keys()
     actual_usage_kwh_mo = round(sum(usage_latest[es] for es in usage_esiids))
-    latest_statement_month = max(
-        (usage_latest_month[es] for es in usage_esiids), default=None)
+    latest_statement_month = max((usage_latest_month[es] for es in usage_esiids), default=None)
+    MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
 
     return {
         "monthly": [{"month": m, "amount": round(monthly[m], 2)} for m in sorted_months],
         "by_supplier": [{"supplier": k, "amount": round(v, 2)} for k, v in sorted(by_supplier.items(), key=lambda x: -x[1])],
         "total_projected": round(total, 2),
         "avg_monthly": round(total / len(monthly), 2) if monthly else 0,
+        "next_12_total": round(sum(monthly[m] for m in sorted_months[:12]), 2),
         "contributing_deals": contributing,
         "usage_based_deals": usage_based,
         "total_in_report": contributing + skipped,
         "not_projected": not_projected,
         "months_out": len(sorted_months),
-        # Actual metered usage from the latest provider statement per meter,
-        # across the active book.
-        "actual_usage_kwh_mo": actual_usage_kwh_mo,          # latest-statement kWh billed on
-        "actual_usage_kwh_yr": actual_usage_kwh_mo * 12,     # annualized
-        "actual_usage_accounts": len(usage_esiids),          # active ESIs with statement usage
-        "active_accounts_total": len(active_esiids),         # all unique active ESIs
+        "horizon_months": FORECAST_MONTHS,
+        "rate_sources": rate_sources,
+        "realization": {k: round(v, 3) for k, v in sorted(realization.items())},
+        "seasonality": [{"month": MON[i - 1], "index": round(index[i], 3)} for i in range(1, 13)],
+        "seasonality_meters": seasonal_meters,
+        "statement_months_used": sorted(complete_months),
+        "actual_usage_kwh_mo": actual_usage_kwh_mo,
+        "actual_usage_kwh_yr": actual_usage_kwh_mo * 12,
+        "actual_usage_accounts": len(usage_esiids),
+        "active_accounts_total": len(active_esiids),
         "latest_statement_month": (latest_statement_month or "")[:7] or None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+_forecast_lock = threading.Lock()
+
+
+def _refresh_forecast_cache() -> None:
+    """Rebuild the forecast cache; no-op if a rebuild is already running."""
+    if not _forecast_lock.acquire(blocking=False):
+        return
+    try:
+        data = _build_revenue_forecast(get_client())
+        _FORECAST_CACHE["at"], _FORECAST_CACHE["data"] = datetime.now(timezone.utc), data
+    except Exception:
+        pass
+    finally:
+        _forecast_lock.release()
+
+
+def warm_revenue_forecast() -> None:
+    """Called at app startup so the first visit doesn't pay the build cost."""
+    threading.Thread(target=_refresh_forecast_cache, daemon=True).start()
+
+
+@router.get("/revenue-forecast")
+def get_revenue_forecast(refresh: bool = Query(False), user: UserContext = Depends(get_current_user)):
+    now = datetime.now(timezone.utc)
+    c = _FORECAST_CACHE
+    fresh = c["data"] is not None and c["at"] and now - c["at"] < _FORECAST_TTL
+    if fresh and not refresh:
+        return c["data"]
+    if c["data"] is not None and not refresh:
+        # stale: serve what we have, rebuild in the background
+        threading.Thread(target=_refresh_forecast_cache, daemon=True).start()
+        return c["data"]
+    _refresh_forecast_cache()
+    if c["data"] is None:
+        raise HTTPException(status_code=503, detail="Forecast could not be built — try again shortly.")
+    return c["data"]
+
 
 @router.get("/supplier-breakdown")
 def supplier_breakdown(billing_month: Optional[str] = Query(None), user: UserContext = Depends(get_current_user)):
