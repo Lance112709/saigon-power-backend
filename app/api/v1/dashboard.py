@@ -376,6 +376,7 @@ def _build_revenue_forecast(db) -> dict:
     meter: dict = {}            # es -> {month(YYYY-MM): [kwh, amount]}
     stmt_supplier: dict = {}    # es -> (month, canonical supplier of latest statement)
     month_rows: dict = {}       # month -> row count (to spot partially imported months)
+    actual_amount: dict = {}    # month -> $ actually paid by providers (all statements)
     off = 0
     while True:
         page = db.table("actual_commissions") \
@@ -387,6 +388,7 @@ def _build_revenue_forecast(db) -> dict:
             if not es or not m:
                 continue
             month_rows[m] = month_rows.get(m, 0) + 1
+            actual_amount[m] = actual_amount.get(m, 0.0) + float(r.get("raw_amount") or 0)
             cell = meter.setdefault(es, {}).setdefault(m, [0.0, 0.0])
             cell[0] += float(r.get("raw_kwh") or 0)
             cell[1] += float(r.get("raw_amount") or 0)
@@ -538,6 +540,13 @@ def _build_revenue_forecast(db) -> dict:
 
     return {
         "monthly": [{"month": m, "amount": round(monthly[m], 2)} for m in sorted_months],
+        # what providers actually paid, by statement month, for the trailing window
+        # (complete=False means that month's statements are still being imported)
+        "actuals": [{"month": m, "amount": round(actual_amount[m], 2), "rows": month_rows.get(m, 0),
+                     "complete": m in complete_months}
+                    for m in sorted(actual_amount) if m < this_month.strftime("%Y-%m")],
+        "received_last_12": round(sum(actual_amount[m] for m in sorted(
+            m for m in actual_amount if m in complete_months and m < this_month.strftime("%Y-%m"))[-12:]), 2),
         "by_supplier": [{"supplier": k, "amount": round(v, 2)} for k, v in sorted(by_supplier.items(), key=lambda x: -x[1])],
         "total_projected": round(total, 2),
         "avg_monthly": round(total / len(monthly), 2) if monthly else 0,
