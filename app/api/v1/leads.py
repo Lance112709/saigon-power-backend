@@ -697,8 +697,19 @@ def _build_dropped(db) -> tuple:
                  terminated_date=d.get("terminated_date"), end_date=d.get("contract_end_date"))
 
     still_paying.sort(key=lambda r: (r.get("supplier") or "", r.get("lead_name") or ""))
+
+    # Active book by contract start month, to reconstruct "active at start of month M"
+    # for churn rates: active_at(M) = active deals started before M + deals dropped in/after M started before M.
+    active_starts: list = []
+    for d in fetch_pages(db.table("crm_deals").select("esiid, contract_start_date").eq("deal_status", "ACTIVE")):
+        if digits(d.get("esiid")):
+            active_starts.append((d.get("contract_start_date") or "")[:7])
+    for d in fetch_pages(db.table("lead_deals").select("esiid, start_date").eq("status", "Active")):
+        if digits(d.get("esiid")):
+            active_starts.append((d.get("start_date") or "")[:7])
     extra = {"excluded": excluded, "still_paying": still_paying,
-             "paid_months_checked": sorted({m for m in paid.values()}, reverse=True)}
+             "paid_months_checked": sorted({m for m in paid.values()}, reverse=True),
+             "active_starts": active_starts, "active_book": len(active_starts)}
     return rows, extra
 
 
@@ -750,6 +761,16 @@ def list_dropped_deals(
             b["count"] += 1
             if d.get("provider_status"):
                 b["provider_reported"] += 1
+    # Churn rate per month = drops in M / book active at the start of M
+    # (only meaningful unfiltered; with a supplier/agent filter it's that slice's drops over the whole book).
+    starts_sorted = sorted(sm for sm in extra["active_starts"] if sm)
+    drop_starts = sorted((str(d.get("start_date") or "")[:7], d["drop_month"]) for d in merged if d["drop_month"])
+    import bisect
+    for m, b in by_month.items():
+        active_then = bisect.bisect_left(starts_sorted, m)                      # active now, started before M
+        active_then += sum(1 for sm, dm in drop_starts if sm and sm < m and dm >= m)  # dropped later, was active then
+        b["active_at_start"] = active_then
+        b["rate"] = round(b["count"] / active_then * 100, 2) if active_then else None
 
     if month:
         merged = [d for d in merged if d["drop_month"] == month]
@@ -761,6 +782,9 @@ def list_dropped_deals(
         "by_month": [{"month": m, **v} for m, v in sorted(by_month.items())],
         "excluded": extra["excluded"],
         "paid_months_checked": extra["paid_months_checked"],
+        "active_book": extra["active_book"],
+        # share of everything we ever had (active + dropped) that has dropped
+        "dropped_share": round(len(merged) / (len(merged) + extra["active_book"]) * 100, 1) if (len(merged) + extra["active_book"]) else None,
     }
     if user.is_manager:   # review list: inactive in the CRM but the provider is still paying
         summary["still_paying"] = extra["still_paying"]
