@@ -183,7 +183,11 @@ def load_deal_book(db) -> dict:
 
 
 def _addr_key(address, zipcode) -> str:
-    a = norm_addr(address)
+    """Street line + ZIP. Deals store the address in several shapes
+    ('19111 Giara Pony Trl, Tomball, Texas 77377' vs '19111 GIARA PONY TRL'),
+    so only the part before the first comma — the street — is compared."""
+    street = str(address or "").split(",")[0]
+    a = norm_addr(street)
     return f"{a}|{zip5(zipcode)}" if a else ""
 
 
@@ -283,12 +287,25 @@ def _prior_contract(deal: dict, by_esiid: dict, by_addr: dict):
         cands += by_esiid.get(deal["esiid"], [])
     if deal["addr_key"]:
         cands += by_addr.get(deal["addr_key"], [])
-    best = None
+    best, best_when = None, ""
     for o in cands:
-        if o["id"] == deal["id"] or not o["start"] or o["start"][:7] >= deal["start"][:7]:
+        if o["id"] == deal["id"]:
             continue
-        if best is None or o["start"] > best["start"]:
-            best = o
+        # evidence the other contract came first: it started in an earlier
+        # month; or it has no start date on file but ended around the time
+        # this one began (imported history often carries only the end date)
+        if o["start"]:
+            if o["start"][:7] >= deal["start"][:7]:
+                continue
+            when = o["start"]
+        elif o["end"] and o["end"] <= _plus_days(deal["start"], 60):
+            when = o["end"]
+        elif norm_name(o["status"]) == "renewed":
+            when = "0000"  # the Renew Deal button marked it — it was the previous contract
+        else:
+            continue
+        if best is None or when > best_when:
+            best, best_when = o, when
     return best
 
 

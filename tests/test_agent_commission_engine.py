@@ -379,3 +379,25 @@ def test_enrollment_bonus_by_segment_residential_vs_commercial():
                   "lead_deals": [lead_com], "crm_deals": [res, com, biz], "actual_commissions": [], "audit_log": []})
     j2 = calculate_month(db2, 2026, 8)["agents"]["Jennie Duong"]
     assert j2["total"] == 20.0 and enrollment_math(j2) == "4 enrolled × $5"
+
+
+def test_renewal_detected_from_imported_prior_contract_without_start_date():
+    """Cuc Hoang: the previous Discount Power contract was imported with only an
+    end date and RENEWED status, and its address lacks city/state — still a renewal."""
+    old = cdeal("old", "Lance Nguyen", "", "2026-09-07", "19111 GIARA PONY TRL", status="RENEWED", supplier="Discount Power")
+    old["esiid"] = "1008901025000971030121"
+    new = cdeal("new", "Nga Nguyen", "2026-09-04", "2029-09-04", "19111 Giara Pony Trl, Tomball, Texas 77377", supplier="Budget Power")
+    new["esiid"] = "1008901025000971030121"
+    db = FakeDB({"sales_agents": [agent("Nga Nguyen", {"components": [{"type": "flat_per_enrollment", "amount": 5}]})],
+                 "lead_deals": [], "crm_deals": [old, new], "actual_commissions": [], "audit_log": []})
+    nga = calculate_month(db, 2026, 9)["agents"]["Nga Nguyen"]
+    d = nga["deals"][0]
+    assert d["enrollment_type"] == "renewal" and d["prior_contract"]["id"] == "old" and nga["renewals"] == 1
+    assert "renewal — prior Discount Power" in d["applied"] and d["commission"] == 5.0 and not d["held"]
+    # address-only match (no ESI ID on either) with the city/state suffix still works
+    old2 = cdeal("old2", "Lance Nguyen", "", "2026-09-07", "19111 GIARA PONY TRL", status="RENEWED", supplier="Discount Power")
+    new2 = cdeal("new2", "Nga Nguyen", "2026-09-04", "2029-09-04", "19111 Giara Pony Trl, Tomball, Texas 77377", supplier="Budget Power")
+    db2 = FakeDB({"sales_agents": [agent("Nga Nguyen", {"components": [{"type": "flat_per_enrollment", "amount": 5}]})],
+                  "lead_deals": [], "crm_deals": [old2, new2], "actual_commissions": [], "audit_log": []})
+    r2 = calculate_month(db2, 2026, 9)["agents"]["Nga Nguyen"]
+    assert r2["renewals"] == 1 and r2["held"] == 0 and r2["total"] == 5.0
