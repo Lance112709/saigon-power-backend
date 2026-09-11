@@ -308,6 +308,73 @@ def _xlsx_response(rec: dict, summary, detail, detail_sheet: str):
         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
+# ── Paid-to-agents summary (month range / YTD) ───────────────────────────────
+
+@router.get("/paid-summary")
+def paid_summary(
+    frm: Optional[str] = Query(None, alias="from"),  # YYYY-MM (commission period)
+    to:  Optional[str] = Query(None),                # YYYY-MM inclusive
+    user: UserContext = Depends(require_admin),
+):
+    """How much has gone to agents: totals by month and by agent over a range
+    of commission periods. 'paid' = records marked paid (with the payment
+    date); 'owed' = approved / closed out but not yet paid; 'pending' = only
+    calculated so far. Omit both bounds for all time."""
+    import re as _re
+    from app.services.reconciliation_v2 import fetch_all
+
+    def key(y, m): return y * 100 + m
+    lo = hi = None
+    for label, val in (("from", frm), ("to", to)):
+        if val:
+            if not _re.fullmatch(r"20\d{2}-\d{2}", val):
+                raise HTTPException(status_code=400, detail=f"{label} must be YYYY-MM")
+            y, m = int(val[:4]), int(val[5:7])
+            if label == "from": lo = key(y, m)
+            else: hi = key(y, m)
+
+    db = get_client()
+    rows = fetch_all(db, "agent_commissions",
+                     "id,agent_name,year,month,status,total_commission,total_deals,paid_at,paid_by,approved_at,closed_out_at")
+    rows = [r for r in rows if (lo is None or key(r["year"], r["month"]) >= lo)
+                           and (hi is None or key(r["year"], r["month"]) <= hi)]
+
+    def bucket(status):
+        return "paid" if status == "paid" else ("owed" if status in ("approved", "closed_out") else "pending")
+
+    by_month, by_agent = {}, {}
+    totals = {"paid": 0.0, "owed": 0.0, "pending": 0.0}
+    for r in rows:
+        amt = float(r.get("total_commission") or 0)
+        b = bucket(r.get("status"))
+        totals[b] += amt
+        m = by_month.setdefault((r["year"], r["month"]), {"year": r["year"], "month": r["month"],
+                                                          "paid": 0.0, "owed": 0.0, "pending": 0.0, "agents": set()})
+        m[b] += amt; m["agents"].add(r["agent_name"])
+        a = by_agent.setdefault(norm_name(r["agent_name"]), {"agent_name": r["agent_name"], "paid": 0.0, "owed": 0.0,
+                                                             "pending": 0.0, "months_paid": 0, "last_paid_at": None})
+        a[b] += amt
+        if b == "paid":
+            a["months_paid"] += 1
+            if r.get("paid_at") and (a["last_paid_at"] is None or r["paid_at"] > a["last_paid_at"]):
+                a["last_paid_at"] = r["paid_at"]
+
+    months = sorted(by_month.values(), key=lambda m: (m["year"], m["month"]))
+    for m in months:
+        m["agents"] = len(m["agents"])
+        for k in ("paid", "owed", "pending"): m[k] = round(m[k], 2)
+    agents = sorted(by_agent.values(), key=lambda a: (-a["paid"], -a["owed"], a["agent_name"]))
+    for a in agents:
+        for k in ("paid", "owed", "pending"): a[k] = round(a[k], 2)
+    detail = sorted(({"id": r["id"], "agent_name": r["agent_name"], "year": r["year"], "month": r["month"],
+                      "status": r["status"], "total_commission": round(float(r.get("total_commission") or 0), 2),
+                      "paid_at": r.get("paid_at"), "paid_by": r.get("paid_by")} for r in rows),
+                    key=lambda r: (-r["year"], -r["month"], r["agent_name"]))
+    return {"from": frm, "to": to, "records": len(rows),
+            "totals": {k: round(v, 2) for k, v in totals.items()},
+            "by_month": months, "by_agent": agents, "detail": detail}
+
+
 # ── Logs ──────────────────────────────────────────────────────────────────────
 
 @router.get("/logs")
