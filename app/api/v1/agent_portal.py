@@ -215,7 +215,8 @@ def book(agent: Optional[str] = Query(None), user: UserContext = Depends(get_cur
     db = get_client()
     name = _resolve_agent(user, agent)
     deals = _my_deals(db, name)
-    paid_recent = _recent_paid_esiids(db)
+    # Paid-on-statement flags are admin-only; everyone else gets the bare book.
+    paid_recent = _recent_paid_esiids(db) if user.is_admin else {}
     labels = list(paid_recent.keys())
 
     out = []
