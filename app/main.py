@@ -202,6 +202,21 @@ except Exception:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Finish any statement import a previous container was killed in the middle
+    # of (deploys land while imports run; the batch row + stored file survive).
+    def _resume_imports_later():
+        import time
+        time.sleep(25)  # let the app settle first
+        try:
+            from app.api.v1.uploads import resume_stuck_imports
+            resume_stuck_imports()
+        except Exception:
+            pass
+    try:
+        import threading
+        threading.Thread(target=_resume_imports_later, daemon=True).start()
+    except Exception:
+        pass
     if _scheduler_ok:
         try:
             scheduler.start()

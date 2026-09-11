@@ -11,7 +11,7 @@ backend restart between upload and confirm no longer strands the batch.
 """
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Body, Depends, Query
@@ -604,33 +604,26 @@ def poll_email(lookback_days: Optional[int] = None, sender: Optional[str] = None
                       lookback_days=lookback_days, from_filter=sender, mailbox=mailbox)
 
 
-@router.post("/{id}/reimport")
-def reimport_batch(id: str, sync_deals: bool = True, clamp_before: Optional[str] = None,
-                   user: UserContext = Depends(require_admin)):
-    """Re-parse a stored statement with the current parsers and rebuild its
-    rows + reconciliation in place (same batch id). Use after a parser fix.
-    sync_deals=false imports the ledger only (no deal status/ESIID/date writes).
-    clamp_before=YYYY-MM relabels stray rows older than that month onto it."""
+def reimport_core(db, batch: dict, actor: str, sync_deals: bool = True, clamp_before: Optional[str] = None) -> dict:
+    """Re-parse a stored statement with the current parsers and rebuild its rows
+    + reconciliation in place. Shared by the /reimport endpoint and the
+    startup resume of batches a container restart left in 'parsing'."""
     from app.services.file_parser.provider_parsers import detect_and_parse
-    db = get_client()
-    res = db.table("upload_batches").select("*").eq("id", id).limit(1).execute().data
-    if not res:
-        raise HTTPException(status_code=404, detail="Upload not found")
-    batch = res[0]
+    id = batch["id"]
     path = (batch.get("storage_path") or "").split("/", 1)[-1]
     if not path:
-        raise HTTPException(status_code=400, detail="Batch has no stored file")
+        raise ValueError("Batch has no stored file")
     try:
         blob = db.storage.from_(STATEMENTS_BUCKET).download(path)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read stored file: {str(e)[:150]}")
+        raise ValueError(f"Could not read stored file: {str(e)[:150]}")
     parsed = detect_and_parse(blob, batch.get("original_filename") or path)
     if not parsed:
-        raise HTTPException(status_code=400, detail="Stored file no longer fingerprints as a known provider format")
+        raise ValueError("Stored file no longer fingerprints as a known provider format")
 
     if clamp_before:
         if not re.fullmatch(r"20\d{2}-(0[1-9]|1[0-2])", clamp_before):
-            raise HTTPException(status_code=400, detail="clamp_before must be YYYY-MM")
+            raise ValueError("clamp_before must be YYYY-MM")
         clamped = [r for r in parsed["rows"] if r.get("statement_label") and r["statement_label"] < clamp_before]
         for r in clamped:
             r["statement_label"] = clamp_before
@@ -659,10 +652,9 @@ def reimport_batch(id: str, sync_deals: bool = True, clamp_before: Optional[str]
                               "statement_label": parsed["statement_label"], "labels": parsed["labels"],
                               "detector": "fingerprint-v1",
                               "reimported": {"at": datetime.now(timezone.utc).isoformat(),
-                                             "by": user.email, "rows_removed": removed,
+                                             "by": actor, "rows_removed": removed,
                                              "sync_deals": sync_deals, "clamp_before": clamp_before}},
     }).eq("id", id).execute()
-    actor = user.email or "admin"
     result = _process_rows(db, id, parsed["provider_group"], sup_id, parsed["rows"],
                            batch.get("amount_received"), actor, parsed["warnings"], parsed["going_final"],
                            sync_deals=sync_deals)
@@ -672,6 +664,53 @@ def reimport_batch(id: str, sync_deals: bool = True, clamp_before: Optional[str]
           reason="Statement re-parsed with current parsers", actor=actor)
     result["rows_removed"] = removed
     return result
+
+
+@router.post("/{id}/reimport")
+def reimport_batch(id: str, sync_deals: bool = True, clamp_before: Optional[str] = None,
+                   user: UserContext = Depends(require_admin)):
+    """Re-parse a stored statement with the current parsers and rebuild its
+    rows + reconciliation in place (same batch id). Use after a parser fix.
+    sync_deals=false imports the ledger only (no deal status/ESIID/date writes).
+    clamp_before=YYYY-MM relabels stray rows older than that month onto it."""
+    db = get_client()
+    res = db.table("upload_batches").select("*").eq("id", id).limit(1).execute().data
+    if not res:
+        raise HTTPException(status_code=404, detail="Upload not found")
+    try:
+        return reimport_core(db, res[0], user.email or "admin", sync_deals=sync_deals, clamp_before=clamp_before)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+def resume_stuck_imports(min_age_minutes: int = 3, max_batches: int = 5) -> list:
+    """Finish statements a container restart left in 'parsing' (a deploy that
+    lands mid-import kills the pipeline; the batch row and stored file survive).
+    Called from app startup in a background thread; re-runs are hash/idempotent."""
+    db = get_client()
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=min_age_minutes)).isoformat()
+    stuck = db.table("upload_batches").select("*").eq("status", "parsing") \
+        .lt("updated_at", cutoff).order("created_at").limit(max_batches).execute().data or []
+    done = []
+    for b in stuck:
+        meta = b.get("ai_column_mapping") or {}
+        if not isinstance(meta, dict) or not meta.get("auto"):
+            continue  # review-path batches wait for the admin's Confirm, not for us
+        attempts = int(meta.get("resume_attempts") or 0)
+        if attempts >= 3:
+            continue
+        db.table("upload_batches").update({"ai_column_mapping": {**meta, "resume_attempts": attempts + 1},
+                                           "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", b["id"]).execute()
+        b["ai_column_mapping"] = {**meta, "resume_attempts": attempts + 1}
+        try:
+            r = reimport_core(db, b, actor="startup-resume", sync_deals=bool(meta.get("reimported", {}).get("sync_deals", True))
+                              if isinstance(meta.get("reimported"), dict) else True)
+            done.append({"id": b["id"], "file": b.get("original_filename"), "rows": r.get("rows_imported"),
+                         "total": r.get("total_affinity_amount")})
+        except Exception as e:
+            audit(db, "upload_batches", b["id"], "resume_failed", None, {"error": str(e)[:200]},
+                  reason="Startup resume of a stuck import failed", actor="startup-resume")
+    return done
 
 
 @router.post("/{id}/apply-statuses")
