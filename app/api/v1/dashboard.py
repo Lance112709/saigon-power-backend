@@ -609,6 +609,126 @@ def get_revenue_forecast(refresh: bool = Query(False), user: UserContext = Depen
     return c["data"]
 
 
+# ── Renewals & holdovers (admin dashboard) ──────────────────────────────────
+@router.get("/renewal-stats")
+def renewal_stats(user: UserContext = Depends(require_admin)):
+    """Renewed deals by month (month = start of the new contract) and holdovers:
+    active contracts past their end date with no newer deal on the meter —
+    customers still with the provider on the default / month-to-month rate."""
+    from app.api.v1.agent_portal import _recent_paid_esiids
+    db = get_client()
+    today = date.today()
+    digits = lambda e: re.sub(r"\D", "", e or "")
+
+    deals, off = [], 0
+    while True:
+        page = db.table("crm_deals").select(
+            "id, customer_id, esiid, provider, deal_status, contract_start_date, contract_end_date, "
+            "energy_rate, adder, sales_agent, provider_status, crm_customers(full_name)") \
+            .range(off, off + 999).execute().data or []
+        deals.extend(page)
+        if len(page) < 1000:
+            break
+        off += 1000
+    by_esi: dict = {}
+    for d in deals:
+        es = digits(d.get("esiid"))
+        if es:
+            by_esi.setdefault(es, []).append(d)
+
+    def newer_deals(d, statuses=None):
+        es = digits(d.get("esiid"))
+        start = d.get("contract_start_date") or ""
+        return [x for x in by_esi.get(es, []) if x["id"] != d["id"]
+                and (x.get("contract_start_date") or "") > start
+                and (statuses is None or x.get("deal_status") in statuses)]
+
+    # ── Renewals: RENEWED deal + the newer contract that replaced it ────────
+    ren_by_month: dict = {}
+    unpaired = 0
+    for d in deals:
+        if d.get("deal_status") != "RENEWED":
+            continue
+        nxt = newer_deals(d)
+        if not nxt:
+            unpaired += 1
+            continue
+        n = min(nxt, key=lambda x: x.get("contract_start_date") or "")
+        m = (n.get("contract_start_date") or "")[:7]
+        b = ren_by_month.setdefault(m, {"month": m, "count": 0, "by_provider": {}, "deals": []})
+        b["count"] += 1
+        prov = canon_supplier(n.get("provider"))
+        b["by_provider"][prov] = b["by_provider"].get(prov, 0) + 1
+        b["deals"].append({"customer_id": d.get("customer_id"),
+                           "customer": (d.get("crm_customers") or {}).get("full_name") or "",
+                           "provider": prov, "esiid": d.get("esiid"),
+                           "old_end": d.get("contract_end_date"), "new_start": n.get("contract_start_date"),
+                           "new_end": n.get("contract_end_date"), "new_rate": n.get("energy_rate"),
+                           "sales_agent": n.get("sales_agent") or d.get("sales_agent"), "deal_id": n["id"]})
+    months = sorted(ren_by_month)
+    this_m = today.strftime("%Y-%m")
+    window = {_shift_month(today.replace(day=1), -k).strftime("%Y-%m") for k in range(12)}
+    last12 = [m for m in months if m in window]
+
+    # ── Holdovers: ACTIVE, contract ended, nothing newer on the meter ───────
+    paid: dict = {}
+    for lb, esis in _recent_paid_esiids(db, months_back=3).items():
+        for e in esis:
+            n = digits(e)
+            if n and n not in paid:
+                paid[n] = lb
+    holdovers = []
+    bad_dates = 0
+    for d in deals:
+        end = (d.get("contract_end_date") or "")[:10]
+        if d.get("deal_status") != "ACTIVE" or not end or end >= today.isoformat():
+            continue
+        if end < "2015-01-01":
+            bad_dates += 1          # e.g. "0031-09-01" — a typo, not a 2,000-year holdover
+            continue
+        if newer_deals(d, {"ACTIVE", "FUTURE"}):
+            continue
+        es = digits(d.get("esiid"))
+        try:
+            days_over = (today - date.fromisoformat(end)).days
+        except Exception:
+            days_over = None
+        holdovers.append({"deal_id": d["id"], "customer_id": d.get("customer_id"),
+                          "customer": (d.get("crm_customers") or {}).get("full_name") or "",
+                          "provider": canon_supplier(d.get("provider")), "esiid": d.get("esiid"),
+                          "contract_end": end, "days_over": days_over,
+                          "rate": d.get("energy_rate"), "adder": d.get("adder"),
+                          "sales_agent": d.get("sales_agent"), "last_paid": paid.get(es),
+                          "still_paying": es in paid})
+    holdovers.sort(key=lambda h: (not h["still_paying"], h["contract_end"]))
+    hp: dict = {}
+    for h in holdovers:
+        b = hp.setdefault(h["provider"], {"provider": h["provider"], "count": 0, "still_paying": 0})
+        b["count"] += 1
+        b["still_paying"] += 1 if h["still_paying"] else 0
+
+    return {
+        "renewals": {
+            "by_month": [{"month": m, "count": ren_by_month[m]["count"],
+                          "by_provider": sorted(ren_by_month[m]["by_provider"].items(), key=lambda x: -x[1]),
+                          "deals": sorted(ren_by_month[m]["deals"], key=lambda x: x["customer"])} for m in months],
+            "last_12_months": last12,
+            "total_last_12": sum(ren_by_month[m]["count"] for m in last12),
+            "this_month": ren_by_month.get(this_m, {}).get("count", 0),
+            "upcoming": sum(ren_by_month[m]["count"] for m in months if m > this_m),
+            "marked_renewed_no_new_contract": unpaired,
+        },
+        "holdovers": {
+            "total": len(holdovers),
+            "still_paying": sum(1 for h in holdovers if h["still_paying"]),
+            "by_provider": sorted(hp.values(), key=lambda x: -x["count"]),
+            "paid_months_checked": sorted(set(paid.values()), reverse=True),
+            "bad_end_dates": bad_dates,
+            "deals": holdovers,
+        },
+    }
+
+
 @router.get("/supplier-breakdown")
 def supplier_breakdown(billing_month: Optional[str] = Query(None), user: UserContext = Depends(get_current_user)):
     """Per-provider expected vs received from the latest v2 reconciliation runs."""
