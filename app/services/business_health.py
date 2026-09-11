@@ -83,7 +83,7 @@ def build_business_health(db, months_back: int = 7) -> dict:
     runs = _v2_runs(db)
     sup_names = {r["supplier_id"]: (r.get("suppliers") or {}).get("name", "?") for r in runs}
     all_months = sorted({r["billing_month"][:7] for r in runs})
-    months = all_months[-months_back:]
+    months = all_months[-(months_back + 2):]   # +2: prev2 for the first plotted month, next for the last
 
     # month -> supplier -> esiid set (+ amounts/kwh for scorecards)
     membership: dict = {}
@@ -98,15 +98,24 @@ def build_business_health(db, months_back: int = 7) -> dict:
             k = float(row.get("raw_kwh") or 0)
             kwhs[(m, sid)] = kwhs.get((m, sid), 0.0) + k
 
-    # 1) growth: confirmed gains/losses per provider. A month is evaluated
-    # only with its neighbors present (billing-cycle bounce is not churn) and
-    # only for providers that reported in all the months involved.
+    # 1) growth: confirmed gains/losses for the WHOLE BOOK. Membership is the
+    # union of every provider's meters (ESI digits only), so a customer who
+    # moves between providers — e.g. the Budget Power book transferring to
+    # Discount Power in 2026-04 — is neither gained nor lost. Those moves are
+    # counted separately as "transfers". A month is evaluated only with its
+    # neighbors present (billing-cycle bounce is not churn) and only over
+    # providers that reported in prev, cur and next; per-provider flows are
+    # kept for the breakdown but never summed into the totals.
+    import re as _re
+    _digits = lambda e: _re.sub(r"\D", "", e or "")
     growth = []
     churn_samples = []
-    for i in range(1, len(months) - 1):
-        prev2 = months[i - 2] if i >= 2 else None
+    for i in range(2, len(months) - 1):          # need prev2, prev, cur, next
+        prev2 = months[i - 2]
         prev, cur, nxt = months[i - 1], months[i], months[i + 1]
-        g = {"month": cur, "gained": 0, "lost": 0, "net": 0, "by_provider": {}, "not_reporting": []}
+        g = {"month": cur, "gained": 0, "lost": 0, "net": 0, "transfers": 0, "book": 0,
+             "by_provider": {}, "not_reporting": []}
+        eligible = []
         for sid in set(membership[prev]) | set(membership[cur]):
             name = sup_names.get(sid, "?")
             if sid not in membership[cur]:
@@ -114,16 +123,39 @@ def build_business_health(db, months_back: int = 7) -> dict:
                 continue
             if sid not in membership[prev] or sid not in membership.get(nxt, {}):
                 continue  # can't confirm without neighbors
-            cf = confirmed_flow(
+            eligible.append(sid)
+            g["by_provider"][name] = confirmed_flow(
                 membership.get(prev2, {}).get(sid, set()) if prev2 else set(),
                 membership[prev][sid], membership[cur][sid], membership[nxt][sid])
-            g["gained"] += cf["gained"]
-            g["lost"] += cf["lost"]
-            g["net"] += cf["net"]
-            g["by_provider"][name] = cf
-            base = len(membership[prev][sid])
-            if base >= 20:
-                churn_samples.append(cf["lost"] / base)
+        def _union(m):
+            out = set()
+            for sid in eligible:
+                out |= {_digits(e) for e in membership.get(m, {}).get(sid, set())}
+            out.discard("")
+            return out
+        u_prev2 = _union(prev2) if prev2 else set()
+        u_prev, u_cur, u_nxt = _union(prev), _union(cur), _union(nxt)
+        cf = confirmed_flow(u_prev2, u_prev, u_cur, u_nxt)
+        g.update(cf)
+        full_prev = set()
+        for sid in membership[prev]:
+            full_prev |= {_digits(e) for e in membership[prev][sid]}
+        full_prev.discard("")
+        g["book"] = len(full_prev)                       # whole book last month (display)
+        g["measured_share"] = round(len(u_prev) / len(full_prev) * 100) if full_prev else 0
+        g["awaiting"] = sorted(sup_names.get(sid, "?") for sid in membership[prev]
+                               if sid not in eligible and sid in membership.get(cur, {}))
+        # transfers: meter paid in both months but by a different provider
+        owner_prev, owner_cur = {}, {}
+        for sid in eligible:
+            for e in membership[prev][sid]:
+                owner_prev[_digits(e)] = sid
+            for e in membership[cur][sid]:
+                owner_cur[_digits(e)] = sid
+        g["transfers"] = sum(1 for e, sid in owner_cur.items() if e in owner_prev and owner_prev[e] != sid)
+        # churn sample only when the providers we could confirm cover most of the book
+        if len(u_prev) >= 100 and full_prev and len(u_prev) / len(full_prev) >= 0.6:
+            churn_samples.append(cf["lost"] / len(u_prev))
         growth.append(g)
 
     # 2) book value from verified payments
