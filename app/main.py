@@ -67,6 +67,16 @@ def _run_email_ingest():
     except Exception:
         pass
 
+def _run_email_ingest_daily():
+    """Daily: the commission@ inbox too (NRG Commercial lands ~21st, Tara/Reliant/
+    APG&E mid-month) — 10-day lookback, hash-idempotent, so nothing waits for the
+    monthly run on the 8th any more."""
+    try:
+        from app.services.email_ingest import poll_inbox
+        poll_inbox(actor="email-ingest-daily", lookback_days=10)
+    except Exception:
+        pass
+
 def _run_lance_statements():
     """Daily: statements that providers mail to lance@ (Heritage, NRG residual,
     Hudson, Iron Horse, Chariot, Budget, NRG backpay)."""
@@ -152,6 +162,7 @@ try:
     # (Heritage ~5th, Chariot ~16th, Budget ~18th, Iron Horse ~19th, NRG ~21st,
     # Hudson ~25th) — one sender-filtered pass each morning catches every one
     # the day it lands; then the Chase deposit alerts are matched to statements.
+    scheduler.add_job(_run_email_ingest_daily, "cron", hour=10, minute=15)
     scheduler.add_job(_run_lance_statements, "cron", hour=10, minute=30)
     scheduler.add_job(_run_bank_alerts, "cron", hour=10, minute=45)
     # Phase 2 pricing automation: NRG emails the matrix each business morning;

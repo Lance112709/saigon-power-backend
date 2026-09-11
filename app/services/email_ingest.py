@@ -147,9 +147,10 @@ def poll_inbox(actor: str = "email-ingest", lookback_days: int = None,
                         # peek and must not use up the import budget (Chariot mails
                         # several a week and the statement sits behind them)
                         entry = {"file": fname, "from": sender, "subject": subject, "peek": _peek(blob, fname)}
-                        if from_filter:
-                            # targeted runs are parser work: keep the file so the new
-                            # layout can be inspected (statements bucket, unrecognized/)
+                        if True:
+                            # keep the file so a changed provider layout can be inspected
+                            # and a parser written without asking for the email again
+                            # (statements bucket, unrecognized/<hash16>.<ext>, deduped)
                             try:
                                 import hashlib
                                 from app.api.v1.uploads import _storage_put
