@@ -84,6 +84,7 @@ def load_deals(db, provider_group: str) -> dict:
         lead = d.get("leads") or {}
         deal = {
             "source": "lead_deals", "id": d["id"], "lead_id": d.get("lead_id"),
+            "provider": (d.get("supplier") or "").strip().lower(),
             "active": d.get("status") == "Active", "status": d.get("status"),
             "adder": float(d["adder"]) if d.get("adder") is not None else None,
             "est_kwh": float(d["est_kwh"]) if d.get("est_kwh") is not None else None,
@@ -106,6 +107,7 @@ def load_deals(db, provider_group: str) -> dict:
         cust = d.get("crm_customers") or {}
         deal = {
             "source": "crm_deals", "id": d["id"], "lead_id": None,
+            "provider": (d.get("provider") or "").strip().lower(),
             "active": d.get("deal_status") == "ACTIVE", "status": d.get("deal_status"),
             "adder": float(d["adder"]) if d.get("adder") is not None else None,
             "est_kwh": 2500.0 if d.get("meter_type") == "Commercial" else 1100.0,
@@ -414,8 +416,15 @@ def run_reconciliation_v2(db, supplier_id: str, provider_group: str, label: str,
         })
 
     # completeness: in-window active deals absent from this statement
+    # Budget's book moved to Direct Energy on 2026-04-15: from the May 2026
+    # statement on, Direct Energy deals are paid by NRG, so they are never
+    # "missing" from a Budget statement (they still match if Budget pays one).
+    def _expected_here(d):
+        if provider_group == "Budget Power" and label >= "2026-05" and d.get("provider") == "direct energy":
+            return False
+        return True
     missing_deals = [d for es, d in by_esiid.items()
-                     if d["active"] and es not in stmt_esiids and _in_window(d, label)]
+                     if d["active"] and es not in stmt_esiids and _in_window(d, label) and _expected_here(d)]
     prev_paid = set()
     if missing_deals:
         esiids = [d["esiid"] for d in missing_deals]
