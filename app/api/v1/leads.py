@@ -640,7 +640,7 @@ def _build_dropped(db) -> tuple:
                 paid[n] = lb
 
     rows, still_paying = [], []
-    excluded = {"superseded": 0, "no_esiid": 0, "converted_pipeline": 0, "no_evidence": 0, "still_paying": 0}
+    excluded = {"superseded": 0, "no_esiid": 0, "no_evidence": 0, "still_paying": 0}
 
     def consider(rec: dict, *, provider_status, provider_status_date, terminated_date, end_date):
         es = digits(rec.get("esiid"))
@@ -668,9 +668,8 @@ def _build_dropped(db) -> tuple:
                          .select("*, leads(first_name, last_name, phone, address, city, state, status)")
                          .eq("status", "Inactive").order("updated_at", desc=True)):
         lead = d.pop("leads", None) or {}
-        if (lead.get("status") or "").lower() == "converted":
-            excluded["converted_pipeline"] += 1      # the real deal lives in crm_deals
-            continue
+        # NOTE: converted leads keep their deals in lead_deals (conversion only flips
+        # leads.status), so an inactive pipeline deal is judged on evidence like any other.
         consider({**d, "source": "pipeline",
                   "lead_name": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
                   "lead_phone": lead.get("phone"),
