@@ -171,6 +171,29 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
     crm_active = crm_q.limit(1).execute().count or 0
     pipeline_active = active_deals.count or 0
 
+    # Distinct active meters (ESI digits) across both tables, and records with no ESI —
+    # so the card can say what the provider can actually pay on.
+    meters: set = set()
+    no_esiid = 0
+    ld_es_q = db.table("lead_deals").select("esiid").eq("status", "Active")
+    crm_es_q = db.table("crm_deals").select("esiid").eq("deal_status", "ACTIVE")
+    if is_agent:
+        ld_es_q = ld_es_q.in_("lead_id", scoped_ids)
+        crm_es_q = crm_es_q.ilike("sales_agent", f"%{agent_name}%")
+    for q in (ld_es_q, crm_es_q):
+        off = 0
+        while True:
+            page = q.range(off, off + 999).execute().data or []
+            for r in page:
+                es = re.sub(r"\D", "", r.get("esiid") or "")
+                if es:
+                    meters.add(es)
+                else:
+                    no_esiid += 1
+            if len(page) < 1000:
+                break
+            off += 1000
+
     # Real dollars: commission received per month from reconciliation-v2 runs
     finance = None
     if not is_agent:
@@ -216,6 +239,8 @@ def get_leads_stats(user: UserContext = Depends(get_current_user)):
         "finance":         finance,
         "portfolio": {
             "active_contracts": pipeline_active + crm_active,
+            "active_meters":    len(meters),
+            "no_esiid":         no_esiid,
             "total_kwh":        round(total_kwh, 2),
             "commission_mo":    round(commission_mo, 2),
             "at_risk":          expiring_n + expiring_crm_n,
