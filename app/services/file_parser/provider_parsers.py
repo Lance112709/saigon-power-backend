@@ -35,7 +35,9 @@ CHURN_KEYWORDS = ["going final", "final", "cancelled", "canceled", "churn",
                   "terminating", "dropping", "drop", "cancel", "inactive", "closed"]
 
 PROVIDER_SUPPLIERS = {
-    "Discount Power/Cirro": {"code": "NRG", "name": "Discount Power"},
+    # NRG's monthly residual report covers every NRG brand: Discount Power and
+    # Direct Energy (residential), Cirro and Reliant (commercial).
+    "Discount Power/Cirro": {"code": "NRG", "name": "NRG Residual (Discount Power / Direct Energy / Cirro / Reliant)"},
     "NRG Commercial":       {"code": "NRGBIZ", "name": "NRG Commercial"},
     "Tara Energy":          {"code": "TARA", "name": "Tara Energy"},
     "Reliant Energy":       {"code": "RELIANT", "name": "Reliant Energy"},
@@ -62,7 +64,8 @@ PAID_MONTH_GROUPS = {"Heritage Power"}
 CRM_PROVIDER_GROUPS = {
     "nrg": "NRG Commercial", "nrg energy": "NRG Commercial",
     "discount power": "Discount Power/Cirro", "cirro energy": "Discount Power/Cirro",
-    "value power": "Discount Power/Cirro",
+    "value power": "Discount Power/Cirro",   # legacy label: resi → Discount Power, commercial → Cirro (relabelled 2026-09-12)
+    "pulse power": "Discount Power/Cirro",   # Pulse Power commercial book moved to Cirro
     # Direct Energy is an NRG brand — its residuals arrive inside the NRG
     # residential statement (first seen Jun 2026, the ex-Budget book).
     "direct energy": "Discount Power/Cirro",
