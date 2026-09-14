@@ -6,6 +6,7 @@ alerts from reconciliation runs. Admins/managers can preview any agent's
 portal with ?agent=<name>.
 """
 import json
+import re
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 
@@ -65,34 +66,76 @@ def _my_deals(db, agent_name: str) -> list:
 
 
 def _my_deals_all(db, agent_name: str) -> list:
+    """This agent's deals across both deal tables, esiid-deduped the same way
+    load_deal_book() does (one deal per meter, active preferred) but fetched
+    with a sales_agent filter instead of scanning the whole company book —
+    the portal calls this three times per page load."""
     me = norm_name(agent_name)
-    book = load_deal_book(db)  # esiid-keyed deals
-    mine = [d | {"esiid": es} for es, d in book.items() if norm_name(d["agent"]) == me]
+    who = agent_name.strip()
+    book: dict = {}      # esiid digits → deal
+    no_esiid: list = []  # deals with no meter never appear in the esiid book
 
-    # deals with no ESIID never appear in the esiid book — fetch them too
+    def put(esiid, deal):
+        es = re.sub(r"\D", "", esiid or "")
+        if not es:
+            no_esiid.append(deal | {"esiid": ""})
+            return
+        cur = book.get(es)
+        if cur is None or (deal["active"] and not cur["active"]):
+            book[es] = deal
+
     for d in fetch_all(db, "lead_deals",
-                       "id,status,supplier,esiid,adder,rate_type,plan_name,sales_agent,end_date,start_date,"
-                       "leads(first_name,last_name)"):
-        if norm_name(d.get("sales_agent")) == me and not (d.get("esiid") or "").strip():
-            lead = d.get("leads") or {}
-            mine.append({"source": "lead_deals", "id": d["id"], "esiid": "",
-                         "active": d.get("status") == "Active", "agent": agent_name,
-                         "supplier": d.get("supplier") or "", "plan_type": d.get("rate_type") or d.get("plan_name") or "",
-                         "adder": float(d["adder"]) if d.get("adder") is not None else None,
-                         "customer": f"{lead.get('first_name','')} {lead.get('last_name','')}".strip(),
-                         "start": d.get("start_date"), "end": d.get("end_date")})
+                       "id,status,supplier,esiid,adder,rate_type,plan_name,contract_term,sales_agent,"
+                       "provider_status,start_date,end_date,service_address,leads(first_name,last_name)",
+                       filters=[("ilike", ("sales_agent", who))]):
+        if norm_name(d.get("sales_agent")) != me:
+            continue
+        lead = d.get("leads") or {}
+        put(d.get("esiid"), {
+            "address": d.get("service_address") or "",
+            "source": "lead_deals", "id": d["id"], "active": d.get("status") == "Active",
+            "provider_status": d.get("provider_status"), "start": d.get("start_date"), "end": d.get("end_date"),
+            "agent": agent_name,
+            "supplier": (d.get("supplier") or "").strip(),
+            "plan_type": (d.get("rate_type") or d.get("plan_name") or d.get("contract_term") or "").strip(),
+            "adder": float(d["adder"]) if d.get("adder") is not None else None,
+            "customer": f"{lead.get('first_name', '')} {lead.get('last_name', '')}".strip(),
+        })
     for d in fetch_all(db, "crm_deals",
-                       "id,deal_status,provider,esiid,adder,product_type,sales_agent,contract_start_date,"
-                       "contract_end_date,business_name,crm_customers(full_name)"):
-        if norm_name(d.get("sales_agent")) == me and not (d.get("esiid") or "").strip():
-            cust = d.get("crm_customers") or {}
-            mine.append({"source": "crm_deals", "id": d["id"], "esiid": "",
-                         "active": d.get("deal_status") == "ACTIVE", "agent": agent_name,
-                         "supplier": d.get("provider") or "", "plan_type": d.get("product_type") or "",
-                         "adder": float(d["adder"]) if d.get("adder") is not None else None,
-                         "customer": cust.get("full_name") or d.get("business_name") or "",
-                         "start": d.get("contract_start_date"), "end": d.get("contract_end_date")})
-    return mine
+                       "id,deal_status,provider,esiid,adder,product_type,contract_term,sales_agent,business_name,"
+                       "provider_status,contract_start_date,contract_end_date,service_address,crm_customers(full_name)",
+                       filters=[("ilike", ("sales_agent", who))]):
+        if norm_name(d.get("sales_agent")) != me:
+            continue
+        cust = d.get("crm_customers") or {}
+        put(d.get("esiid"), {
+            "address": d.get("service_address") or "",
+            "source": "crm_deals", "id": d["id"], "active": d.get("deal_status") == "ACTIVE",
+            "provider_status": d.get("provider_status"), "start": d.get("contract_start_date"),
+            "end": d.get("contract_end_date"),
+            "agent": agent_name,
+            "supplier": (d.get("provider") or "").strip(),
+            "plan_type": (d.get("product_type") or d.get("contract_term") or "").strip(),
+            "adder": float(d["adder"]) if d.get("adder") is not None else None,
+            "customer": cust.get("full_name") or d.get("business_name") or "",
+        })
+
+    # A meter whose live contract now belongs to another agent is theirs, not
+    # mine — same rule the company-wide book applies (active deal wins).
+    inactive_es = [es for es, d in book.items() if not d["active"]]
+    if inactive_es:
+        others_active = set()
+        for d in fetch_all(db, "lead_deals", "esiid,sales_agent", filters=[("eq", ("status", "Active"))]):
+            if norm_name(d.get("sales_agent")) != me:
+                others_active.add(re.sub(r"\D", "", d.get("esiid") or ""))
+        for d in fetch_all(db, "crm_deals", "esiid,sales_agent", filters=[("eq", ("deal_status", "ACTIVE"))]):
+            if norm_name(d.get("sales_agent")) != me:
+                others_active.add(re.sub(r"\D", "", d.get("esiid") or ""))
+        for es in inactive_es:
+            if es in others_active:
+                book.pop(es, None)
+
+    return [d | {"esiid": es} for es, d in book.items()] + no_esiid
 
 
 def _recent_paid_esiids(db, months_back: int = 2) -> dict:
