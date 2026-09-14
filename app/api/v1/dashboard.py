@@ -746,9 +746,9 @@ def renewal_stats(user: UserContext = Depends(require_manager)):
         b["count"] += 1
         b["still_paying"] += 1 if h["still_paying"] else 0
 
-    # Managers see the expired/holdover picture; renewal history stays admin-only.
+    # Managers and admins both get the full picture (renewals opened to managers 2026-09-14).
     return {
-        "renewals": None if not user.is_admin else {
+        "renewals": {
             "by_month": [{**{k: v for k, v in cohort[m].items() if k not in ("by_provider", "deals")},
                           "by_provider": sorted(([p, v["due"], v["renewed"]] for p, v in cohort[m]["by_provider"].items()), key=lambda x: -x[1]),
                           "deals": sorted(cohort[m]["deals"], key=lambda x: (x["outcome"] != "renewed", x["customer"]))}
