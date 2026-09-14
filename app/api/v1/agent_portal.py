@@ -129,8 +129,11 @@ def overview(agent: Optional[str] = Query(None), user: UserContext = Depends(get
     paid_last_month = len(my_esiids & paid_recent.get(latest_label, set())) if latest_label else 0
 
     since = _book_from(db, name)
-    comms = _my_commissions(db, name, since, limit=1)
+    comms = _my_commissions(db, name, since, limit=240)
     last_comm = comms[0] if comms else None
+    paid = [c for c in comms if c.get("status") == "paid"]
+    total_received = round(sum(float(c.get("total_commission") or 0) for c in paid), 2)
+    last_paid = paid[0] if paid else None  # newest commission month that has been paid
 
     plans = load_agent_plans(db)
     my_plan = plans.get(norm_name(name))
@@ -144,6 +147,10 @@ def overview(agent: Optional[str] = Query(None), user: UserContext = Depends(get
         "latest_statement_month": latest_label,
         "renewals_60d": renewals_60d,
         "last_commission": last_comm,
+        "total_received": total_received,  # sum of every paid commission month in the visible book
+        "paid_months": len(paid),
+        "last_paid": {"month": last_paid["month"], "year": last_paid["year"],
+                      "amount": last_paid["total_commission"], "paid_at": last_paid.get("paid_at")} if last_paid else None,
         "plan_components": components,
         "has_plan": bool(components),
         "book_from": since,
