@@ -45,7 +45,8 @@ def _book_from(db, agent_name: str) -> Optional[str]:
     agent's enrollments whose contract start is on/after that date (and
     payouts from that month on). None = full history."""
     try:
-        rows = fetch_all(db, "sales_agents", "name,portal_book_from")
+        rows = (db.table("sales_agents").select("name,portal_book_from")
+                .ilike("name", agent_name.strip()).limit(5).execute().data or [])
     except Exception:  # column not migrated yet
         return None
     me = norm_name(agent_name)
@@ -56,13 +57,24 @@ def _book_from(db, agent_name: str) -> Optional[str]:
     return None
 
 
+_DEALS_CACHE: dict = {}          # norm agent name → (monotonic ts, deals)
+_DEALS_CACHE_TTL = 20.0          # seconds — the page fires overview/book/renewals together
+
+
 def _my_deals(db, agent_name: str) -> list:
-    """The agent's deals across both deal tables, limited to portal_book_from."""
+    """The agent's deals across both deal tables, limited to portal_book_from.
+    Cached for a few seconds per agent: one page view calls this three times."""
+    import time
+    key = norm_name(agent_name)
+    hit = _DEALS_CACHE.get(key)
+    if hit and time.monotonic() - hit[0] < _DEALS_CACHE_TTL:
+        return hit[1]
     mine = _my_deals_all(db, agent_name)
     since = _book_from(db, agent_name)
-    if not since:
-        return mine
-    return [d for d in mine if d.get("start") and str(d["start"])[:10] >= since]
+    if since:
+        mine = [d for d in mine if d.get("start") and str(d["start"])[:10] >= since]
+    _DEALS_CACHE[key] = (time.monotonic(), mine)
+    return mine
 
 
 def _my_deals_all(db, agent_name: str) -> list:
@@ -138,8 +150,17 @@ def _my_deals_all(db, agent_name: str) -> list:
     return [d | {"esiid": es} for es, d in book.items()] + no_esiid
 
 
+_PAID_CACHE: dict = {}           # months_back → (monotonic ts, {label: set(esiids)})
+_PAID_CACHE_TTL = 600.0
+
+
 def _recent_paid_esiids(db, months_back: int = 2) -> dict:
-    """{label: set(esiids)} for the most recent statement months in the system."""
+    """{label: set(esiids)} for the most recent statement months in the system.
+    Cached in-process for 10 minutes — it scans two months of statement rows."""
+    import time
+    hit = _PAID_CACHE.get(months_back)
+    if hit and time.monotonic() - hit[0] < _PAID_CACHE_TTL:
+        return hit[1]
     labels = sorted({r["billing_month"][:7] for r in
                      (db.table("reconciliation_runs").select("billing_month")
                       .like("notes", '%"engine": "v2"%').order("billing_month", desc=True)
@@ -149,6 +170,7 @@ def _recent_paid_esiids(db, months_back: int = 2) -> dict:
         rows = fetch_all(db, "actual_commissions", "raw_esiid",
                          filters=[("eq", ("billing_month", f"{lb}-01"))])
         out[lb] = {r["raw_esiid"] for r in rows}
+    _PAID_CACHE[months_back] = (time.monotonic(), out)
     return out
 
 
