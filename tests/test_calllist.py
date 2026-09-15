@@ -40,3 +40,26 @@ def test_renewed_customer_returns_next_cycle():
     rows = [{"entity_key": "lead:abc", "end_date": "2027-10-01"}]
     resolved = {_cycle_key("lead:abc", "2026-10-01")}
     assert _drop_resolved(rows, resolved) == rows
+
+
+from app.api.v1.calllist import _month_counts, _filter_month, NO_MONTH
+
+
+def test_month_counts_sorted_with_no_date_last():
+    rows = [
+        {"end_date": "2026-11-03"}, {"end_date": "2026-09-30"},
+        {"end_date": "2026-11-20T00:00:00"}, {"end_date": None}, {"end_date": ""},
+    ]
+    assert _month_counts(rows) == [
+        {"month": "2026-09", "label": "Sep 2026", "count": 1},
+        {"month": "2026-11", "label": "Nov 2026", "count": 2},
+        {"month": NO_MONTH, "label": "No end date", "count": 2},
+    ]
+
+
+def test_filter_month():
+    rows = [{"end_date": "2026-11-03", "n": 1}, {"end_date": "2026-09-30", "n": 2}, {"end_date": None, "n": 3}]
+    assert [r["n"] for r in _filter_month(rows, "2026-11")] == [1]
+    assert [r["n"] for r in _filter_month(rows, NO_MONTH)] == [3]
+    assert [r["n"] for r in _filter_month(rows, None)] == [1, 2, 3]
+    assert [r["n"] for r in _filter_month(rows, "")] == [1, 2, 3]

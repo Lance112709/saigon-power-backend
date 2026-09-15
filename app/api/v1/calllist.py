@@ -238,9 +238,49 @@ def _build_entries(db, user: UserContext) -> list:
     return results
 
 
+NO_MONTH = "none"  # bucket for rows without a contract end date
+
+
+def _month_key(end_date: Optional[str]) -> str:
+    """'2026-10' for an end date in October 2026; NO_MONTH when there is none."""
+    d = (end_date or "")[:7]
+    return d if len(d) == 7 and d[4] == "-" else NO_MONTH
+
+
+def _month_label(key: str) -> str:
+    if key == NO_MONTH:
+        return "No end date"
+    try:
+        return date(int(key[:4]), int(key[5:7]), 1).strftime("%b %Y")
+    except Exception:
+        return key
+
+
+def _month_counts(results: list) -> list[dict]:
+    """Contract-end months present in the list, oldest first, with row counts —
+    the toggle strip on the call-list page is built from this."""
+    counts: dict[str, int] = {}
+    for r in results:
+        k = _month_key(r.get("end_date"))
+        counts[k] = counts.get(k, 0) + 1
+    keys = sorted(k for k in counts if k != NO_MONTH)
+    if NO_MONTH in counts:
+        keys.append(NO_MONTH)
+    return [{"month": k, "label": _month_label(k), "count": counts[k]} for k in keys]
+
+
+def _filter_month(results: list, month: Optional[str]) -> list:
+    m = (month or "").strip()
+    if not m:
+        return results
+    return [r for r in results if _month_key(r.get("end_date")) == m]
+
+
 @router.get("")
 def get_call_list(
     priority_filter: Optional[str] = Query(None),
+    month:           Optional[str] = Query(None, description="Contract-end month 'YYYY-MM', or 'none' for rows without an end date"),
+    include_months:  bool          = Query(False, description="Return {entries, months} instead of a bare list"),
     limit:           int           = Query(50),
     user: UserContext = Depends(get_current_user),
 ):
@@ -255,7 +295,14 @@ def get_call_list(
     if priority_filter == "high":
         results = [r for r in results if r["priority_score"] >= 75]
 
-    return results[:limit]
+    # Month buckets are counted before the month filter and the row cap, so the
+    # toggle always shows every month that has customers, with true totals.
+    months = _month_counts(results) if include_months else None
+    results = _filter_month(results, month)[:limit]
+
+    if include_months:
+        return {"entries": results, "months": months}
+    return results
 
 
 def _lookup_names(db, entity_keys: list[str]) -> dict[str, dict]:
