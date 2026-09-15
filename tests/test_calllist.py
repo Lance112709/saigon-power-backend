@@ -63,3 +63,18 @@ def test_filter_month():
     assert [r["n"] for r in _filter_month(rows, NO_MONTH)] == [3]
     assert [r["n"] for r in _filter_month(rows, None)] == [1, 2, 3]
     assert [r["n"] for r in _filter_month(rows, "")] == [1, 2, 3]
+
+
+from datetime import date, timedelta
+from app.api.v1.calllist import _score_customer
+
+
+def test_commercial_boost_only_when_due():
+    far = (date.today() + timedelta(days=1800)).isoformat()
+    soon = (date.today() + timedelta(days=20)).isoformat()
+    # Commercial meter with no/far-off end date must not put the customer on the list
+    assert _score_customer({}, [{"status": "Active", "end_date": None, "product_type": "Commercial"}])[0] == 0
+    assert _score_customer({}, [{"status": "Active", "end_date": far, "product_type": "Commercial"}])[0] == 0
+    # ...but a due commercial deal still gets the boost over residential
+    assert _score_customer({}, [{"status": "Active", "end_date": soon, "product_type": "Commercial"}])[0] == 95
+    assert _score_customer({}, [{"status": "Active", "end_date": soon, "product_type": "Residential"}])[0] == 80

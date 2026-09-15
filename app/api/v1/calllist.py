@@ -77,33 +77,37 @@ def _score_customer(lead: dict, deals: list) -> tuple[int, list[str], str]:
 
     for deal in active_deals:
         days = _days_until(deal.get("end_date"))
+        deal_score = 0
 
         if days is not None:
             if days < 0:
-                score += 100
+                deal_score = 100
                 reasons.append(f"Contract EXPIRED {-days} day{'s' if days != -1 else ''} ago — "
                                f"customer is on holdover pricing")
                 action = "Call now — contract already expired"
             elif days <= 7:
-                score += 100
+                deal_score = 100
                 reasons.append(f"Contract expires in {days} day{'s' if days != 1 else ''} — URGENT")
                 action = "Renew NOW — contract expiring"
             elif days <= 30:
-                score += 80
+                deal_score = 80
                 reasons.append(f"Contract expires in {days} days")
                 action = "Call for renewal — URGENT"
             elif days <= 60:
-                score += 50
+                deal_score = 50
                 reasons.append(f"Contract expires in {days} days")
                 action = "Call for renewal"
             elif days <= 90:
-                score += 25
+                deal_score = 25
                 reasons.append(f"Renewal window opens soon ({days} days)")
                 action = "Start renewal conversation"
 
-        # Boost commercial accounts
-        if str(deal.get("product_type") or "").lower() == "commercial":
-            score += 15
+        # Boost commercial accounts — only ones that are actually due, otherwise a
+        # commercial meter with no or a far-off end date puts the customer on the
+        # list with an empty "Why call" (762 rows, ~650 of them noise, 2026-09-15).
+        if deal_score and str(deal.get("product_type") or "").lower() == "commercial":
+            deal_score += 15
+        score += deal_score
 
     return min(score, 100), reasons, action
 
