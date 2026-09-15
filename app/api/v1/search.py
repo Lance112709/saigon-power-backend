@@ -81,9 +81,10 @@ def global_search(
     # their customers through their own deals in block 4, so skip the broad
     # customer name/phone scan for them.
     customers = [] if agent else (db.table("crm_customers").select(
-        "id, full_name, first_name, last_name, email, phone, mailing_address, city, state"
+        "id, full_name, business_name, first_name, last_name, email, phone, mailing_address, city, state"
     ).or_(
         f"full_name.ilike.%{q}%,"
+        f"business_name.ilike.%{q}%,"
         f"first_name.ilike.%{q}%,"
         f"last_name.ilike.%{q}%,"
         f"email.ilike.%{q}%,"
@@ -99,7 +100,7 @@ def global_search(
             "type": "customer",
             "id": c["id"],
             "name": name,
-            "sub": c.get("phone") or c.get("email") or "",
+            "sub": c.get("business_name") or c.get("phone") or c.get("email") or "",
             "detail": ", ".join(x for x in [c.get("mailing_address"), c.get("city"), c.get("state")] if x),
             "status": "Imported",
             "url": f"/crm/customers/{c['id']}",

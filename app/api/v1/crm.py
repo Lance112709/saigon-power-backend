@@ -188,7 +188,7 @@ def list_customers(
     memb = (membership or "").strip()
 
     embed = "crm_deals!inner" if _crm_deal_filtered(deal_status, provider, agent_name, meter_type) else "crm_deals"
-    cols = ("id, full_name, first_name, last_name, email, phone, city, state, notes, created_at, "
+    cols = ("id, full_name, business_name, first_name, last_name, email, phone, city, state, notes, created_at, "
             f"{embed}(id, deal_status, provider, sales_agent, service_address, business_name)")
 
     if memb in ("members", "non_members"):
@@ -267,7 +267,7 @@ def _apply_crm_customer_filters(q, search, provider, deal_status, meter_type,
     if search:
         s = sanitize_search(search)
         if s:
-            q = q.or_(f"full_name.ilike.%{s}%,email.ilike.%{s}%,phone.ilike.%{s}%")
+            q = q.or_(f"full_name.ilike.%{s}%,business_name.ilike.%{s}%,email.ilike.%{s}%,phone.ilike.%{s}%")
     if source == "__manual__":
         q = q.is_("notes", "null")
     elif source:
@@ -708,7 +708,7 @@ def delete_customer_attachment(id: str, attachment_id: str, user: UserContext = 
 def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     assert_customer_access(db, user, id)
-    allowed = {"full_name", "first_name", "last_name", "email", "phone", "dob",
+    allowed = {"full_name", "business_name", "first_name", "last_name", "email", "phone", "dob",
                "mailing_address", "city", "state", "postal_code", "notes"}
     payload = {k: v for k, v in data.items() if k in allowed}
     from datetime import datetime, timezone
