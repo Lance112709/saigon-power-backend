@@ -165,16 +165,28 @@ def build_business_health(db, months_back: int = 7) -> dict:
                          for r in runs)
     avg_churn = (sum(churn_samples) / len(churn_samples)) if churn_samples else 0.03
     book = ltv_math(total_received, account_months, avg_churn)
+    # Paying accounts = every meter on each provider's NEWEST statement within
+    # the last 3 statement months. Providers upload on different calendars
+    # (NRG's newest may be July while Iron Horse already sent September), so
+    # "latest month only" made whole providers count as zero and the number
+    # swung by a thousand between uploads. Unique by ESI digits across providers.
     latest = months[-1] if months else None
-    prev_month = months[-2] if len(months) > 1 else None
-    paying_now = 0
-    for sid in sup_names:
-        cur_set = membership.get(latest, {}).get(sid)
-        if cur_set is None and prev_month:
-            cur_set = membership.get(prev_month, {}).get(sid)  # statement not in yet
-        paying_now += len(cur_set or set())
+    window = months[-3:]
+    paying_meters: set = set()
+    paying_by_provider: dict = {}
+    for sid, name in sup_names.items():
+        have = [m for m in window if sid in membership.get(m, {})]
+        if not have:
+            continue
+        m = have[-1]
+        meters = {_digits(e) for e in membership[m][sid]} - {""}
+        paying_meters |= meters
+        paying_by_provider[name] = {"month": m, "accounts": len(meters)}
+    paying_now = len(paying_meters)
     book.update({
         "paying_accounts": paying_now,
+        "paying_window": {"from": window[0] if window else None, "to": latest,
+                          "by_provider": paying_by_provider},
         "book_value": round(paying_now * book["ltv_per_account"], 0),
         "total_received_alltime": round(total_received, 2),
     })
