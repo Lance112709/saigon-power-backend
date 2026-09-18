@@ -51,12 +51,16 @@ def zip5(z) -> str:
 
 
 def fetch_all(db, table: str, cols: str, filters=None):
+    """Page through a table 1,000 rows at a time. Ordered by id: PostgREST
+    ranges without an ORDER BY are not stable across pages on large tables
+    (rows can repeat or go missing between pages), which silently skews any
+    count built on the result."""
     out, off = [], 0
     while True:
         q = db.table(table).select(cols)
         for fn, args in (filters or []):
             q = getattr(q, fn)(*args)
-        r = q.range(off, off + 999).execute().data or []
+        r = q.order("id").range(off, off + 999).execute().data or []
         out.extend(r)
         if len(r) < 1000:
             break
