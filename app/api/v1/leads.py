@@ -1314,6 +1314,22 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
         payload.setdefault("terminated_date", None)
     payload["updated_at"] = _now()
     before = (db.table("lead_deals").select("*").eq("id", deal_id).eq("lead_id", id).limit(1).execute().data or [{}])[0]
+    # Same rule as Add Deal: an Active deal may not share its ESI ID or service
+    # address with another active deal anywhere in the CRM. Checked when the
+    # meter/address changes or the deal is being (re)activated — e.g. a website
+    # enrollment (created as Future) flipping to Active.
+    after_status = payload.get("status", before.get("status"))
+    if after_status == "Active" and (
+        ("esiid" in payload and (payload["esiid"] or "") != (before.get("esiid") or ""))
+        or ("service_address" in payload and (payload["service_address"] or "") != (before.get("service_address") or ""))
+        or before.get("status") != "Active"
+    ):
+        from app.api.v1.crm import find_active_deal_conflict
+        conflict = find_active_deal_conflict(db, payload.get("esiid", before.get("esiid")),
+                                             payload.get("service_address", before.get("service_address")),
+                                             exclude_lead_deal_id=deal_id)
+        if conflict:
+            raise HTTPException(status_code=409, detail=conflict)
     res = db.table("lead_deals").update(payload).eq("id", deal_id).eq("lead_id", id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Deal not found")

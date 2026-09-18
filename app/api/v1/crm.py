@@ -769,12 +769,20 @@ def _all_known_esiids(db) -> set:
     return esiids
 
 
-def find_active_deal_conflict(db, esiid: str, service_address: str):
+def find_active_deal_conflict(db, esiid: str, service_address: str,
+                              exclude_crm_id: str = None, exclude_lead_deal_id: str = None):
     """If the ESI ID or service address already belongs to an ACTIVE deal
     anywhere in the CRM (imported deals or lead deals), return a human message
-    explaining the conflict; otherwise None. Used to block duplicate enrollments."""
+    explaining the conflict; otherwise None. Used to block duplicate enrollments.
+    exclude_* skip the deal being edited so it never conflicts with itself."""
     esiid = (esiid or "").strip()
     addr = (service_address or "").strip()
+
+    def _crm(q):
+        return q.neq("id", exclude_crm_id) if exclude_crm_id else q
+
+    def _lead(q):
+        return q.neq("id", exclude_lead_deal_id) if exclude_lead_deal_id else q
 
     def _crm_customer(d):
         return (d.get("crm_customers") or {}).get("full_name") or "another customer"
@@ -784,22 +792,22 @@ def find_active_deal_conflict(db, esiid: str, service_address: str):
         return f"{l.get('first_name','')} {l.get('last_name','')}".strip() or "another lead"
 
     if esiid:
-        hit = db.table("crm_deals").select("id, crm_customers(full_name)") \
-            .eq("esiid", esiid).eq("deal_status", "ACTIVE").limit(1).execute().data
+        hit = _crm(db.table("crm_deals").select("id, crm_customers(full_name)")
+                   .eq("esiid", esiid).eq("deal_status", "ACTIVE")).limit(1).execute().data
         if hit:
             return f"ESI ID {esiid} already has an active deal in the CRM (on {_crm_customer(hit[0])}). It can't be added again."
-        hit = db.table("lead_deals").select("id, leads(first_name, last_name)") \
-            .eq("esiid", esiid).eq("status", "Active").limit(1).execute().data
+        hit = _lead(db.table("lead_deals").select("id, leads(first_name, last_name)")
+                    .eq("esiid", esiid).eq("status", "Active")).limit(1).execute().data
         if hit:
             return f"ESI ID {esiid} already has an active deal in the CRM (on {_lead_name(hit[0])}). It can't be added again."
 
     if addr:
-        hit = db.table("crm_deals").select("id, crm_customers(full_name)") \
-            .ilike("service_address", addr).eq("deal_status", "ACTIVE").limit(1).execute().data
+        hit = _crm(db.table("crm_deals").select("id, crm_customers(full_name)")
+                   .ilike("service_address", addr).eq("deal_status", "ACTIVE")).limit(1).execute().data
         if hit:
             return f"Service address \"{addr}\" already has an active deal in the CRM (on {_crm_customer(hit[0])}). It can't be added again."
-        hit = db.table("lead_deals").select("id, leads(first_name, last_name)") \
-            .ilike("service_address", addr).eq("status", "Active").limit(1).execute().data
+        hit = _lead(db.table("lead_deals").select("id, leads(first_name, last_name)")
+                    .ilike("service_address", addr).eq("status", "Active")).limit(1).execute().data
         if hit:
             return f"Service address \"{addr}\" already has an active deal in the CRM (on {_lead_name(hit[0])}). It can't be added again."
 
@@ -1165,6 +1173,20 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
         payload.setdefault("terminated_date", None)
     from datetime import datetime, timezone
     before = (db.table("crm_deals").select("*").eq("id", id).limit(1).execute().data or [{}])[0]
+    # Same rule as Add Deal: an ACTIVE deal may not share its ESI ID or service
+    # address with another active deal. Checked when the meter/address changes
+    # or the deal is being (re)activated — never for unrelated edits.
+    after_status = payload.get("deal_status", before.get("deal_status"))
+    if after_status == "ACTIVE" and (
+        ("esiid" in payload and (payload["esiid"] or "") != (before.get("esiid") or ""))
+        or ("service_address" in payload and (payload["service_address"] or "") != (before.get("service_address") or ""))
+        or before.get("deal_status") != "ACTIVE"
+    ):
+        conflict = find_active_deal_conflict(db, payload.get("esiid", before.get("esiid")),
+                                             payload.get("service_address", before.get("service_address")),
+                                             exclude_crm_id=id)
+        if conflict:
+            raise HTTPException(status_code=409, detail=conflict)
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     res = db.table("crm_deals").update(payload).eq("id", id).execute()
     new_status = payload.get("deal_status")
