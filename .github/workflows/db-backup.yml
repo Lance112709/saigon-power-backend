@@ -1,0 +1,106 @@
+name: Nightly database backup
+
+# Dumps the Supabase Postgres database (public schema) and uploads it to
+# Google Drive. Keeps 30 daily dumps + 13 monthly dumps. Optionally mirrors the
+# Supabase Storage buckets (contracts, attachments, statements) as well.
+# Setup + restore steps: docs/database-backups.md
+
+on:
+  schedule:
+    - cron: "17 8 * * *" # 08:17 UTC ≈ 3:17am Central
+  workflow_dispatch:
+
+concurrency:
+  group: db-backup
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  DRIVE_FOLDER: "Saigon Power CRM Backups"
+  # rclone remote "gdrive" — configured entirely from env, no config file
+  RCLONE_CONFIG_GDRIVE_TYPE: drive
+  RCLONE_CONFIG_GDRIVE_SCOPE: drive.file
+  RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.GDRIVE_RCLONE_TOKEN }}
+  HAS_STORAGE_KEYS: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID != '' && secrets.SUPABASE_S3_SECRET_ACCESS_KEY != '' }}
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install pg_dump 17 and rclone
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSL -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17
+          curl -fsSL https://rclone.org/install.sh | sudo bash
+          echo "/usr/lib/postgresql/17/bin" >> "$GITHUB_PATH"
+
+      - name: Dump database
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ -z "$SUPABASE_DB_URL" ]; then
+            echo "::error::SUPABASE_DB_URL secret is not set"; exit 1
+          fi
+          STAMP=$(date -u +%Y-%m-%d)
+          echo "DUMP_FILE=saigon-crm-${STAMP}.dump" >> "$GITHUB_ENV"
+          pg_dump "$SUPABASE_DB_URL" \
+            --schema=public --format=custom --compress=9 \
+            --no-owner --no-privileges \
+            --file="saigon-crm-${STAMP}.dump"
+
+      - name: Verify dump
+        run: |
+          ls -lh "$DUMP_FILE"
+          SIZE=$(stat -c %s "$DUMP_FILE")
+          # List to a file first: `grep -q` on a pipe would SIGPIPE pg_restore
+          # and fail the step under pipefail.
+          pg_restore --list "$DUMP_FILE" > dump.toc
+          TABLES=$(grep -c "TABLE DATA" dump.toc)
+          echo "size=${SIZE} bytes, tables with data=${TABLES}"
+          # A healthy dump is tens of MB with dozens of tables; anything tiny
+          # means the dump silently came back empty.
+          [ "$SIZE" -gt 5000000 ] || { echo "::error::dump is suspiciously small"; exit 1; }
+          [ "$TABLES" -ge 20 ] || { echo "::error::dump has too few tables"; exit 1; }
+          for t in crm_customers crm_deals lead_deals actual_commissions; do
+            grep -q "TABLE DATA public ${t} " dump.toc \
+              || { echo "::error::table ${t} missing from dump"; exit 1; }
+          done
+
+      - name: Upload to Google Drive
+        run: |
+          rclone copy "$DUMP_FILE" "gdrive:${DRIVE_FOLDER}/daily" --quiet
+          if [ "$(date -u +%d)" = "01" ]; then
+            rclone copy "$DUMP_FILE" "gdrive:${DRIVE_FOLDER}/monthly" --quiet
+          fi
+          # Confirm the file really landed
+          rclone lsf "gdrive:${DRIVE_FOLDER}/daily" > uploaded.txt
+          grep -qx "$DUMP_FILE" uploaded.txt
+
+      - name: Prune old dumps
+        run: |
+          rclone delete "gdrive:${DRIVE_FOLDER}/daily" --min-age 30d --quiet
+          rclone delete "gdrive:${DRIVE_FOLDER}/monthly" --min-age 400d --quiet
+
+      # Optional: uploaded files (signed contracts, attachments, statements) live
+      # in Supabase Storage, not in Postgres. Runs only once the S3 keys are set.
+      # `copy`, not `sync`: a file deleted in Supabase stays in the backup.
+      - name: Mirror Supabase Storage files
+        if: env.HAS_STORAGE_KEYS == 'true'
+        env:
+          RCLONE_CONFIG_SUPA_TYPE: s3
+          RCLONE_CONFIG_SUPA_PROVIDER: Other
+          RCLONE_CONFIG_SUPA_ENDPOINT: ${{ secrets.SUPABASE_S3_ENDPOINT }}
+          RCLONE_CONFIG_SUPA_REGION: ${{ secrets.SUPABASE_S3_REGION }}
+          RCLONE_CONFIG_SUPA_ACCESS_KEY_ID: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID }}
+          RCLONE_CONFIG_SUPA_SECRET_ACCESS_KEY: ${{ secrets.SUPABASE_S3_SECRET_ACCESS_KEY }}
+          RCLONE_CONFIG_SUPA_FORCE_PATH_STYLE: "true"
+        run: |
+          rclone copy "supa:" "gdrive:${DRIVE_FOLDER}/storage" --quiet --transfers 8
