@@ -153,6 +153,19 @@ def list_tasks(
 
     res = q.order("due_date").range(offset, offset + limit - 1).execute()
 
+    # Tasks linked only to a deal: resolve the deal to its customer / lead so the
+    # page can open the account (and name it) without a second round trip.
+    crm_deal_ids = [t["crm_deal_id"] for t in res.data if t.get("crm_deal_id") and not t.get("customer_id") and not t.get("lead_id")]
+    lead_deal_ids = [t["deal_id"] for t in res.data if t.get("deal_id") and not t.get("lead_id") and not t.get("customer_id")]
+    deal_cust, deal_lead = {}, {}
+    if crm_deal_ids:
+        for d in db.table("crm_deals").select("id, customer_id, crm_customers(full_name)").in_("id", crm_deal_ids).execute().data or []:
+            deal_cust[d["id"]] = (d.get("customer_id"), (d.get("crm_customers") or {}).get("full_name") or "")
+    if lead_deal_ids:
+        for d in db.table("lead_deals").select("id, lead_id, leads(first_name, last_name)").in_("id", lead_deal_ids).execute().data or []:
+            l = d.get("leads") or {}
+            deal_lead[d["id"]] = (d.get("lead_id"), f"{l.get('first_name','')} {l.get('last_name','')}".strip())
+
     results = []
     for t in res.data:
         lead     = t.pop("leads", None) or {}
@@ -161,9 +174,21 @@ def list_tasks(
             f"{lead.get('first_name','')} {lead.get('last_name','')}".strip()
             if lead else customer.get("full_name") or ""
         )
+        # Where a click on the task should land: the lead or customer account page.
+        entity_link = None
+        if t.get("lead_id"):
+            entity_link = f"/crm/leads/{t['lead_id']}"
+        elif t.get("customer_id"):
+            entity_link = f"/crm/customers/{t['customer_id']}"
+        elif t.get("crm_deal_id") and deal_cust.get(t["crm_deal_id"], (None, ""))[0]:
+            cid, name = deal_cust[t["crm_deal_id"]]
+            entity_link = f"/crm/customers/{cid}"; entity_name = entity_name or name
+        elif t.get("deal_id") and deal_lead.get(t["deal_id"], (None, ""))[0]:
+            lid, name = deal_lead[t["deal_id"]]
+            entity_link = f"/crm/leads/{lid}"; entity_name = entity_name or name
         # Compute effective status dynamically
         t["status"] = _effective_status(t["status"], t.get("due_date") or "")
-        results.append({**t, "entity_name": entity_name})
+        results.append({**t, "entity_name": entity_name, "entity_link": entity_link})
 
     return results
 
