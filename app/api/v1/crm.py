@@ -770,6 +770,15 @@ def _all_known_esiids(db) -> set:
     return esiids
 
 
+def generated_deal_name(provider, service_address) -> str:
+    """'<REP> — <street>' — the one naming rule for new deals (e.g. 'Heritage Power — 12334 Test Dr').
+    Street = the part of the service address before the first comma."""
+    import re as _re
+    rep = _re.sub(r"\s+", " ", str(provider or "")).strip()
+    street = _re.sub(r"\s+", " ", str(service_address or "").split(",")[0]).strip()
+    return f"{rep} — {street}" if rep and street else ""
+
+
 def find_active_deal_conflict(db, esiid: str, service_address: str,
                               exclude_crm_id: str = None, exclude_lead_deal_id: str = None):
     """If the ESI ID or service address already belongs to an ACTIVE deal
@@ -835,7 +844,9 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
 
     payload = {
         "customer_id":           id,
-        "deal_name":             str(data.get("deal_name") or "").strip() or None,
+        # Deal names are generated, never typed: "<REP> — <street address>".
+        "deal_name":             generated_deal_name(data.get("provider"), data.get("service_address"))
+                                 or str(data.get("deal_name") or "").strip() or None,
         "business_name":         str(data.get("business_name") or "").strip() or None,
         "provider":              str(data.get("provider") or "").strip().upper() or None,
         "esiid":                 str(data.get("esiid") or "").strip() or None,
@@ -1125,7 +1136,9 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
         "est_kwh":              data.get("est_kwh") or None,
         "anxh":                 orig.get("anxh"),
         "business_name":        orig.get("business_name"),
-        "deal_name":            data.get("deal_name") or orig.get("deal_name"),
+        "deal_name":            generated_deal_name(data.get("provider") or orig.get("provider"),
+                                                    data.get("service_address") or orig.get("service_address"))
+                                or data.get("deal_name") or orig.get("deal_name"),
         "created_by":           user.name,
     }
     res = db.table("crm_deals").insert(new_deal).execute()
