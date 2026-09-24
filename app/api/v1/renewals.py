@@ -36,8 +36,8 @@ def _collect_renewals(db, start_date, end_date, provider, sa, agent_filter):
     # ── CRM Leads deals ──────────────────────────────────────────────────────────
     q = db.table("lead_deals").select(
         "id, end_date, supplier, plan_name, contract_term, rate, rate_type, "
-        "lead_id, sales_agent, status, "
-        "leads(first_name, last_name, phone, email, sgp_customer_id)"
+        "lead_id, sales_agent, status, service_address, service_city, service_state, service_zip, "
+        "leads(first_name, last_name, phone, email, sgp_customer_id, business_name)"
     ).eq("status", "Active")
 
     if start_date: q = q.gte("end_date", start_date)
@@ -64,6 +64,9 @@ def _collect_renewals(db, start_date, end_date, provider, sa, agent_filter):
             "phone":        lead.get("phone"),
             "email":        lead.get("email"),
             "sgp_id":       lead.get("sgp_customer_id"),
+            "business_name": lead.get("business_name"),
+            "service_address": ", ".join(x for x in (d.get("service_address"), d.get("service_city"),
+                                                      " ".join(y for y in (d.get("service_state"), d.get("service_zip")) if y)) if x and str(x).strip()),
             "provider":     d.get("supplier"),
             "plan_name":    d.get("plan_name"),
             "rate":         d.get("rate"),
@@ -77,7 +80,7 @@ def _collect_renewals(db, start_date, end_date, provider, sa, agent_filter):
     # ── Imported Customers deals ─────────────────────────────────────────────────
     q2 = db.table("crm_deals").select(
         "id, contract_end_date, provider, product_type, contract_term, energy_rate, "
-        "customer_id, sales_agent, deal_status, "
+        "customer_id, sales_agent, deal_status, business_name, service_address, "
         "crm_customers(full_name, phone, email)"
     ).eq("deal_status", "ACTIVE")
 
@@ -105,6 +108,8 @@ def _collect_renewals(db, start_date, end_date, provider, sa, agent_filter):
             "phone":        cust.get("phone"),
             "email":        cust.get("email"),
             "sgp_id":       None,
+            "business_name": d.get("business_name"),
+            "service_address": d.get("service_address"),
             "provider":     d.get("provider"),
             "plan_name":    d.get("product_type"),
             "rate":         d.get("energy_rate"),
@@ -148,12 +153,13 @@ def export_renewals(
 
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["Customer", "Phone", "Email", "SGP ID", "Source", "Provider",
+    w.writerow(["Customer", "Business", "Service Address", "Phone", "Email", "SGP ID", "Source", "Provider",
                 "Plan", "Rate", "Rate Type", "Contract Term", "Sales Agent",
                 "Contract End", "Days Left"])
     for r in rows:
         w.writerow([
-            r.get("full_name") or "", r.get("phone") or "", r.get("email") or "",
+            r.get("full_name") or "", r.get("business_name") or "", r.get("service_address") or "",
+            r.get("phone") or "", r.get("email") or "",
             r.get("sgp_id") or "", r.get("source") or "", r.get("provider") or "",
             r.get("plan_name") or "", r.get("rate") if r.get("rate") is not None else "",
             r.get("rate_type") or "", r.get("contract_term") or "",
