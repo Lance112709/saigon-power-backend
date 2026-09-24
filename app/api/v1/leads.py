@@ -6,6 +6,7 @@ import re
 import io
 import csv
 from app.services.agent_names import canonical_agent
+from app.services.rates import normalize_rate
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_lead_access
@@ -109,7 +110,7 @@ def _deal_payload(data: dict) -> dict:
         "product_type":        str(data.get("product_type") or "").strip() or None,
         "rate_type":           str(data.get("rate_type") or "").strip() or None,
         "contract_term":       str(data.get("contract_term") or "").strip() or None,
-        "rate":                _f("rate"),
+        "rate":                normalize_rate(_f("rate")),
         "adder":               _f("adder"),
         "est_kwh":             _f("est_kwh"),
         "expected_close_date": data.get("expected_close_date") or None,
@@ -1310,6 +1311,8 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
         raise HTTPException(status_code=400, detail="No valid fields to update")
     if "sales_agent" in payload:
         payload["sales_agent"] = canonical_agent(db, payload["sales_agent"])
+    if "rate" in payload:
+        payload["rate"] = normalize_rate(payload["rate"])
     if payload.get("status") == "Active":
         payload.setdefault("terminated_date", None)
     payload["updated_at"] = _now()

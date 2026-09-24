@@ -2,6 +2,7 @@ from fastapi import APIRouter, HTTPException, Query, Body, Depends
 from typing import Optional
 from datetime import datetime, timezone
 from app.db.client import get_client
+from app.services.rates import normalize_rate
 from app.auth.deps import get_current_user, require_manager, UserContext
 
 router = APIRouter()
@@ -242,7 +243,7 @@ def create_proposal(data: dict = Body(...), user: UserContext = Depends(get_curr
         "customer_address":     str(data.get("customer_address") or "").strip() or None,
         "rep_name":             str(data.get("rep_name") or "").strip() or None,
         "plan_name":            str(data.get("plan_name") or "").strip() or None,
-        "rate":                 _f("rate"),
+        "rate":                 normalize_rate(_f("rate")),
         "term_months":          _i("term_months"),
         "est_monthly_bill":     _f("est_monthly_bill"),
         "early_termination_fee": _f("early_termination_fee"),
@@ -343,6 +344,8 @@ def update_proposal(proposal_id: str, data: dict = Body(...), user: UserContext 
     payload = {k: v for k, v in data.items() if k in allowed}
     if not payload:
         raise HTTPException(status_code=400, detail="No valid fields to update")
+    if "rate" in payload:
+        payload["rate"] = normalize_rate(payload["rate"])
     payload["updated_at"] = _now()
     res = db.table("proposals").update(payload).eq("id", proposal_id).execute()
     if not res.data:

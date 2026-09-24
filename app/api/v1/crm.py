@@ -6,6 +6,7 @@ import io
 import csv
 from datetime import datetime as dt
 from app.services.agent_names import canonical_agent
+from app.services.rates import normalize_rate
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_customer_access, assert_crm_deal_access
@@ -841,7 +842,7 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         "meter_type":            str(data.get("meter_type") or "").strip() or None,
         "deal_type":             str(data.get("deal_type") or "").strip() or None,
         "deal_status":           str(data.get("deal_status") or "ACTIVE").strip().upper(),
-        "energy_rate":           _f("energy_rate"),
+        "energy_rate":           normalize_rate(_f("energy_rate")),
         "adder":                 _f("adder"),
         "contract_term":         str(data.get("contract_term") or "").strip() or None,
         "contract_start_date":   data.get("contract_start_date") or None,
@@ -1113,7 +1114,7 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
         "contract_end_date":    data.get("contract_end_date") or None,
         "contract_signed_date": data.get("contract_signed_date") or None,
         "contract_term":        data.get("contract_term") or orig.get("contract_term"),
-        "energy_rate":          data.get("energy_rate") or None,
+        "energy_rate":          normalize_rate(data.get("energy_rate")),
         "adder":                data.get("adder") or None,
         "product_type":         data.get("product_type") or orig.get("product_type"),
         "meter_type":           data.get("meter_type") or orig.get("meter_type"),
@@ -1171,6 +1172,8 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
         payload["sales_agent"] = canonical_agent(db, payload["sales_agent"])
     if payload.get("deal_status") == "ACTIVE":
         payload.setdefault("terminated_date", None)
+    if "energy_rate" in payload:
+        payload["energy_rate"] = normalize_rate(payload["energy_rate"])
     from datetime import datetime, timezone
     before = (db.table("crm_deals").select("*").eq("id", id).limit(1).execute().data or [{}])[0]
     # Same rule as Add Deal: an ACTIVE deal may not share its ESI ID or service
@@ -1336,7 +1339,7 @@ def import_deals(file_path: str = Body(..., embed=True), user: UserContext = Dep
             "deal_type": deal_type,
             "deal_status": deal_status if deal_status in ("ACTIVE", "INACTIVE") else "ACTIVE",
             "adder": adder,
-            "energy_rate": rate,
+            "energy_rate": normalize_rate(rate, strict=False),
             "product_type": product_type,
             "contract_term": term,
             "contract_signed_date": signed_date,
@@ -1633,7 +1636,7 @@ async def import_upload(
             "contract_end_date":    _norm_date(get_col(row, "Contract End Date", "End Date")),
             "contract_signed_date": _norm_date(get_col(row, "Contract Signed Date", "Signed Date")),
             "contract_term":        _norm_str(get_col(row, "Term (Months)", "Term")),
-            "energy_rate":          _norm_float(get_col(row, "Energy Rate", "Rate")),
+            "energy_rate":          normalize_rate(_norm_float(get_col(row, "Energy Rate", "Rate")), strict=False),
             "adder":                _norm_float(get_col(row, "Adder")),
             "product_type":         _norm_str(get_col(row, "Product Type")),
             "meter_type":           _norm_str(get_col(row, "Meter Type")),

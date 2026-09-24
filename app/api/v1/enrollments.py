@@ -13,6 +13,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
 from app.db.client import get_client
+from app.services.rates import normalize_rate
 from app.auth.deps import require_admin, get_current_user, UserContext
 from app.services.audit import audit
 from app.services.enrollment_dispatch import dispatch_enrollment, build_request
@@ -123,7 +124,7 @@ def submit_public_enrollment(body: PublicEnrollment, request: Request):
         deal = db.table("lead_deals").insert({
             "lead_id": lead_id, "status": "Future",
             "supplier": record["provider"], "plan_name": record["plan_name"],
-            "rate": record["rate"],
+            "rate": normalize_rate(record["rate"], strict=False),
             "contract_term": f"{record['term_months']} Months" if record.get("term_months") else None,
             "service_address": record["service_address"], "service_city": record["service_city"],
             "service_state": record["service_state"], "service_zip": record["service_zip"],
