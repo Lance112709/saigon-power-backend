@@ -93,12 +93,22 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
 
     # Auto-update deal statuses from the provider's status column (trusted sources only)
     status_sync = None
+    absence = None
     if provider_group in ABSENCE_SYNC_GROUPS and sync_deals:
         absence = absence_sync(db, supplier_id, provider_group, deals, actor,
                                current_esiids={r["esiid"] for r in rows if r.get("esiid")})
         if absence.get("deactivated"):
             warnings.append(f"{absence['deactivated']} deal(s) deactivated — absent from the "
                             f"last 3 {provider_group} statements.")
+        if absence.get("switched"):
+            warnings.append(
+                f"{len(absence['switched'])} {provider_group} deal(s) are now being paid by another "
+                f"provider but have no deal under it — left active; relabel the provider on those deals.")
+        if absence.get("pending"):
+            warnings.append(
+                f"{absence['held']} of {absence['active']} active {provider_group} deals have not been "
+                f"paid on the last 3 statements — too many to drop automatically; held for your review "
+                f"(use Apply status changes to force).")
     if provider_group and sync_deals and (trust_status or provider_group in TRUSTED_STATUS_GROUPS):
         batch_meta = db.table("upload_batches").select("original_filename").eq("id", batch_id).limit(1).execute().data
         source = f"{provider_group} — {(batch_meta[0]['original_filename'] if batch_meta else batch_id)}"
@@ -252,6 +262,7 @@ def _process_rows(db, batch_id: str, provider_group: Optional[str], supplier_id:
         "amounts_match": abs(difference) < 0.02 if difference is not None else None,
         "runs": runs,
         "status_sync": status_sync,
+        "absence_sync": absence,
         "warnings": warnings,
     }
 
@@ -742,6 +753,10 @@ def apply_statuses(id: str, user: UserContext = Depends(require_admin)):
     deals = load_deals(db, provider_group)
     source = f"{provider_group} — {batch.get('original_filename')} (force-applied)"
     result = sync_statuses(db, rows, deals, source, user.email or "admin", force=True)
+    # The absence rule is held by the same mass-churn check; force it too.
+    result["absence_sync"] = absence_sync(
+        db, batch.get("supplier_id"), provider_group, deals, user.email or "admin",
+        current_esiids={r["esiid"] for r in rows if r.get("esiid")}, force=True)
     audit(db, "upload_batches", id, "force_apply_statuses", None, result,
           reason="Admin confirmed status changes despite mass-churn warning", actor=user.email or "admin")
     return result

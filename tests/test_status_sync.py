@@ -161,3 +161,162 @@ def test_guard_rejection_does_not_abort_sync(monkeypatch):
     assert res["blocked"] == 1
     assert res["reactivated"] == 1
     assert blocked["active"] is False and fine["active"] is True
+
+
+# --- absence rule (all providers) -------------------------------------------
+from fakedb import FakeDB as RealFakeDB  # noqa: E402
+from app.services.status_sync import (  # noqa: E402
+    absence_sync, ABSENCE_SYNC_GROUPS, TRUSTED_STATUS_GROUPS, _full_statement_months)
+
+SUP, OTHER = "sup-1", "sup-2"
+FILL = [f"10089019999999999{i:05d}" for i in range(10)]   # 10 padding meters = a "full" month
+
+
+def _db():
+    db = RealFakeDB()
+    db.table("suppliers").insert([{"id": SUP, "name": "Iron Horse"},
+                                  {"id": OTHER, "name": "Budget Power"}]).execute()
+    return db
+
+
+def _ledger(db, months_esiids, supplier=SUP, pad=True):
+    """months_esiids: {"2026-06": [E1, E2], ...} -> actual_commissions rows."""
+    for ym, esiids in months_esiids.items():
+        for es in list(esiids) + (FILL if pad else []):
+            db.table("actual_commissions").insert({"supplier_id": supplier, "billing_month": f"{ym}-01",
+                                                   "raw_esiid": es}).execute()
+
+
+def _deals(db, *specs):
+    """specs: (esiid, source, start) -> seeded deal rows + load_deals-shaped dict."""
+    by = {}
+    for es, source, start in specs:
+        did = f"d-{es}"
+        db.table(source).insert({"id": did, "esiid": es,
+                                 ("status" if source == "lead_deals" else "deal_status"):
+                                 ("Active" if source == "lead_deals" else "ACTIVE")}).execute()
+        by[es] = {"source": source, "id": did, "active": True, "esiid": es, "start": start}
+    return {"by_esiid": by}
+
+
+def test_absence_rule_covers_every_provider():
+    for g in ("Discount Power/Cirro", "Iron Horse", "CleanSky", "Chariot", "Hudson Energy",
+              "Budget Power", "Heritage Power", "Tara Energy", "NRG Commercial", "Reliant Energy", "APG&E"):
+        assert g in ABSENCE_SYNC_GROUPS
+
+
+def test_absence_deactivates_after_three_missing_months():
+    db = _db()
+    _ledger(db, {"2026-06": [E1, E2], "2026-07": [E1], "2026-08": [E1]})
+    deals = _deals(db, (E1, "crm_deals", "2025-01-01"), (E2, "lead_deals", "2025-01-01"),
+                   (E3, "crm_deals", "2025-01-01"))
+    out = absence_sync(db, SUP, "Iron Horse", deals, "tester", current_esiids={E1})
+    assert out["deactivated"] == 1 and out["churned"] == 1 and not out["pending"]
+    assert out["window"] == "2026-06" and out["latest"] == "2026-08"
+    assert db.tables["crm_deals"][0]["deal_status"] == "ACTIVE"          # E1 still paid
+    assert db.tables["lead_deals"][0]["status"] == "Active"              # E2 paid in June (in window)
+    assert db.tables["crm_deals"][1]["deal_status"] == "INACTIVE"        # E3 never paid
+    assert db.tables["crm_deals"][1]["provider_status"] == "Inactive"
+    assert any(a["action"] == "status_deactivated" for a in db.tables["audit_log"])
+
+
+def test_absence_grace_period_for_new_contracts():
+    db = _db()
+    _ledger(db, {"2026-06": [E1], "2026-07": [E1], "2026-08": [E1]})
+    deals = _deals(db, (E2, "crm_deals", "2026-07-15"),   # started 1 month ago: first payment not due yet
+                   (E3, "crm_deals", "2025-12-01"))      # old contract, unpaid for 3 months
+    out = absence_sync(db, SUP, "CleanSky", deals, "tester")
+    assert out["in_grace"] == 1 and out["deactivated"] == 1
+    assert db.tables["crm_deals"][0]["deal_status"] == "ACTIVE"
+    assert db.tables["crm_deals"][1]["deal_status"] == "INACTIVE"
+
+
+def test_absence_needs_three_full_statement_months_on_file():
+    db = _db()
+    _ledger(db, {"2026-07": [E1], "2026-08": [E1]})
+    deals = _deals(db, (E2, "crm_deals", "2025-01-01"))
+    out = absence_sync(db, SUP, "Chariot", deals, "tester")
+    assert out["deactivated"] == 0 and "skipped" in out
+    assert db.tables["crm_deals"][0]["deal_status"] == "ACTIVE"
+
+
+def test_stub_statement_month_does_not_count_toward_window():
+    db = _db()
+    _ledger(db, {"2026-05": [E1, E2], "2026-06": [E1], "2026-07": [E1]})
+    _ledger(db, {"2026-08": [E3]}, pad=False)            # 1-row stub vs 11-row months
+    assert _full_statement_months(db, SUP) == ["2026-07-01", "2026-06-01", "2026-05-01"]
+    deals = _deals(db, (E2, "crm_deals", "2025-01-01"), (E3, "crm_deals", "2025-01-01"))
+    out = absence_sync(db, SUP, "Iron Horse", deals, "tester")
+    # window is May-Jul (stub ignored): E2 paid in May -> kept; E3 paid on the stub -> still "seen"
+    assert out["window"] == "2026-05" and out["deactivated"] == 0
+    assert all(d["deal_status"] == "ACTIVE" for d in db.tables["crm_deals"])
+
+
+def test_meter_paid_by_another_rep_is_not_dropped_without_a_twin():
+    db = _db()
+    _ledger(db, {"2026-06": [E1], "2026-07": [E1], "2026-08": [E1]})
+    _ledger(db, {"2026-07": [E2]}, supplier=OTHER, pad=False)   # Budget Power now pays E2
+    deals = _deals(db, (E1, "crm_deals", "2025-01-01"), (E2, "crm_deals", "2025-01-01"))
+    out = absence_sync(db, SUP, "Iron Horse", deals, "tester")
+    assert out["deactivated"] == 0 and out["candidates"] == 0
+    assert [(x["esiid"], x["paid_by"]) for x in out["switched"]] == [(E2, "Budget Power")]
+    assert db.tables["crm_deals"][1]["deal_status"] == "ACTIVE"
+    assert "audit_log" not in db.tables
+
+
+def test_stale_twin_is_dropped_when_other_provider_pays_and_crm_has_that_deal():
+    db = _db()
+    _ledger(db, {"2026-06": [E1], "2026-07": [E1], "2026-08": [E1]})
+    _ledger(db, {"2026-07": [E2]}, supplier=OTHER, pad=False)
+    deals = _deals(db, (E1, "crm_deals", "2025-01-01"),
+                   (E2, "lead_deals", "2025-01-01"))          # old Budget-era pipeline deal
+    db.table("crm_deals").insert({"id": "twin", "esiid": E2, "deal_status": "ACTIVE",
+                                  "provider": "Budget Power"}).execute()
+    out = absence_sync(db, SUP, "Iron Horse", deals, "tester")
+    assert out["deactivated"] == 1 and out["stale_twins"] == 1 and out["switched"] == []
+    assert db.tables["lead_deals"][0]["status"] == "Inactive"
+    assert "now paid by Budget Power" in db.tables["lead_deals"][0]["provider_status_source"]
+    assert [d["deal_status"] for d in db.tables["crm_deals"]] == ["ACTIVE", "ACTIVE"]  # E1 + twin untouched
+
+
+def test_absence_mass_churn_is_held_until_forced():
+    db = _db()
+    _ledger(db, {"2026-06": [E1], "2026-07": [E1], "2026-08": [E1]})
+    deals = _deals(db, (E1, "crm_deals", "2025-01-01"), (E2, "crm_deals", "2025-01-01"),
+                   (E3, "crm_deals", "2025-01-01"))
+    out = absence_sync(db, SUP, "Discount Power/Cirro", deals, "tester")
+    assert out["pending"] and out["held"] == 2 and out["deactivated"] == 0
+    assert all(d["deal_status"] == "ACTIVE" for d in db.tables["crm_deals"])
+    forced = absence_sync(db, SUP, "Discount Power/Cirro", deals, "tester", force=True)
+    assert forced["deactivated"] == 2
+    assert [d["deal_status"] for d in db.tables["crm_deals"]] == ["ACTIVE", "INACTIVE", "INACTIVE"]
+
+
+def test_absence_dry_run_writes_nothing():
+    db = _db()
+    _ledger(db, {"2026-06": [E1], "2026-07": [E1], "2026-08": [E1]})
+    deals = _deals(db, (E1, "crm_deals", "2025-01-01"), (E2, "crm_deals", "2025-01-01"))
+    out = absence_sync(db, SUP, "Tara Energy", deals, "tester", dry_run=True)
+    assert [w["esiid"] for w in out["would_deactivate"]] == [E2]
+    assert all(d["deal_status"] == "ACTIVE" for d in db.tables["crm_deals"])
+    assert "audit_log" not in db.tables
+
+
+def test_hudson_drop_flag_is_trusted():
+    assert "Hudson Energy" in TRUSTED_STATUS_GROUPS
+    assert map_status("drop 2026-07-13 00:00:00") == "inactive"
+    assert map_status("Payment") is None
+    assert map_status("Residential") is None and map_status("Switch Back") is None
+
+
+def test_deals_of_another_provider_group_are_not_judged_by_this_statement():
+    """Budget Power's load_deals() also carries the Direct Energy deals of the
+    transferred book; Budget's statements must not deactivate them."""
+    db = _db()
+    _ledger(db, {"2026-06": [E1], "2026-07": [E1], "2026-08": [E1]})
+    deals = _deals(db, (E1, "lead_deals", "2025-01-01"), (E2, "lead_deals", "2025-01-01"))
+    deals["by_esiid"][E1]["provider"] = "budget power"
+    deals["by_esiid"][E2]["provider"] = "direct energy"       # home group: Discount Power/Cirro
+    out = absence_sync(db, SUP, "Budget Power", deals, "tester")
+    assert out["other_group"] == 1 and out["active"] == 1 and out["deactivated"] == 0
+    assert db.tables["lead_deals"][1]["status"] == "Active"
