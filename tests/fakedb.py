@@ -56,6 +56,11 @@ class FakeQuery:
         self.filters.append(lambda r: needle in str(r.get(col) or ""))
         return self
 
+    def ilike(self, col, pattern):
+        needle = pattern.strip("%").lower()
+        self.filters.append(lambda r: needle in str(r.get(col) or "").lower())
+        return self
+
     def order(self, col, desc=False):
         self.order_by.append((col, desc))
         return self

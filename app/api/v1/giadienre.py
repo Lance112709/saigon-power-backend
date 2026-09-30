@@ -1054,6 +1054,7 @@ def portal_smt_interest(user: dict = Depends(portal_user)):
 # — Daily AI contract monitoring (cron; giadienre.com Vercel Cron calls this) —
 
 MONITOR_WINDOW_DAYS = 90
+MONITOR_EXPIRED_GRACE_DAYS = 30   # stop alerting once a contract is this far past its end
 
 
 @router.post("/monitor/run")
@@ -1086,6 +1087,8 @@ def monitor_run(x_cron_key: str = Header(default="")):
             continue
         counts["with_end_date"] += 1
         days_left = (datetime.strptime(end, "%Y-%m-%d").date() - today).days
+        if days_left < -MONITOR_EXPIRED_GRACE_DAYS:
+            continue
         if days_left < 0:
             counts["expired"] += 1
         elif days_left <= 30:
@@ -1093,6 +1096,12 @@ def monitor_run(x_cron_key: str = Header(default="")):
         elif days_left <= MONITOR_WINDOW_DAYS:
             counts["expiring_90"] += 1
         else:
+            continue
+
+        # one renewal task per contract end date — extra.renewal_alert_end is
+        # stamped when the task is created, so completing or deleting the task
+        # is final until the subscriber's end date changes
+        if (sub.get("extra") or {}).get("renewal_alert_end") == end:
             continue
 
         # one open renewal task per subscription — dedupe on the [gdr:id] marker
@@ -1121,6 +1130,13 @@ def monitor_run(x_cron_key: str = Header(default="")):
             "lead_id": None, "customer_id": None, "deal_id": None,
         }).execute()
         counts["tasks_created"] += 1
+        # re-read extra so a concurrent portal write (bills, card) isn't clobbered
+        cur = db.table("giadienre_subscriptions").select("extra") \
+            .eq("id", sub["id"]).limit(1).execute().data
+        cur_extra = dict((cur[0].get("extra") if cur else {}) or {})
+        cur_extra["renewal_alert_end"] = end
+        db.table("giadienre_subscriptions").update({"extra": cur_extra}) \
+            .eq("id", sub["id"]).execute()
 
     audit(db, "giadienre_subscriptions", "daily-run", "monitor_run", None, counts,
           reason="Daily GiaDienRe contract monitoring", actor="cron:giadienre")
