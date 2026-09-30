@@ -15,6 +15,7 @@ from app.services.merge_vars import lead_merge_vars
 from app.api.v1.tasks import create_lead_tasks
 from app.services.lead_conversion import next_sgp_id, try_convert_lead, heal_stuck_leads
 from app.services import activity
+from app.services.audit import audit
 import logging
 
 logger = logging.getLogger("saigon.leads")
@@ -89,6 +90,14 @@ def _AGENT_REGISTRY() -> dict:
         return {}
 
 
+def lead_deal_name(supplier, service_address) -> Optional[str]:
+    """Lead deals use the same generated name as CRM deals: "<REP> — <street address>".
+    Stored in lead_deals.plan_name (the column the deal name has always lived in)."""
+    rep = str(supplier or "").strip()
+    addr = re.sub(r"\s+", " ", str(service_address or "").strip())
+    return f"{rep} — {addr}" if rep and addr else None
+
+
 def _deal_payload(data: dict) -> dict:
     def _f(key):
         v = data.get(key)
@@ -106,7 +115,7 @@ def _deal_payload(data: dict) -> dict:
         # Contract
         "status":              data.get("status", "Future"),
         "supplier":            str(data.get("supplier") or "").strip() or None,
-        "plan_name":           str(data.get("plan_name") or "").strip() or None,
+        "plan_name":           lead_deal_name(data.get("supplier"), data.get("service_address")),
         "product_type":        str(data.get("product_type") or "").strip() or None,
         "rate_type":           str(data.get("rate_type") or "").strip() or None,
         "contract_term":       str(data.get("contract_term") or "").strip() or None,
@@ -1055,6 +1064,67 @@ def lead_activity(id: str, user: UserContext = Depends(require_admin)):
 
 # ── Lead Detail + Update ───────────────────────────────────────────────────────
 
+def lead_membership(db, lead_id):
+    """Active SmartCare (POWER PLUS) membership linked to a lead, or None.
+    Mirrors crm.customer_membership; needs migration 020 (giadienre_subscriptions.lead_id)."""
+    if not lead_id:
+        return None
+    try:
+        rows = db.table("giadienre_subscriptions").select(
+            "plan_name, plan_id, billing_cycle, status, subscribed_at, next_billing_date, last_payment_amount"
+        ).eq("lead_id", lead_id).eq("status", "ACTIVE") \
+            .order("subscribed_at", desc=True).limit(1).execute().data or []
+    except Exception as e:  # column missing until migration 020 is applied
+        logger.warning("lead_membership unavailable: %s", e)
+        return None
+    if not rows:
+        return None
+    s = rows[0]
+    return {"active": True, "manual": s.get("plan_id") == "SMARTCARE_MANUAL",
+            "plan_name": s.get("plan_name"), "plan_id": s.get("plan_id"),
+            "billing_cycle": s.get("billing_cycle"), "since": s.get("subscribed_at"),
+            "next_billing_date": s.get("next_billing_date"), "amount": s.get("last_payment_amount")}
+
+
+@router.post("/{id}/smartcare-badge")
+def toggle_lead_smartcare_badge(id: str, data: dict = Body(...),
+                                user: UserContext = Depends(require_manager)):
+    """Manual SmartCare Member badge on a lead (badge only, no billing) — same
+    mechanism as the customer page: an ACTIVE SMARTCARE_MANUAL subscription row."""
+    db = get_client()
+    rows = db.table("leads").select("*").eq("id", id).limit(1).execute().data
+    if not rows:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    lead = rows[0]
+    enable = bool(data.get("enabled", True))
+    try:
+        if enable:
+            existing = db.table("giadienre_subscriptions").select("id") \
+                .eq("lead_id", id).eq("plan_id", "SMARTCARE_MANUAL").eq("status", "ACTIVE").limit(1).execute().data
+            if not existing:
+                db.table("giadienre_subscriptions").insert({
+                    "lead_id": id,
+                    "full_name": _full_name(lead) or "Customer",
+                    "email": lead.get("email"), "phone": lead.get("phone"),
+                    "city": lead.get("city"), "state": lead.get("state"), "zip": lead.get("zip"),
+                    "plan_id": "SMARTCARE_MANUAL", "plan_name": "SmartCare (Manual)",
+                    "billing_cycle": "monthly", "status": "ACTIVE",
+                    "form_type": "manual", "lead_source": "CRM Manual",
+                }).execute()
+            audit(db, "leads", id, "smartcare_badge_added", None, {"by": user.email},
+                  reason="Manual SmartCare badge", actor=user.email or "staff")
+        else:
+            db.table("giadienre_subscriptions").delete().eq("lead_id", id).eq("plan_id", "SMARTCARE_MANUAL").execute()
+            audit(db, "leads", id, "smartcare_badge_removed", None, {"by": user.email},
+                  reason="Manual SmartCare badge removed", actor=user.email or "staff")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("lead smartcare badge failed: %s", e)
+        raise HTTPException(status_code=503, detail="SmartCare badge on leads needs database migration 020 (giadienre_subscriptions.lead_id).")
+    return {"membership": lead_membership(db, id)}
+
+
 @router.get("/{id}")
 def get_lead(id: str, user: UserContext = Depends(get_current_user)):
     db = get_client()
@@ -1067,7 +1137,8 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
             raise HTTPException(status_code=403, detail="Access denied")
     deals = db.table("lead_deals").select("*").eq("lead_id", id).order("created_at", desc=True).execute()
     deals_list = _auto_promote_deals(db, deals.data or [])
-    return {**lead.data[0], "full_name": _full_name(lead.data[0]), "deals": deals_list}
+    return {**lead.data[0], "full_name": _full_name(lead.data[0]), "deals": deals_list,
+            "membership": lead_membership(db, id)}
 
 @router.patch("/{id}")
 def update_lead(id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
@@ -1317,6 +1388,12 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
         payload.setdefault("terminated_date", None)
     payload["updated_at"] = _now()
     before = (db.table("lead_deals").select("*").eq("id", deal_id).eq("lead_id", id).limit(1).execute().data or [{}])[0]
+    # Deal name is never typed: regenerate it whenever the REP or address is part of the update.
+    if "supplier" in payload or "service_address" in payload:
+        payload["plan_name"] = lead_deal_name(payload.get("supplier", before.get("supplier")),
+                                              payload.get("service_address", before.get("service_address")))
+    else:
+        payload.pop("plan_name", None)
     # Same rule as Add Deal: an Active deal may not share its ESI ID or service
     # address with another active deal anywhere in the CRM. Checked when the
     # meter/address changes or the deal is being (re)activated — e.g. a website
