@@ -50,14 +50,64 @@ def _fetch(db, table, cols, flt):
     return out
 
 
+# Statement supplier code -> provider family. NRG pays Discount Power / Direct
+# Energy / Cirro / Reliant meters on one residual statement, so those all count
+# as the same family; every other REP is its own family.
+SUPPLIER_FAMILY = {"NRG": "NRG", "NRGBIZ": "NRG", "NRG_COMM": "NRG",
+                   "RELIANT": "NRG", "CIRRO": "NRG"}
+# Deal provider label prefix (letters only, lowercase) -> family.
+_PROVIDER_PREFIXES = (
+    ("discount", "NRG"), ("direct", "NRG"), ("cirro", "NRG"), ("reliant", "NRG"),
+    ("nrg", "NRG"), ("budget", "BUDGET"), ("chariot", "CHARIOT"),
+    ("cleansky", "CLEANSKY"), ("heritage", "HERITAGE"), ("hudson", "HUDSON"),
+    ("ironhorse", "IRONHORSE"), ("apg", "APGE"), ("tara", "TARA"),
+    ("pennywise", "PENNYWISE"),
+)
+
+
+def provider_family(label) -> Optional[str]:
+    """Family for a deal's provider label ('Discount Power' -> 'NRG'); None if unknown."""
+    key = re.sub(r"[^a-z]", "", str(label or "").lower())
+    for prefix, fam in _PROVIDER_PREFIXES:
+        if key.startswith(prefix):
+            return fam
+    return None
+
+
+def supplier_family(code) -> Optional[str]:
+    code = str(code or "").strip().upper()
+    return SUPPLIER_FAMILY.get(code, code or None)
+
+
+def split_by_provider(rows: list, family: Optional[str], sup_codes: dict) -> tuple:
+    """(rows for this deal's provider family, rows from other providers).
+    With no family known, everything is kept — same as before."""
+    if not family:
+        return rows, []
+    keep, other = [], []
+    for r in rows:
+        fam = supplier_family(sup_codes.get(r.get("supplier_id")))
+        (keep if fam == family else other).append(r)
+    return keep, other
+
+
 def _esiids_for(db, customer_id: Optional[str], deal_id: Optional[str],
                 lead_id: Optional[str]) -> list:
-    esiids = []
+    return _scope_for(db, customer_id, deal_id, lead_id)[0]
+
+
+def _scope_for(db, customer_id: Optional[str], deal_id: Optional[str],
+               lead_id: Optional[str]) -> tuple:
+    """(esiids, provider_label, provider_family). A deal-scoped request also
+    carries the deal's provider so statements from other REPs on the same
+    meter (e.g. an old Chariot contract) are not shown under it."""
+    esiids, label = [], None
     if deal_id:
-        for t in ("crm_deals", "lead_deals"):
-            r = db.table(t).select("esiid").eq("id", deal_id).limit(1).execute().data
+        for t, col in (("crm_deals", "provider"), ("lead_deals", "supplier")):
+            r = db.table(t).select(f"esiid,{col}").eq("id", deal_id).limit(1).execute().data
             if r:
                 esiids = [r[0].get("esiid")]
+                label = r[0].get(col)
                 break
     elif customer_id:
         r = db.table("crm_deals").select("esiid").eq("customer_id", customer_id).execute().data
@@ -65,7 +115,26 @@ def _esiids_for(db, customer_id: Optional[str], deal_id: Optional[str],
     elif lead_id:
         r = db.table("lead_deals").select("esiid").eq("lead_id", lead_id).execute().data
         esiids = [d.get("esiid") for d in r or []]
-    return sorted({norm_es(e) for e in esiids if norm_es(e)})
+    return sorted({norm_es(e) for e in esiids if norm_es(e)}), label, provider_family(label)
+
+
+def _suppliers(db, rows: list) -> tuple:
+    """(id -> name, id -> code) for the suppliers referenced by rows."""
+    sup_ids = sorted({r["supplier_id"] for r in rows if r.get("supplier_id")})
+    if not sup_ids:
+        return {}, {}
+    sups = db.table("suppliers").select("id,name,code").in_("id", sup_ids).execute().data or []
+    return {s["id"]: s["name"] for s in sups}, {s["id"]: s.get("code") for s in sups}
+
+
+def _hidden_summary(other: list, names: dict) -> dict:
+    """What a deal page is not showing: payments on this meter from other REPs."""
+    by_sup: dict = {}
+    for r in other:
+        by_sup[names.get(r.get("supplier_id")) or "Unknown supplier"] = \
+            by_sup.get(names.get(r.get("supplier_id")) or "Unknown supplier", 0) + 1
+    return {"count": len(other),
+            "suppliers": [{"supplier": k, "count": v} for k, v in sorted(by_sup.items(), key=lambda x: -x[1])]}
 
 
 @router.get("")
@@ -78,20 +147,17 @@ def list_payments(
     if not (customer_id or deal_id or lead_id):
         raise HTTPException(status_code=400, detail="Pass customer_id, deal_id, or lead_id")
     db = get_client()
-    esiids = _esiids_for(db, customer_id, deal_id, lead_id)
+    esiids, provider, family = _scope_for(db, customer_id, deal_id, lead_id)
     if not esiids:
-        return {"esi_ids": [], "payments": [], "total": 0, "months": []}
+        return {"esi_ids": [], "payments": [], "total": 0, "months": [], "provider": provider}
 
     rows = _fetch(db, "actual_commissions",
                   "id,raw_esiid,resolved_esiid,billing_month,raw_amount,raw_kwh,raw_rate,"
                   "raw_customer_name,supplier_id,upload_batch_id,is_matched,created_at,raw_row_data",
                   lambda q: q.in_("raw_esiid", esiids))
 
-    sup_ids = sorted({r["supplier_id"] for r in rows if r.get("supplier_id")})
-    sups = {}
-    if sup_ids:
-        sups = {s["id"]: s["name"] for s in
-                db.table("suppliers").select("id,name").in_("id", sup_ids).execute().data}
+    sups, codes = _suppliers(db, rows)
+    rows, other = split_by_provider(rows, family, codes)
     batch_ids = sorted({r["upload_batch_id"] for r in rows if r.get("upload_batch_id")})
     batches = {}
     for i in range(0, len(batch_ids), 100):
@@ -142,6 +208,8 @@ def list_payments(
         "total": round(sum(p["amount"] for p in payments), 2),
         "months": month_list,
         "latest_status": month_list[0]["status"] if month_list else None,
+        "provider": provider,
+        "hidden_other_provider": _hidden_summary(other, sups),
     }
 
 
@@ -216,19 +284,16 @@ def usage(
                 raise HTTPException(status_code=404, detail="Deal not found")
             assert_lead_access(db, user, ld[0]["lead_id"])
 
-    esiids = _esiids_for(db, customer_id, deal_id, lead_id)
+    esiids, provider, family = _scope_for(db, customer_id, deal_id, lead_id)
     if not esiids:
-        return {"esi_ids": [], "payments": []}
+        return {"esi_ids": [], "payments": [], "provider": provider}
 
     rows = _fetch(db, "actual_commissions",
                   "id,raw_esiid,resolved_esiid,billing_month,raw_kwh,supplier_id,raw_row_data",
                   lambda q: q.in_("raw_esiid", esiids))
 
-    sup_ids = sorted({r["supplier_id"] for r in rows if r.get("supplier_id")})
-    sups = {}
-    if sup_ids:
-        sups = {s["id"]: s["name"] for s in
-                db.table("suppliers").select("id,name").in_("id", sup_ids).execute().data}
+    sups, codes = _suppliers(db, rows)
+    rows, other = split_by_provider(rows, family, codes)
 
     payments = []
     for r in sorted(rows, key=lambda x: (x.get("billing_month") or ""), reverse=True):
@@ -243,4 +308,5 @@ def usage(
             "service_end": norm.get("service_end"),
         })
 
-    return {"esi_ids": esiids, "payments": payments}
+    return {"esi_ids": esiids, "payments": payments, "provider": provider,
+            "hidden_other_provider": _hidden_summary(other, sups)}

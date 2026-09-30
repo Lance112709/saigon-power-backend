@@ -145,3 +145,28 @@ def test_agent_name_suggestions_and_explicit_renames():
     with pytest.raises(ValueError):
         an.normalize_deal_agent_names(db, dry_run=True, renames={"Somebody Else": "Nobody"})
     assert an.canonical_agent(db, "  nga   nguyen ") == "Nga Nguyen" and an.canonical_agent(db, "") is None
+
+
+def test_provider_family_groups_nrg_brands_and_keeps_others_apart():
+    from app.api.v1.commission_payments import provider_family, supplier_family
+    assert provider_family("Discount Power") == "NRG"
+    assert provider_family("Direct Energy") == "NRG"
+    assert provider_family("NRG") == "NRG"
+    assert provider_family("CHARIOT") == "CHARIOT"
+    assert provider_family("Chariot Energy") == "CHARIOT"
+    assert provider_family("BUDGET POWER") == "BUDGET"
+    assert provider_family("") is None and provider_family(None) is None
+    assert supplier_family("NRGBIZ") == "NRG" and supplier_family("RELIANT") == "NRG"
+    assert supplier_family("CHARIOT") == "CHARIOT"
+
+
+def test_split_by_provider_hides_other_reps_on_same_meter():
+    from app.api.v1.commission_payments import split_by_provider
+    codes = {"s-chariot": "CHARIOT", "s-nrg": "NRG"}
+    rows = [{"id": 1, "supplier_id": "s-chariot"}, {"id": 2, "supplier_id": "s-nrg"},
+            {"id": 3, "supplier_id": "s-chariot"}]
+    keep, other = split_by_provider(rows, "NRG", codes)
+    assert [r["id"] for r in keep] == [2] and [r["id"] for r in other] == [1, 3]
+    # unknown provider label -> nothing filtered (customer/lead pages, blank provider)
+    keep, other = split_by_provider(rows, None, codes)
+    assert len(keep) == 3 and other == []
