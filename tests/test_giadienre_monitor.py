@@ -9,8 +9,12 @@ from app.api.v1 import giadienre
 from tests.fakedb import FakeDB
 
 
-def _run(db, monkeypatch):
+def _run(db, monkeypatch, tasks_on=True):
     monkeypatch.setenv("GDR_CRON_KEY", "k")
+    if tasks_on:
+        monkeypatch.setenv("GDR_MONITOR_TASKS", "1")
+    else:
+        monkeypatch.delenv("GDR_MONITOR_TASKS", raising=False)
     monkeypatch.setattr(giadienre, "get_client", lambda: db)
     monkeypatch.setattr("app.services.sms.send_sms", lambda *a, **k: None)
     return giadienre.monitor_run(x_cron_key="k")
@@ -27,6 +31,15 @@ def _sub(db, days, **kw):
 
 def _renewals(db):
     return [t for t in db.tables.get("tasks", []) if "GiaDienRe renewal" in t["title"]]
+
+
+def test_renewal_tasks_are_off_by_default(monkeypatch):
+    db = FakeDB()
+    _sub(db, 10)
+    res = _run(db, monkeypatch, tasks_on=False)
+    assert res["expiring_30"] == 1 and res["tasks_created"] == 0
+    assert _renewals(db) == []
+    assert db.tables["giadienre_subscriptions"][0]["extra"] == {"bills": [1]}
 
 
 def test_deleted_or_completed_task_is_not_recreated(monkeypatch):

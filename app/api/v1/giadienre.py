@@ -1098,6 +1098,11 @@ def monitor_run(x_cron_key: str = Header(default="")):
         else:
             continue
 
+        # Renewal tasks are off (Lance, 2026-10-02: keep them out of Tasks &
+        # Follow-Ups); the run still counts and audits. GDR_MONITOR_TASKS=1 re-enables.
+        if os.environ.get("GDR_MONITOR_TASKS") != "1":
+            continue
+
         # one renewal task per contract end date — extra.renewal_alert_end is
         # stamped when the task is created, so completing or deleting the task
         # is final until the subscriber's end date changes
