@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Query, Body, Depends
+from fastapi import APIRouter, HTTPException, Query, Body, Depends, BackgroundTasks
 from typing import Optional
 from datetime import datetime, timezone, timedelta
 from app.db.client import get_client
@@ -93,6 +93,14 @@ def create_deal_renewal_tasks(db, lead_id: str, deal_id: str, lead_name: str, en
 def trigger_reminders(user: UserContext = Depends(get_current_user)):
     from app.services.email_reminders import send_task_reminders
     return send_task_reminders()
+
+@router.get("/assignees")
+def task_assignees(user: UserContext = Depends(get_current_user)):
+    """Active users a task can be assigned to. Open to every signed-in user
+    (the full /users list is admin-only), so it returns names and roles only."""
+    db = get_client()
+    res = db.table("users").select("id, first_name, last_name, role").eq("status", "active").order("first_name").execute()
+    return res.data or []
 
 @router.get("/stats")
 def task_stats(user: UserContext = Depends(get_current_user)):
@@ -193,7 +201,7 @@ def list_tasks(
     return results
 
 @router.post("")
-def create_task(data: dict = Body(...), user: UserContext = Depends(get_current_user)):
+def create_task(background: BackgroundTasks, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     if not data.get("lead_id") and not data.get("deal_id") and not data.get("customer_id") and not data.get("crm_deal_id"):
         raise HTTPException(status_code=400, detail="Task must be linked to a lead, deal, or customer")
@@ -215,11 +223,22 @@ def create_task(data: dict = Body(...), user: UserContext = Depends(get_current_
         "status":      "pending",
         "assigned_to": str(data.get("assigned_to") or "").strip() or None,
     }
-    res = db.table("tasks").insert(payload).execute()
-    return res.data[0]
+    creator = {"created_by": user.name, "created_by_id": user.user_id}
+    try:
+        res = db.table("tasks").insert({**payload, **creator}).execute()
+    except Exception as e:
+        # Migration 021 not applied yet: save the task without its creator.
+        if "created_by" not in str(e):
+            raise
+        res = db.table("tasks").insert(payload).execute()
+    task = res.data[0]
+    if task.get("assigned_to"):
+        from app.services.email_reminders import notify_task_assigned
+        background.add_task(notify_task_assigned, task, user.user_id, user.name)
+    return task
 
 @router.patch("/{task_id}")
-def update_task(task_id: str, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
+def update_task(task_id: str, background: BackgroundTasks, data: dict = Body(...), user: UserContext = Depends(get_current_user)):
     db = get_client()
     allowed = {"title", "description", "due_date", "status", "priority", "assigned_to", "task_type"}
     payload = {k: v for k, v in data.items() if k in allowed}
@@ -227,10 +246,19 @@ def update_task(task_id: str, data: dict = Body(...), user: UserContext = Depend
         raise HTTPException(status_code=400, detail="No valid fields")
     if payload.get("status") == "completed":
         payload["completed_at"] = _now()
+    before = db.table("tasks").select("status, assigned_to").eq("id", task_id).execute().data
+    if not before:
+        raise HTTPException(status_code=404, detail="Task not found")
     res = db.table("tasks").update(payload).eq("id", task_id).execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Task not found")
-    return res.data[0]
+    task = res.data[0]
+    from app.services.email_reminders import notify_task_assigned, notify_task_completed
+    if task.get("assigned_to") and task.get("assigned_to") != before[0].get("assigned_to"):
+        background.add_task(notify_task_assigned, task, user.user_id, user.name)
+    if task.get("status") == "completed" and before[0].get("status") != "completed":
+        background.add_task(notify_task_completed, task, user.user_id, user.name)
+    return task
 
 @router.delete("/{task_id}")
 def delete_task(task_id: str, user: UserContext = Depends(get_current_user)):
