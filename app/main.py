@@ -165,7 +165,7 @@ def _run_sgp_evaluation():
 
 try:
     scheduler = BackgroundScheduler(timezone="America/Chicago")
-    scheduler.add_job(_run_reminders, "cron", hour=8, minute=0)
+    scheduler.add_job(_run_reminders, "cron", hour=9, minute=0)
     scheduler.add_job(_run_ai_daily, "cron", hour=6, minute=0)
     scheduler.add_job(_run_ai_monthly, "cron", day=1, hour=6, minute=30)
     scheduler.add_job(_run_renewal_sms, "cron", hour=9, minute=0)
