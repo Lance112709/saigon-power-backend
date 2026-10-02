@@ -1,9 +1,12 @@
 name: Nightly database backup
 
-# Dumps the Supabase Postgres database (public schema) and uploads it to
-# Google Drive. Keeps 30 daily dumps + 13 monthly dumps. Optionally mirrors the
-# Supabase Storage buckets (contracts, attachments, statements) as well.
-# Setup + restore steps: docs/database-backups.md
+# Dumps the Supabase Postgres database (public schema), encrypts it, and keeps
+# it as a GitHub Actions artifact (30 days). If a Google Drive token is also
+# configured, the encrypted dump goes to Drive too (30 daily + ~13 monthly).
+#
+# Only required secret: SUPABASE_DB_PASSWORD (the database password).
+# Dumps are encrypted with .github/backup-public.pem; the matching private key
+# lives OUTSIDE this repo. Setup + restore steps: docs/database-backups.md
 
 on:
   schedule:
@@ -17,11 +20,17 @@ concurrency:
 permissions: {}
 
 env:
+  # Session pooler (IPv4) — the direct host is IPv6-only and runners are IPv4.
+  DB_HOST: aws-1-us-west-2.pooler.supabase.com
+  DB_PORT: "5432"
+  DB_USER: postgres.larwckswepsgvtsdgthv
+  DB_NAME: postgres
   DRIVE_FOLDER: "Saigon Power CRM Backups"
   # rclone remote "gdrive" — configured entirely from env, no config file
   RCLONE_CONFIG_GDRIVE_TYPE: drive
   RCLONE_CONFIG_GDRIVE_SCOPE: drive.file
   RCLONE_CONFIG_GDRIVE_TOKEN: ${{ secrets.GDRIVE_RCLONE_TOKEN }}
+  HAS_DRIVE: ${{ secrets.GDRIVE_RCLONE_TOKEN != '' }}
   HAS_STORAGE_KEYS: ${{ secrets.SUPABASE_S3_ACCESS_KEY_ID != '' && secrets.SUPABASE_S3_SECRET_ACCESS_KEY != '' }}
 
 jobs:
@@ -29,6 +38,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: .github/backup-public.pem
+          sparse-checkout-cone-mode: false
+
       - name: Install pg_dump 17 and rclone
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -44,14 +59,16 @@ jobs:
 
       - name: Dump database
         env:
-          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          PGPASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
+          PGSSLMODE: require
         run: |
-          if [ -z "$SUPABASE_DB_URL" ]; then
-            echo "::error::SUPABASE_DB_URL secret is not set"; exit 1
+          if [ -z "$PGPASSWORD" ]; then
+            echo "::error::SUPABASE_DB_PASSWORD secret is not set (GitHub → repo Settings → Secrets → Actions)"; exit 1
           fi
           STAMP=$(date -u +%Y-%m-%d)
+          echo "STAMP=${STAMP}" >> "$GITHUB_ENV"
           echo "DUMP_FILE=saigon-crm-${STAMP}.dump" >> "$GITHUB_ENV"
-          pg_dump "$SUPABASE_DB_URL" \
+          pg_dump -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" \
             --schema=public --format=custom --compress=9 \
             --no-owner --no-privileges \
             --file="saigon-crm-${STAMP}.dump"
@@ -74,18 +91,39 @@ jobs:
               || { echo "::error::table ${t} missing from dump"; exit 1; }
           done
 
-      - name: Upload to Google Drive
+      # Hybrid encryption: random AES key for the dump, key wrapped with the
+      # RSA public key. Decrypt steps in docs/database-backups.md.
+      - name: Encrypt dump
         run: |
-          rclone copy "$DUMP_FILE" "gdrive:${DRIVE_FOLDER}/daily" --quiet
+          mkdir -p out
+          openssl rand -hex 32 > dump.key
+          openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -salt \
+            -in "$DUMP_FILE" -out "out/${DUMP_FILE}.enc" -pass file:dump.key
+          openssl pkeyutl -encrypt -pubin -inkey .github/backup-public.pem \
+            -pkeyopt rsa_padding_mode:oaep -in dump.key -out "out/${DUMP_FILE}.key.enc"
+          shred -u dump.key "$DUMP_FILE"
+          (cd out && sha256sum ./* > "${DUMP_FILE}.sha256")
+          ls -lh out
+
+      - name: Keep on GitHub (30 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: saigon-crm-${{ env.STAMP }}
+          path: out/
+          retention-days: 30
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload to Google Drive
+        if: env.HAS_DRIVE == 'true'
+        run: |
+          rclone copy out/ "gdrive:${DRIVE_FOLDER}/daily" --quiet
           if [ "$(date -u +%d)" = "01" ]; then
-            rclone copy "$DUMP_FILE" "gdrive:${DRIVE_FOLDER}/monthly" --quiet
+            rclone copy out/ "gdrive:${DRIVE_FOLDER}/monthly" --quiet
           fi
           # Confirm the file really landed
           rclone lsf "gdrive:${DRIVE_FOLDER}/daily" > uploaded.txt
-          grep -qx "$DUMP_FILE" uploaded.txt
-
-      - name: Prune old dumps
-        run: |
+          grep -qx "${DUMP_FILE}.enc" uploaded.txt
           rclone delete "gdrive:${DRIVE_FOLDER}/daily" --min-age 30d --quiet
           rclone delete "gdrive:${DRIVE_FOLDER}/monthly" --min-age 400d --quiet
 
@@ -93,7 +131,7 @@ jobs:
       # in Supabase Storage, not in Postgres. Runs only once the S3 keys are set.
       # `copy`, not `sync`: a file deleted in Supabase stays in the backup.
       - name: Mirror Supabase Storage files
-        if: env.HAS_STORAGE_KEYS == 'true'
+        if: env.HAS_DRIVE == 'true' && env.HAS_STORAGE_KEYS == 'true'
         env:
           RCLONE_CONFIG_SUPA_TYPE: s3
           RCLONE_CONFIG_SUPA_PROVIDER: Other
