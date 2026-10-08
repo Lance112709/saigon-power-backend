@@ -154,6 +154,8 @@ def _enrich_deals(db, deals: list) -> None:
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
+ACCOUNT_FLAGS = {"VIP Client", "Red Flag", "65+", "Payment Assistance Programs", "GHOST"}
+
 @router.get("/stats")
 def get_crm_stats(user: UserContext = Depends(require_admin)):
     db = get_client()
@@ -710,11 +712,18 @@ def update_customer(id: str, data: dict = Body(...), user: UserContext = Depends
     db = get_client()
     assert_customer_access(db, user, id)
     allowed = {"full_name", "business_name", "first_name", "last_name", "email", "phone", "dob",
-               "mailing_address", "city", "state", "postal_code", "notes"}
+               "mailing_address", "city", "state", "postal_code", "notes", "account_flag"}
     payload = {k: v for k, v in data.items() if k in allowed}
     from datetime import datetime, timezone
     result = {}
     before = (db.table("crm_customers").select("*").eq("id", id).limit(1).execute().data or [{}])[0]
+    if "account_flag" in payload:
+        flag = (payload["account_flag"] or "").strip() or None
+        if flag is not None and flag not in ACCOUNT_FLAGS:
+            raise HTTPException(status_code=400, detail=f"Unknown account flag: {flag}")
+        payload["account_flag"] = flag
+        if flag is None and "account_flag" not in before:
+            payload.pop("account_flag")  # column not migrated yet (022) — don't break plain edits
     if payload:
         payload["updated_at"] = datetime.now(timezone.utc).isoformat()
         res = db.table("crm_customers").update(payload).eq("id", id).execute()
