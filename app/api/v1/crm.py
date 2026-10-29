@@ -4,6 +4,7 @@ from typing import Optional
 import re
 import io
 import csv
+import logging
 from datetime import datetime as dt
 from app.services.agent_names import canonical_agent
 from app.services.rates import normalize_rate
@@ -13,6 +14,8 @@ from app.auth.ownership import assert_customer_access, assert_crm_deal_access
 from app.core.security import sanitize_search
 from app.services.audit import audit
 from app.services import activity
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -110,17 +113,59 @@ def _to_float(val) -> Optional[float]:
 
 def _promote_future_deals(db, deals: list) -> None:
     """Flip FUTURE deals (e.g. renewals signed ahead of time) to ACTIVE once
-    their contract start date has passed. Same rule lead deals use."""
+    their contract start date has passed. Same rule lead deals use.
+
+    The duplicate-active-meter guard (migration 012) rejects the flip while an
+    older deal on the same ESI ID is still ACTIVE. That happens when a provider
+    statement re-activated the predecessor before the renewal started (it was
+    still paying), or when the old contract lives as a shell deal on another
+    customer record. Either way the meter has handed over, so the predecessor
+    is retired as RENEWED first. Failures are logged, never swallowed."""
     from datetime import date
     today = date.today().isoformat()
     for d in deals:
         start = (d.get("contract_start_date") or "")[:10]
-        if d.get("deal_status") == "FUTURE" and start and start <= today:
+        if d.get("deal_status") != "FUTURE" or not start or start > today:
+            continue
+        esiid = (d.get("esiid") or "").strip()
+        if esiid:
             try:
-                db.table("crm_deals").update({"deal_status": "ACTIVE"}).eq("id", d["id"]).execute()
-                d["deal_status"] = "ACTIVE"
+                blockers = db.table("crm_deals").select("id, customer_id, contract_start_date") \
+                    .eq("esiid", esiid).eq("deal_status", "ACTIVE").neq("id", d["id"]).execute().data or []
             except Exception:
-                pass  # duplicate-active-ESIID guard may block; leave as FUTURE
+                logger.exception("auto-promote: blocker lookup failed for crm_deal %s", d.get("id"))
+                blockers = []
+            skip = False
+            for b in blockers:
+                b_start = (b.get("contract_start_date") or "")[:10]
+                if b_start and b_start > start:
+                    # The other deal is newer than this one — not a predecessor.
+                    logger.warning("auto-promote: crm_deal %s left FUTURE; newer ACTIVE deal %s on ESI %s",
+                                   d.get("id"), b.get("id"), esiid)
+                    skip = True
+                    continue
+                try:
+                    db.table("crm_deals").update({"deal_status": "RENEWED"}).eq("id", b["id"]).execute()
+                    audit(db, "crm_deals", b["id"], "deal_renewed",
+                          {"deal_status": "ACTIVE"}, {"deal_status": "RENEWED"},
+                          reason=f"Superseded by deal {d['id']} on the same ESI ID starting {start}",
+                          actor="auto-promote")
+                    for other in deals:
+                        if other.get("id") == b["id"]:
+                            other["deal_status"] = "RENEWED"
+                except Exception:
+                    logger.exception("auto-promote: could not retire predecessor %s for crm_deal %s", b.get("id"), d.get("id"))
+                    skip = True
+            if skip:
+                continue
+        try:
+            db.table("crm_deals").update({"deal_status": "ACTIVE"}).eq("id", d["id"]).execute()
+            d["deal_status"] = "ACTIVE"
+            audit(db, "crm_deals", d["id"], "deal_updated",
+                  {"deal_status": "FUTURE"}, {"deal_status": "ACTIVE"},
+                  reason=f"Contract start date {start} reached", actor="auto-promote")
+        except Exception:
+            logger.exception("auto-promote failed for crm_deal %s", d.get("id"))
 
 def _enrich_deals(db, deals: list) -> None:
     """Backfill energy_rate and sales_agent from actual_commissions by ESIID."""
