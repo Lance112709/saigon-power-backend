@@ -1290,6 +1290,15 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
                                              exclude_crm_id=id)
         if conflict:
             raise HTTPException(status_code=409, detail=conflict)
+    # Edit Deal hides the adder for non-Commercial meters; if the stored value
+    # is still empty, fill the REP default now (same rule as Add / Renew).
+    if "adder" not in payload and before.get("adder") is None:
+        probe = {"adder": None,
+                 "meter_type": payload.get("meter_type", before.get("meter_type")),
+                 "provider": payload.get("provider", before.get("provider"))}
+        fill_default_adder(db, probe)
+        if probe["adder"] is not None:
+            payload["adder"] = probe["adder"]
     payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     res = db.table("crm_deals").update(payload).eq("id", id).execute()
     new_status = payload.get("deal_status")
