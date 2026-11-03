@@ -78,6 +78,7 @@ CRM_PROVIDER_GROUPS = {
     "cleansky energy": "CleanSky", "cleansky": "CleanSky",
     "hudson": "Hudson Energy", "hudson energy": "Hudson Energy",
     "heritage": "Heritage Power", "heritage power": "Heritage Power",
+    "bkv": "BKV Energy", "bkv energy": "BKV Energy",   # added 2026-11-03; no statement parser yet
 }
 
 

@@ -61,7 +61,7 @@ _PROVIDER_PREFIXES = (
     ("nrg", "NRG"), ("budget", "BUDGET"), ("chariot", "CHARIOT"),
     ("cleansky", "CLEANSKY"), ("heritage", "HERITAGE"), ("hudson", "HUDSON"),
     ("ironhorse", "IRONHORSE"), ("apg", "APGE"), ("tara", "TARA"),
-    ("pennywise", "PENNYWISE"),
+    ("pennywise", "PENNYWISE"), ("bkv", "BKV"),
 )
 
 

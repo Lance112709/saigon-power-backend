@@ -363,6 +363,7 @@ _SUPPLIER_ALIASES = {
     "apge": "APG&E", "reliant": "Reliant Energy", "reliantenergy": "Reliant Energy",
     "cirro": "Cirro Energy", "cirroenergy": "Cirro Energy",
     "pennywise": "Pennywise Energy", "pennywiseenergy": "Pennywise Energy",
+    "bkv": "BKV Energy", "bkvenergy": "BKV Energy",
 }
 
 

@@ -29,6 +29,7 @@ PROVIDER_TO_CODE = {
     "CHARIOT ENERGY": "CHARIOT",
     "CLEANSKY ENERGY": "CLEANSKY",
     "HUDSON ENERGY": "HUDSON",
+    "BKV ENERGY": "BKV", "BKV": "BKV",
 }
 
 # Flexible supplier name → code (lowercase keys)
@@ -52,6 +53,7 @@ SUPPLIER_ALIASES: dict = {
     "power next": "POWERNEXT", "powernext": "POWERNEXT",
     "goodcharlie": "GOODCHARLIE", "good charlie": "GOODCHARLIE",
     "sfe energy": "SFE", "sfe": "SFE",
+    "bkv": "BKV", "bkv energy": "BKV",
 }
 
 ACTIVE_STATUSES  = {"active", "yes", "open", "current", "enrolled", "a", "1"}
@@ -79,7 +81,7 @@ SAMPLE_ROW = [
 VALID_SUPPLIERS = [
     "Budget Power", "Iron Horse", "Heritage Power", "NRG Energy",
     "Discount Power", "Chariot Energy", "CleanSky Energy", "Hudson Energy",
-    "Reliant", "Direct Energy", "Cirro Energy", "True Power",
+    "Reliant", "Direct Energy", "Cirro Energy", "True Power", "BKV Energy",
 ]
 
 def _extract_email(contact_str: str) -> Optional[str]:
