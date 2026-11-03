@@ -826,6 +826,35 @@ def _all_known_esiids(db) -> set:
     return esiids
 
 
+def supplier_default_adder(db, provider) -> Optional[float]:
+    """suppliers.default_adder for a REP label (case-insensitive name match),
+    or None when the REP is unknown or has no default set."""
+    name = str(provider or "").strip()
+    if not name:
+        return None
+    # Dropdown labels are sometimes short ("Chariot", "Reliant"); resolve
+    # those through the alias table to the supplier code first.
+    code = SUPPLIER_ALIASES.get(name.lower())
+    try:
+        q = db.table("suppliers").select("default_adder")
+        res = (q.eq("code", code) if code else q.ilike("name", name)).limit(1).execute()
+        if not res.data and code:
+            res = db.table("suppliers").select("default_adder").ilike("name", name).limit(1).execute()
+    except Exception:
+        return None
+    if res.data and res.data[0].get("default_adder") is not None:
+        return float(res.data[0]["default_adder"])
+    return None
+
+
+def fill_default_adder(db, payload: dict) -> None:
+    """Non-Commercial meters take the REP's flat default adder when the form
+    sent none (the Add Deal / Renew forms only show the adder field for
+    Commercial meters, whose adder is custom per deal)."""
+    if payload.get("adder") is None and str(payload.get("meter_type") or "").strip().lower() != "commercial":
+        payload["adder"] = supplier_default_adder(db, payload.get("provider"))
+
+
 def generated_deal_name(provider, service_address) -> str:
     """'<REP> — <street>' — the one naming rule for new deals (e.g. 'Heritage Power — 12334 Test Dr').
     Street = the part of the service address before the first comma."""
@@ -927,6 +956,7 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         "flag_delinked":         bool(data.get("flag_delinked", False)),
         "created_by":            user.name,
     }
+    fill_default_adder(db, payload)
     res = db.table("crm_deals").insert(payload).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Failed to create deal")
@@ -1197,6 +1227,7 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
                                 or data.get("deal_name") or orig.get("deal_name"),
         "created_by":           user.name,
     }
+    fill_default_adder(db, new_deal)
     res = db.table("crm_deals").insert(new_deal).execute()
     if res.data:
         activity.record(db, user, "crm_deals", res.data[0]["id"], "deal_created", None,
