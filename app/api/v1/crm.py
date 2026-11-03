@@ -13,6 +13,7 @@ from app.auth.deps import get_current_user, require_admin, require_manager, User
 from app.auth.ownership import assert_customer_access, assert_crm_deal_access
 from app.core.security import sanitize_search
 from app.services.audit import audit
+from app.services.adder_visibility import can_see_adder, redact_adder, redact_adder_one
 from app.services import activity
 
 logger = logging.getLogger(__name__)
@@ -585,6 +586,7 @@ def get_customer(id: str, user: UserContext = Depends(get_current_user)):
         deals = [d for d in deals if (d.get("sales_agent") or "").lower() == agent_name]
         if not deals:
             raise HTTPException(status_code=403, detail="Access denied")
+    redact_adder(user, deals)
     return {**c.data[0], "deals": deals, "membership": customer_membership(db, id)}
 
 
@@ -956,13 +958,15 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         "flag_delinked":         bool(data.get("flag_delinked", False)),
         "created_by":            user.name,
     }
+    if not can_see_adder(user, payload.get("sales_agent")):
+        payload["adder"] = None           # callers who may not see the adder cannot set it
     fill_default_adder(db, payload)
     res = db.table("crm_deals").insert(payload).execute()
     if not res.data:
         raise HTTPException(status_code=500, detail="Failed to create deal")
     activity.record(db, user, "crm_deals", res.data[0]["id"], "deal_created", None,
                     {k: v for k, v in payload.items() if v not in (None, False, "") and k not in ("customer_id", "created_by")})
-    return res.data[0]
+    return redact_adder_one(user, res.data[0])
 
 def _apply_deal_filters(q, search, provider, deal_status, meter_type, deal_type, sales_agent):
     if provider:
@@ -1051,6 +1055,7 @@ def list_deals(
     # Sales agents only see their own deals
     if user.is_sales_agent and user.sales_agent_name:
         deals = [d for d in deals if (d.get("sales_agent") or "").lower() == user.sales_agent_name.lower()]
+    redact_adder(user, deals)
     return deals
 
 @router.get("/deals/check-duplicate")
@@ -1144,7 +1149,7 @@ def get_deal(id: str, user: UserContext = Depends(get_current_user)):
     if user.is_sales_agent and user.sales_agent_name:
         if (deal.get("sales_agent") or "").lower() != user.sales_agent_name.lower():
             raise HTTPException(status_code=403, detail="Access denied")
-    return deal
+    return redact_adder_one(user, deal)
 
 @router.get("/deals/{id}/notes")
 def get_deal_notes(id: str, user: UserContext = Depends(get_current_user)):
@@ -1227,13 +1232,15 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
                                 or data.get("deal_name") or orig.get("deal_name"),
         "created_by":           user.name,
     }
+    if not can_see_adder(user, new_deal.get("sales_agent")):
+        new_deal["adder"] = None
     fill_default_adder(db, new_deal)
     res = db.table("crm_deals").insert(new_deal).execute()
     if res.data:
         activity.record(db, user, "crm_deals", res.data[0]["id"], "deal_created", None,
                         {k: v for k, v in new_deal.items() if v not in (None, False, "") and k not in ("customer_id", "created_by")},
                         reason=f"Renewal of {orig.get('deal_name') or 'previous deal'}")
-    return res.data[0]
+    return redact_adder_one(user, res.data[0])
 
 @router.delete("/deals/{id}")
 def delete_deal(id: str, user: UserContext = Depends(require_manager)):
@@ -1276,6 +1283,10 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
         payload["energy_rate"] = normalize_rate(payload["energy_rate"])
     from datetime import datetime, timezone
     before = (db.table("crm_deals").select("*").eq("id", id).limit(1).execute().data or [{}])[0]
+    if "adder" in payload and not can_see_adder(user, payload.get("sales_agent", before.get("sales_agent"))):
+        payload.pop("adder")
+        if not payload:
+            raise HTTPException(status_code=400, detail="No valid fields to update")
     # Same rule as Add Deal: an ACTIVE deal may not share its ESI ID or service
     # address with another active deal. Checked when the meter/address changes
     # or the deal is being (re)activated — never for unrelated edits.
@@ -1307,7 +1318,7 @@ def update_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get
     else:
         action = "deal_updated"
     activity.record_update(db, user, "crm_deals", id, before, payload, action=action)
-    return res.data[0] if res.data else {}
+    return redact_adder_one(user, res.data[0]) if res.data else {}
 
 # ── Activity log ──────────────────────────────────────────────────────────────
 

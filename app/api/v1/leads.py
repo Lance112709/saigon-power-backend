@@ -7,6 +7,7 @@ import io
 import csv
 from app.services.agent_names import canonical_agent
 from app.services.rates import normalize_rate
+from app.services.adder_visibility import can_see_adder, redact_adder, redact_adder_one
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_lead_access
@@ -797,7 +798,9 @@ def list_dropped_deals(
     }
     if user.is_manager:   # review list: inactive in the CRM but the provider is still paying
         summary["still_paying"] = extra["still_paying"]
-    return {"summary": summary, "deals": merged[offset:offset + limit]}
+    page = merged[offset:offset + limit]
+    redact_adder(user, page)
+    return {"summary": summary, "deals": page}
 
 
 @router.get("/all-deals")
@@ -844,6 +847,7 @@ def list_all_lead_deals(
             "sgp_customer_id": lead.get("sgp_customer_id"),
             "lead_status": lead.get("status"),
         })
+    redact_adder(user, results)
     return results
 
 
@@ -1137,6 +1141,7 @@ def get_lead(id: str, user: UserContext = Depends(get_current_user)):
             raise HTTPException(status_code=403, detail="Access denied")
     deals = db.table("lead_deals").select("*").eq("lead_id", id).order("created_at", desc=True).execute()
     deals_list = _auto_promote_deals(db, deals.data or [])
+    redact_adder(user, deals_list)
     return {**lead.data[0], "full_name": _full_name(lead.data[0]), "deals": deals_list,
             "membership": lead_membership(db, id)}
 
@@ -1202,13 +1207,12 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
 
     payload = {"lead_id": id, **_deal_payload(data)}
 
+    if not can_see_adder(user, payload.get("sales_agent")):
+        payload["adder"] = None           # callers who may not see the adder cannot set it
     # For Residential deals, auto-fill adder from supplier's default_adder
     if str(data.get("product_type") or "").strip().lower() == "residential" and not payload.get("adder"):
-        supplier_name = str(data.get("supplier") or "").strip()
-        if supplier_name:
-            sup = db.table("suppliers").select("default_adder").ilike("name", supplier_name).limit(1).execute()
-            if sup.data and sup.data[0].get("default_adder") is not None:
-                payload["adder"] = float(sup.data[0]["default_adder"])
+        from app.api.v1.crm import supplier_default_adder
+        payload["adder"] = supplier_default_adder(db, data.get("supplier"))
 
     try:
         res = db.table("lead_deals").insert(payload).execute()
@@ -1225,7 +1229,7 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
         if not conv["converted"]:
             raise HTTPException(status_code=500, detail=f"Deal saved, but converting the lead to a customer failed: {conv['reason']}")
 
-    return deal
+    return redact_adder_one(user, deal)
 
 @router.delete("/{id}/deals/{deal_id}")
 def delete_lead_deal(id: str, deal_id: str, user: UserContext = Depends(get_current_user)):
@@ -1388,6 +1392,8 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
         payload.setdefault("terminated_date", None)
     payload["updated_at"] = _now()
     before = (db.table("lead_deals").select("*").eq("id", deal_id).eq("lead_id", id).limit(1).execute().data or [{}])[0]
+    if "adder" in payload and not can_see_adder(user, payload.get("sales_agent", before.get("sales_agent"))):
+        payload.pop("adder")
     # Deal name is never typed: regenerate it whenever the REP or address is part of the update.
     if "supplier" in payload or "service_address" in payload:
         payload["plan_name"] = lead_deal_name(payload.get("supplier", before.get("supplier")),
@@ -1425,4 +1431,4 @@ def update_lead_deal(id: str, deal_id: str, data: dict = Body(...), user: UserCo
         if not conv["converted"]:
             raise HTTPException(status_code=500, detail=f"Deal saved, but converting the lead to a customer failed: {conv['reason']}")
 
-    return res.data[0]
+    return redact_adder_one(user, res.data[0])
