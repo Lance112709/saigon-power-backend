@@ -10,10 +10,11 @@ from typing import Iterable
 
 
 def _own_names(user) -> set:
-    return {s for s in (
-        (getattr(user, "sales_agent_name", None) or "").strip().lower(),
-        (getattr(user, "name", None) or "").strip().lower(),
-    ) if s}
+    """Only a login LINKED to a sales agent record (users.sales_agent_name)
+    counts as that salesperson. A CSR whose display name happens to be on a
+    deal as sales_agent is not a salesperson and sees nothing."""
+    s = (getattr(user, "sales_agent_name", None) or "").strip().lower()
+    return {s} if s else set()
 
 
 def can_see_adder(user, sales_agent) -> bool:
