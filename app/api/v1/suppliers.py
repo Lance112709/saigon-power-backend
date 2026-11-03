@@ -19,11 +19,18 @@ class SupplierUpdate(BaseModel):
     notes: Optional[str] = None
     default_adder: Optional[float] = None
 
+def _strip_adder(user: UserContext, rows: list) -> list:
+    """default_adder is the broker margin — admins only (same rule as deal adders)."""
+    if not user.is_admin:
+        for r in rows:
+            r.pop("default_adder", None)
+    return rows
+
 @router.get("")
 def list_suppliers(user: UserContext = Depends(get_current_user)):
     db = get_client()
     res = db.table("suppliers").select("*").order("name").execute()
-    return res.data
+    return _strip_adder(user, res.data or [])
 
 @router.post("")
 def create_supplier(body: SupplierCreate, user: UserContext = Depends(require_admin)):
@@ -37,7 +44,7 @@ def get_supplier(id: str, user: UserContext = Depends(get_current_user)):
     res = db.table("suppliers").select("*").eq("id", id).single().execute()
     if not res.data:
         raise HTTPException(status_code=404, detail="Supplier not found")
-    return res.data
+    return _strip_adder(user, [res.data])[0]
 
 @router.patch("/{id}")
 def update_supplier(id: str, body: SupplierUpdate, user: UserContext = Depends(require_admin)):
