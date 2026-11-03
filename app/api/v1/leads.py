@@ -7,7 +7,7 @@ import io
 import csv
 from app.services.agent_names import canonical_agent
 from app.services.rates import normalize_rate
-from app.services.adder_visibility import can_see_adder, redact_adder, redact_adder_one
+from app.services.adder_visibility import can_see_adder, can_enter_adder, redact_adder, redact_adder_one
 from app.db.client import get_client
 from app.auth.deps import get_current_user, require_admin, require_manager, UserContext
 from app.auth.ownership import assert_lead_access
@@ -1207,8 +1207,8 @@ def create_lead_deal(id: str, data: dict = Body(...), user: UserContext = Depend
 
     payload = {"lead_id": id, **_deal_payload(data)}
 
-    if not can_see_adder(user, payload.get("sales_agent")):
-        payload["adder"] = None           # callers who may not see the adder cannot set it
+    if not can_enter_adder(db, user, payload.get("sales_agent")):
+        payload["adder"] = None           # no permission to type an adder on a new deal
     # For Residential deals, auto-fill adder from supplier's default_adder
     if str(data.get("product_type") or "").strip().lower() == "residential" and not payload.get("adder"):
         from app.api.v1.crm import supplier_default_adder

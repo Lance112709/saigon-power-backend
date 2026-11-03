@@ -13,7 +13,7 @@ from app.auth.deps import get_current_user, require_admin, require_manager, User
 from app.auth.ownership import assert_customer_access, assert_crm_deal_access
 from app.core.security import sanitize_search
 from app.services.audit import audit
-from app.services.adder_visibility import can_see_adder, redact_adder, redact_adder_one
+from app.services.adder_visibility import can_see_adder, can_enter_adder, redact_adder, redact_adder_one
 from app.services import activity
 
 logger = logging.getLogger(__name__)
@@ -958,8 +958,8 @@ def create_customer_deal(id: str, data: dict = Body(...), user: UserContext = De
         "flag_delinked":         bool(data.get("flag_delinked", False)),
         "created_by":            user.name,
     }
-    if not can_see_adder(user, payload.get("sales_agent")):
-        payload["adder"] = None           # callers who may not see the adder cannot set it
+    if not can_enter_adder(db, user, payload.get("sales_agent")):
+        payload["adder"] = None           # no permission to type an adder on a new deal
     fill_default_adder(db, payload)
     res = db.table("crm_deals").insert(payload).execute()
     if not res.data:
@@ -1232,8 +1232,8 @@ def renew_deal(id: str, data: dict = Body(...), user: UserContext = Depends(get_
                                 or data.get("deal_name") or orig.get("deal_name"),
         "created_by":           user.name,
     }
-    if not can_see_adder(user, new_deal.get("sales_agent")):
-        new_deal["adder"] = None
+    if not can_enter_adder(db, user, new_deal.get("sales_agent")):
+        new_deal["adder"] = None          # no permission to type an adder on a renewal
     fill_default_adder(db, new_deal)
     res = db.table("crm_deals").insert(new_deal).execute()
     if res.data:
