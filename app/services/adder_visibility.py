@@ -1,7 +1,9 @@
 """Who may see a deal's adder (the broker margin, $/kWh).
 
-Rule (Lance, 2026-11-03): admins see every adder; a salesperson sees the
-adder only on deals where they are the sales agent; nobody else sees it.
+Rule (Lance, 2026-11-03, tightened 2026-11-04): admins see every adder; a
+login with the sales_agent ROLE sees the adder only on deals where they are
+the sales agent; nobody else sees it. Managers and CSRs never see it, even
+when their login is linked to a sales agent and they sold the deal.
 Deal rows leaving the API are stripped of `adder` when the caller may not see
 it, and `adder` is dropped from writes by such callers, so the forms can hide
 the field without the value leaking through the network tab.
@@ -10,9 +12,11 @@ from typing import Iterable
 
 
 def _own_names(user) -> set:
-    """Only a login LINKED to a sales agent record (users.sales_agent_name)
-    counts as that salesperson. A CSR whose display name happens to be on a
-    deal as sales_agent is not a salesperson and sees nothing."""
+    """Only a sales_agent-role login LINKED to a sales agent record
+    (users.sales_agent_name) counts as that salesperson. A manager or CSR
+    sees nothing, even when linked to an agent and named on the deal."""
+    if getattr(user, "role", None) != "sales_agent":
+        return set()
     s = (getattr(user, "sales_agent_name", None) or "").strip().lower()
     return {s} if s else set()
 

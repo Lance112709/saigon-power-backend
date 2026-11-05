@@ -25,11 +25,21 @@ def test_sales_agent_sees_only_own_deals():
     assert deals[0]["adder"] == 0.007 and "adder" not in deals[1]
 
 
-def test_linked_manager_sees_own_deals_only():
+def test_linked_manager_sees_nothing_even_on_own_deals():
+    # Lance 2026-11-04: managers never see the adder, even when they sold the deal.
     u = U("manager", "Jennie T.", agent="Jennie Tran")
+    assert not can_see_adder(u, "Jennie Tran")
     deals = [{"sales_agent": "Jennie Tran", "adder": 0.01}, {"sales_agent": "Nga Nguyen", "adder": 0.007}, {"adder": 0.005}]
     redact_adder(u, deals)
-    assert deals[0]["adder"] == 0.01 and "adder" not in deals[1] and "adder" not in deals[2]
+    assert all("adder" not in d for d in deals)
+
+
+def test_linked_csr_sees_nothing_even_on_own_deals():
+    u = U("csr", "Kim Le", agent="Kim Le")
+    assert not can_see_adder(u, "Kim Le")
+    deals = [{"sales_agent": "Kim Le", "adder": 0.01}]
+    redact_adder(u, deals)
+    assert "adder" not in deals[0]
 
 
 def test_csr_without_linked_agent_sees_nothing_even_if_named_on_deal():
